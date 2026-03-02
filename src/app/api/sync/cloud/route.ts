@@ -114,11 +114,15 @@ async function syncAndVerify(machineId: string, createdKey: any, existingKeys: a
     );
   }
 
+  // Build the cloud URL for the frontend to use
+  const cloudUrl = CLOUD_URL ? `${CLOUD_URL}/${machineId}` : null;
+
   // Step 2: Verify connection by pinging the cloud (with retry)
   const apiKey = createdKey || existingKeys[0]?.key;
   if (!apiKey) {
     return NextResponse.json({
       ...syncResult,
+      cloudUrl,
       verified: false,
       verifyError: "No API key available",
     });
@@ -146,6 +150,7 @@ async function syncAndVerify(machineId: string, createdKey: any, existingKeys: a
       if (pingResponse.ok) {
         return NextResponse.json({
           ...syncResult,
+          cloudUrl,
           verified: true,
         });
       }
@@ -163,6 +168,7 @@ async function syncAndVerify(machineId: string, createdKey: any, existingKeys: a
   // Sync succeeded but verify failed — still return success with warning
   return NextResponse.json({
     ...syncResult,
+    cloudUrl,
     verified: false,
     verifyError: lastVerifyError || "Verification failed after retries",
   });

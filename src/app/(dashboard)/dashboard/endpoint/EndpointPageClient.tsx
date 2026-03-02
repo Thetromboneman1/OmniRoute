@@ -7,7 +7,7 @@ import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import { AI_PROVIDERS, getProviderByAlias } from "@/shared/constants/providers";
 import { useTranslations } from "next-intl";
 
-const CLOUD_URL = process.env.NEXT_PUBLIC_CLOUD_URL;
+const CLOUD_URL = process.env.NEXT_PUBLIC_CLOUD_URL || null;
 const CLOUD_ACTION_TIMEOUT_MS = 15000;
 
 export default function APIPageClient({ machineId }) {
@@ -29,6 +29,7 @@ export default function APIPageClient({ machineId }) {
   const [syncStep, setSyncStep] = useState(""); // "syncing" | "verifying" | "disabling" | "done" | ""
   const [modalSuccess, setModalSuccess] = useState(false); // show success state in modal before closing
   const [selectedProvider, setSelectedProvider] = useState(null); // for provider models popup
+  const [cloudBaseUrl, setCloudBaseUrl] = useState(CLOUD_URL); // dynamic cloud URL from API response
 
   const { copied, copy } = useCopyToClipboard();
 
@@ -204,6 +205,10 @@ export default function APIPageClient({ machineId }) {
         if (data.createdKey) {
           await fetchData();
         }
+        // Update cloud URL from API response (fixes undefined/v1 when env var not set)
+        if (data.cloudUrl) {
+          setCloudBaseUrl(data.cloudUrl);
+        }
         // Reload settings to ensure fresh state
         await loadCloudSettings();
       } else {
@@ -274,7 +279,7 @@ export default function APIPageClient({ machineId }) {
   };
 
   const [baseUrl, setBaseUrl] = useState("/v1");
-  const cloudEndpointNew = `${CLOUD_URL}/v1`;
+  const cloudEndpointNew = cloudBaseUrl ? `${cloudBaseUrl}/v1` : null;
 
   // Hydration fix: Only access window on client side
   useEffect(() => {
@@ -293,7 +298,7 @@ export default function APIPageClient({ machineId }) {
   }
 
   // Use new format endpoint (machineId embedded in key)
-  const currentEndpoint = cloudEnabled ? cloudEndpointNew : baseUrl;
+  const currentEndpoint = cloudEnabled && cloudEndpointNew ? cloudEndpointNew : baseUrl;
 
   return (
     <div className="flex flex-col gap-8">

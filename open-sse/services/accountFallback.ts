@@ -24,14 +24,25 @@ export function getProviderProfile(provider) {
 // In-memory map: "provider:connectionId:model" → { reason, until, lockedAt }
 const modelLockouts = new Map();
 
-// Auto-cleanup expired lockouts every 15 seconds
-const _cleanupTimer = setInterval(() => {
-  const now = Date.now();
-  for (const [key, entry] of modelLockouts) {
-    if (now > entry.until) modelLockouts.delete(key);
+// Auto-cleanup expired lockouts every 15 seconds (lazy init for Cloudflare Workers compatibility)
+let _cleanupTimer: ReturnType<typeof setInterval> | null = null;
+
+function ensureCleanupTimer() {
+  if (_cleanupTimer) return;
+  try {
+    _cleanupTimer = setInterval(() => {
+      const now = Date.now();
+      for (const [key, entry] of modelLockouts) {
+        if (now > entry.until) modelLockouts.delete(key);
+      }
+    }, 15_000);
+    if (typeof _cleanupTimer === "object" && "unref" in _cleanupTimer) {
+      (_cleanupTimer as any).unref(); // Don't prevent process exit (Node.js only)
+    }
+  } catch {
+    // Cloudflare Workers may not support setInterval outside handlers — skip cleanup timer
   }
-}, 15_000);
-_cleanupTimer.unref(); // Don't prevent process exit
+}
 
 /**
  * Lock a specific model on a specific account
@@ -43,6 +54,7 @@ _cleanupTimer.unref(); // Don't prevent process exit
  */
 export function lockModel(provider, connectionId, model, reason, cooldownMs) {
   if (!model) return; // No model → skip model-level locking
+  ensureCleanupTimer();
   const key = `${provider}:${connectionId}:${model}`;
   modelLockouts.set(key, {
     reason,
