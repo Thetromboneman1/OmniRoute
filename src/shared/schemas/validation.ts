@@ -37,6 +37,7 @@ export const comboNodeSchema = z.object({
 export const comboSchema = z.object({
   name: z.string().min(1, "Combo name is required").max(100),
   model: z.string().min(1, "Model pattern is required"),
+  endpoint: z.enum(["chat", "embeddings", "images"]).default("chat"),
   strategy: z
     .enum(["priority", "weighted", "round-robin", "random", "least-used", "cost-optimized"])
     .default("priority"),

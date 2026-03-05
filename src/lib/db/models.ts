@@ -115,7 +115,14 @@ export async function getAllCustomModels() {
   return result;
 }
 
-export async function addCustomModel(providerId, modelId, modelName, source = "manual") {
+export async function addCustomModel(
+  providerId: string,
+  modelId: string,
+  modelName?: string,
+  source = "manual",
+  apiFormat: "chat-completions" | "responses" = "chat-completions",
+  supportedEndpoints: string[] = ["chat"]
+) {
   const db = getDbInstance();
   const row = db
     .prepare("SELECT value FROM key_value WHERE namespace = 'customModels' AND key = ?")
@@ -126,7 +133,13 @@ export async function addCustomModel(providerId, modelId, modelName, source = "m
   const exists = models.find((m) => m.id === modelId);
   if (exists) return exists;
 
-  const model = { id: modelId, name: modelName || modelId, source };
+  const model = {
+    id: modelId,
+    name: modelName || modelId,
+    source,
+    apiFormat,
+    supportedEndpoints,
+  };
   models.push(model);
   db.prepare(
     "INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES ('customModels', ?, ?)"

@@ -364,6 +364,17 @@ export async function getUnifiedModelsResponse(
           const aliasId = `${alias}/${modelId}`;
           if (models.some((m) => m.id === aliasId)) continue;
 
+          // Determine type from supportedEndpoints
+          const endpoints = Array.isArray(model.supportedEndpoints)
+            ? model.supportedEndpoints
+            : ["chat"];
+          const apiFormat =
+            typeof model.apiFormat === "string" ? model.apiFormat : "chat-completions";
+          let modelType: string | undefined;
+          if (endpoints.includes("embeddings")) modelType = "embedding";
+          else if (endpoints.includes("images")) modelType = "image";
+          else if (endpoints.includes("audio")) modelType = "audio";
+
           models.push({
             id: aliasId,
             object: "model",
@@ -373,6 +384,11 @@ export async function getUnifiedModelsResponse(
             root: modelId,
             parent: null,
             custom: true,
+            ...(modelType ? { type: modelType } : {}),
+            ...(apiFormat !== "chat-completions" ? { api_format: apiFormat } : {}),
+            ...(endpoints.length > 1 || !endpoints.includes("chat")
+              ? { supported_endpoints: endpoints }
+              : {}),
           });
 
           // Only add provider-prefixed version if different from alias
@@ -388,6 +404,7 @@ export async function getUnifiedModelsResponse(
               root: modelId,
               parent: aliasId,
               custom: true,
+              ...(modelType ? { type: modelType } : {}),
             });
           }
         }

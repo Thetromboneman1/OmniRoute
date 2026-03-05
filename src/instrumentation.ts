@@ -8,22 +8,27 @@
  * @see https://nextjs.org/docs/app/building-your-application/optimizing/instrumentation
  */
 
-function ensureJwtSecret(): void {
+function ensureSecrets(): void {
+  // eslint-disable-next-line no-eval
+  const crypto = eval("require")("crypto");
+
   if (!process.env.JWT_SECRET || process.env.JWT_SECRET.trim() === "") {
-    // Use eval to hide require from webpack's static analysis
-    // This code only runs in Node.js runtime (guarded by NEXT_RUNTIME check)
-    // eslint-disable-next-line no-eval
-    const crypto = eval("require")("crypto");
     const generated = crypto.randomBytes(48).toString("base64");
     process.env.JWT_SECRET = generated;
     console.log("[STARTUP] JWT_SECRET auto-generated (random 64-char secret)");
+  }
+
+  if (!process.env.API_KEY_SECRET || process.env.API_KEY_SECRET.trim() === "") {
+    const generated = crypto.randomBytes(32).toString("hex");
+    process.env.API_KEY_SECRET = generated;
+    console.log("[STARTUP] API_KEY_SECRET auto-generated (random 64-char hex secret)");
   }
 }
 
 export async function register() {
   // Only run on the server (not during build or in Edge runtime)
   if (process.env.NEXT_RUNTIME === "nodejs") {
-    ensureJwtSecret();
+    ensureSecrets();
     // Console log file capture (must be first — before any logging occurs)
     const { initConsoleInterceptor } = await import("@/lib/consoleInterceptor");
     initConsoleInterceptor();

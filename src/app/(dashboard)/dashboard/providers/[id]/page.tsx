@@ -1338,6 +1338,8 @@ function CustomModelsSection({ providerId, providerAlias, copied, onCopy }) {
   const [customModels, setCustomModels] = useState([]);
   const [newModelId, setNewModelId] = useState("");
   const [newModelName, setNewModelName] = useState("");
+  const [newApiFormat, setNewApiFormat] = useState("chat-completions");
+  const [newEndpoints, setNewEndpoints] = useState(["chat"]);
   const [adding, setAdding] = useState(false);
   const [loading, setLoading] = useState(true);
 
@@ -1370,11 +1372,15 @@ function CustomModelsSection({ providerId, providerAlias, copied, onCopy }) {
           provider: providerId,
           modelId: newModelId.trim(),
           modelName: newModelName.trim() || undefined,
+          apiFormat: newApiFormat,
+          supportedEndpoints: newEndpoints,
         }),
       });
       if (res.ok) {
         setNewModelId("");
         setNewModelName("");
+        setNewApiFormat("chat-completions");
+        setNewEndpoints(["chat"]);
         await fetchCustomModels();
       }
     } catch (e) {
@@ -1407,38 +1413,89 @@ function CustomModelsSection({ providerId, providerAlias, copied, onCopy }) {
       <p className="text-xs text-text-muted mb-3">{t("customModelsHint")}</p>
 
       {/* Add form */}
-      <div className="flex items-end gap-2 mb-3">
-        <div className="flex-1">
-          <label htmlFor="custom-model-id" className="text-xs text-text-muted mb-1 block">
-            {t("modelId")}
-          </label>
-          <input
-            id="custom-model-id"
-            type="text"
-            value={newModelId}
-            onChange={(e) => setNewModelId(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && handleAdd()}
-            placeholder={t("customModelPlaceholder")}
-            className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
-          />
+      <div className="flex flex-col gap-3 mb-3">
+        <div className="flex items-end gap-2">
+          <div className="flex-1">
+            <label htmlFor="custom-model-id" className="text-xs text-text-muted mb-1 block">
+              {t("modelId")}
+            </label>
+            <input
+              id="custom-model-id"
+              type="text"
+              value={newModelId}
+              onChange={(e) => setNewModelId(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleAdd()}
+              placeholder={t("customModelPlaceholder")}
+              className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
+            />
+          </div>
+          <div className="w-40">
+            <label htmlFor="custom-model-name" className="text-xs text-text-muted mb-1 block">
+              {t("displayName")}
+            </label>
+            <input
+              id="custom-model-name"
+              type="text"
+              value={newModelName}
+              onChange={(e) => setNewModelName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleAdd()}
+              placeholder={t("optional")}
+              className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
+            />
+          </div>
+          <Button size="sm" icon="add" onClick={handleAdd} disabled={!newModelId.trim() || adding}>
+            {adding ? t("adding") : t("add")}
+          </Button>
         </div>
-        <div className="w-40">
-          <label htmlFor="custom-model-name" className="text-xs text-text-muted mb-1 block">
-            {t("displayName")}
-          </label>
-          <input
-            id="custom-model-name"
-            type="text"
-            value={newModelName}
-            onChange={(e) => setNewModelName(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && handleAdd()}
-            placeholder={t("optional")}
-            className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
-          />
+
+        {/* API Format + Supported Endpoints */}
+        <div className="flex items-end gap-4 flex-wrap">
+          <div className="w-48">
+            <label htmlFor="custom-api-format" className="text-xs text-text-muted mb-1 block">
+              API Format
+            </label>
+            <select
+              id="custom-api-format"
+              value={newApiFormat}
+              onChange={(e) => setNewApiFormat(e.target.value)}
+              className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
+            >
+              <option value="chat-completions">Chat Completions</option>
+              <option value="responses">Responses API</option>
+            </select>
+          </div>
+          <div className="flex-1">
+            <span className="text-xs text-text-muted mb-1 block">Supported Endpoints</span>
+            <div className="flex items-center gap-3">
+              {["chat", "embeddings", "images", "audio"].map((ep) => (
+                <label
+                  key={ep}
+                  className="flex items-center gap-1.5 text-xs text-text-main cursor-pointer"
+                >
+                  <input
+                    type="checkbox"
+                    checked={newEndpoints.includes(ep)}
+                    onChange={(e) => {
+                      if (e.target.checked) {
+                        setNewEndpoints((prev) => [...prev, ep]);
+                      } else {
+                        setNewEndpoints((prev) => prev.filter((x) => x !== ep));
+                      }
+                    }}
+                    className="rounded border-border"
+                  />
+                  {ep === "chat"
+                    ? "💬 Chat"
+                    : ep === "embeddings"
+                      ? "📐 Embeddings"
+                      : ep === "images"
+                        ? "🖼️ Images"
+                        : "🔊 Audio"}
+                </label>
+              ))}
+            </div>
+          </div>
         </div>
-        <Button size="sm" icon="add" onClick={handleAdd} disabled={!newModelId.trim() || adding}>
-          {adding ? t("adding") : t("add")}
-        </Button>
       </div>
 
       {/* List */}
@@ -1457,7 +1514,7 @@ function CustomModelsSection({ providerId, providerAlias, copied, onCopy }) {
                 <span className="material-symbols-outlined text-base text-primary">tune</span>
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-medium truncate">{model.name || model.id}</p>
-                  <div className="flex items-center gap-1 mt-1">
+                  <div className="flex items-center gap-1 mt-1 flex-wrap">
                     <code className="text-xs text-text-muted font-mono bg-sidebar px-1.5 py-0.5 rounded">
                       {fullModel}
                     </code>
@@ -1470,6 +1527,26 @@ function CustomModelsSection({ providerId, providerAlias, copied, onCopy }) {
                         {copied === copyKey ? "check" : "content_copy"}
                       </span>
                     </button>
+                    {model.apiFormat === "responses" && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-blue-500/15 text-blue-400 font-medium">
+                        Responses
+                      </span>
+                    )}
+                    {model.supportedEndpoints?.includes("embeddings") && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-purple-500/15 text-purple-400 font-medium">
+                        📐 Embed
+                      </span>
+                    )}
+                    {model.supportedEndpoints?.includes("images") && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-400 font-medium">
+                        🖼️ Images
+                      </span>
+                    )}
+                    {model.supportedEndpoints?.includes("audio") && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-green-500/15 text-green-400 font-medium">
+                        🔊 Audio
+                      </span>
+                    )}
                   </div>
                 </div>
                 <button

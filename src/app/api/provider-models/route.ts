@@ -64,9 +64,16 @@ export async function POST(request) {
     if (isValidationFailure(validation)) {
       return Response.json({ error: validation.error }, { status: 400 });
     }
-    const { provider, modelId, modelName, source } = validation.data;
+    const { provider, modelId, modelName, source, apiFormat, supportedEndpoints } = validation.data;
 
-    const model = await addCustomModel(provider, modelId, modelName, source || "manual");
+    const model = await addCustomModel(
+      provider,
+      modelId,
+      modelName,
+      source || "manual",
+      apiFormat,
+      supportedEndpoints
+    );
     return Response.json({ model });
   } catch (error) {
     console.error("Error adding provider model:", error);

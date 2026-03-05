@@ -310,7 +310,8 @@ export async function handleComboChat({
     const parsed = parseModel(modelStr);
     const provider = parsed.provider || parsed.providerAlias || "unknown";
     const profile = getProviderProfile(provider);
-    const breaker = getCircuitBreaker(`combo:${provider}`, {
+    const breakerKey = `combo:${modelStr}`;
+    const breaker = getCircuitBreaker(breakerKey, {
       failureThreshold: profile.circuitBreakerThreshold,
       resetTimeout: profile.circuitBreakerReset,
     });
@@ -440,8 +441,7 @@ export async function handleComboChat({
 
   // Early exit: check if all models have breaker OPEN
   const allBreakersOpen = orderedModels.every((m) => {
-    const p = parseModel(m).provider || parseModel(m).providerAlias || "unknown";
-    return !getCircuitBreaker(`combo:${p}`).canExecute();
+    return !getCircuitBreaker(`combo:${m}`).canExecute();
   });
 
   // All models failed
@@ -532,7 +532,8 @@ async function handleRoundRobinCombo({
     const parsed = parseModel(modelStr);
     const provider = parsed.provider || parsed.providerAlias || "unknown";
     const profile = getProviderProfile(provider);
-    const breaker = getCircuitBreaker(`combo:${provider}`, {
+    const breakerKey = `combo:${modelStr}`;
+    const breaker = getCircuitBreaker(breakerKey, {
       failureThreshold: profile.circuitBreakerThreshold,
       resetTimeout: profile.circuitBreakerReset,
     });
@@ -694,8 +695,7 @@ async function handleRoundRobinCombo({
 
   // Early exit: check if all models have breaker OPEN
   const allBreakersOpen = orderedModels.every((m) => {
-    const p = parseModel(m).provider || parseModel(m).providerAlias || "unknown";
-    return !getCircuitBreaker(`combo:${p}`).canExecute();
+    return !getCircuitBreaker(`combo:${m}`).canExecute();
   });
 
   if (allBreakersOpen) {

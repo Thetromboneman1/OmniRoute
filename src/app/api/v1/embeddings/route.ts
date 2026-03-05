@@ -13,6 +13,8 @@ import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { v1EmbeddingsSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
+import { getAllCustomModels } from "@/lib/localDb";
+
 /**
  * Handle CORS preflight
  */
@@ -30,23 +32,43 @@ export async function OPTIONS() {
  * GET /v1/embeddings — list available embedding models
  */
 export async function GET() {
-  const models = getAllEmbeddingModels();
-  return new Response(
-    JSON.stringify({
-      object: "list",
-      data: models.map((m) => ({
-        id: m.id,
-        object: "model",
-        created: Math.floor(Date.now() / 1000),
-        owned_by: m.provider,
-        type: "embedding",
-        dimensions: m.dimensions,
-      })),
-    }),
-    {
-      headers: { "Content-Type": "application/json" },
+  const builtInModels = getAllEmbeddingModels();
+  const timestamp = Math.floor(Date.now() / 1000);
+
+  const data = builtInModels.map((m) => ({
+    id: m.id,
+    object: "model",
+    created: timestamp,
+    owned_by: m.provider,
+    type: "embedding",
+    dimensions: m.dimensions,
+  }));
+
+  // Include custom models tagged for embeddings
+  try {
+    const customModelsMap = (await getAllCustomModels()) as Record<string, any>;
+    for (const [providerId, models] of Object.entries(customModelsMap)) {
+      if (!Array.isArray(models)) continue;
+      for (const model of models) {
+        if (!model?.id || !Array.isArray(model.supportedEndpoints)) continue;
+        if (!model.supportedEndpoints.includes("embeddings")) continue;
+        const fullId = `${providerId}/${model.id}`;
+        if (data.some((d) => d.id === fullId)) continue;
+        data.push({
+          id: fullId,
+          object: "model",
+          created: timestamp,
+          owned_by: providerId,
+          type: "embedding",
+          dimensions: null,
+        });
+      }
     }
-  );
+  } catch {}
+
+  return new Response(JSON.stringify({ object: "list", data }), {
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 /**

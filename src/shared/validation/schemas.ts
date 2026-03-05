@@ -300,6 +300,8 @@ export const providerModelMutationSchema = z.object({
   modelId: z.string().trim().min(1, "modelId is required").max(240),
   modelName: z.string().trim().max(240).optional(),
   source: z.string().trim().max(80).optional(),
+  apiFormat: z.enum(["chat-completions", "responses"]).default("chat-completions"),
+  supportedEndpoints: z.array(z.enum(["chat", "embeddings", "images", "audio"])).default(["chat"]),
 });
 
 const pricingFieldsSchema = z

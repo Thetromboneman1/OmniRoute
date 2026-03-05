@@ -14,6 +14,8 @@ import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { v1ImageGenerationSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
+import { getAllCustomModels } from "@/lib/localDb";
+
 /**
  * Handle CORS preflight
  */
@@ -31,23 +33,43 @@ export async function OPTIONS() {
  * GET /v1/images/generations — list available image models
  */
 export async function GET() {
-  const models = getAllImageModels();
-  return new Response(
-    JSON.stringify({
-      object: "list",
-      data: models.map((m) => ({
-        id: m.id,
-        object: "model",
-        created: Math.floor(Date.now() / 1000),
-        owned_by: m.provider,
-        type: "image",
-        supported_sizes: m.supportedSizes,
-      })),
-    }),
-    {
-      headers: { "Content-Type": "application/json" },
+  const builtInModels = getAllImageModels();
+  const timestamp = Math.floor(Date.now() / 1000);
+
+  const data = builtInModels.map((m) => ({
+    id: m.id,
+    object: "model",
+    created: timestamp,
+    owned_by: m.provider,
+    type: "image",
+    supported_sizes: m.supportedSizes,
+  }));
+
+  // Include custom models tagged for images
+  try {
+    const customModelsMap = (await getAllCustomModels()) as Record<string, any>;
+    for (const [providerId, models] of Object.entries(customModelsMap)) {
+      if (!Array.isArray(models)) continue;
+      for (const model of models) {
+        if (!model?.id || !Array.isArray(model.supportedEndpoints)) continue;
+        if (!model.supportedEndpoints.includes("images")) continue;
+        const fullId = `${providerId}/${model.id}`;
+        if (data.some((d) => d.id === fullId)) continue;
+        data.push({
+          id: fullId,
+          object: "model",
+          created: timestamp,
+          owned_by: providerId,
+          type: "image",
+          supported_sizes: null,
+        });
+      }
     }
-  );
+  } catch {}
+
+  return new Response(JSON.stringify({ object: "list", data }), {
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 /**

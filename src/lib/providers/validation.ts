@@ -307,11 +307,29 @@ async function validateOpenAICompatibleProvider({ apiKey, providerSpecificData =
     if (chatRes.status >= 500) {
       return { valid: false, error: `Provider unavailable (${chatRes.status})` };
     }
+  } catch {
+    // Chat test also failed — fall through to simple connectivity check
+  }
+
+  // Step 3: Final fallback — simple connectivity check
+  // For local providers (Ollama, LM Studio, etc.) that may not respond to
+  // standard OpenAI endpoints but are still reachable
+  try {
+    const pingRes = await fetch(baseUrl, {
+      method: "GET",
+      headers: buildBearerHeaders(apiKey),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    // If the server responds at all (even with an error page), it's reachable
+    if (pingRes.status < 500) {
+      return { valid: true, error: null };
+    }
+
+    return { valid: false, error: `Provider unavailable (${pingRes.status})` };
   } catch (error: any) {
     return { valid: false, error: error.message || "Connection failed" };
   }
-
-  return { valid: false, error: "Validation failed" };
 }
 
 async function validateAnthropicCompatibleProvider({ apiKey, providerSpecificData = {} }: any) {
