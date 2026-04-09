@@ -8,10 +8,21 @@ description: Analyze open feature request issues, implement viable ones on dedic
 
 A **5-phase** workflow that systematically harvests feature requests from GitHub issues, creates structured idea files, researches solutions across the internet and Git repositories, presents a consolidated report for user approval, then generates detailed implementation plans and executes them.
 
-**Output directories:**
+**Output directory structure:**
 
-- `_ideia/` — One markdown file per feature idea (persistent knowledge base)
-- `_tasks/features-vX.Y.Z/` — Implementation plan files (per-release)
+```
+_ideia/
+├── viable/          # ✅ Features ready for implementation (issues stay OPEN)
+│   ├── 1046-native-playground.md
+│   └── 1046-native-playground.requirements.md
+├── defer/           # ⏭️ Good ideas deferred for future cycles (issues CLOSED)
+│   └── 1041-smart-auto-combos.md
+└── notfit/          # ❌ Out of scope / already exists (issues CLOSED)
+    └── 945-telegram-integration.md
+
+_tasks/features-vX.Y.Z/   # Implementation plans (per-release)
+└── 1046-native-playground.plan.md
+```
 
 > **BRANCH RULE**: All implementation work MUST happen on the current `release/vX.Y.Z` branch. Never create separate `feat/` branches. If no release branch exists yet, create one first using `/generate-release` Phase 1 steps 1–5.
 
@@ -55,7 +66,7 @@ If already on a `release/vX.Y.Z` branch, continue working there.
 
 ```bash
 # Fetch issues with feature/enhancement labels
-gh issue list --repo <owner>/<repo> --state open --labels "enhancement" --limit 500 --json number --jq '.[].number'
+gh issue list --repo <owner>/<repo> --state open -l "enhancement" --limit 500 --json number --jq '.[].number'
 
 # Also check for [Feature] in title (common pattern when no labels are set)
 gh issue list --repo <owner>/<repo> --state open --limit 500 --json number,title --jq '.[] | select(.title | test("\\[Feature\\]|\\[feature\\]|feature request"; "i")) | .number'
@@ -75,7 +86,7 @@ gh issue view <NUMBER> --repo <owner>/<repo> --json number,title,labels,body,com
 - You may batch these into parallel calls (up to 4 at a time).
 - Sort by oldest first (FIFO).
 
-### 1.4 Create or Update Idea Files
+### 1.4 Create Idea Files (initially in `_ideia/` root)
 
 For each feature request, create a structured idea file in `<project_root>/_ideia/`:
 
@@ -171,7 +182,8 @@ Before investing in research, quickly assess:
 | ✅ **VIABLE** | Good idea, enough context | Proceed to Research |
 | ❓ **NEEDS DETAIL** | Good idea, insufficient spec | Skip research, ask author |
 | ⏭️ **DEFER** | Good idea, too complex for this cycle | Catalog only, skip research |
-| ❌ **NOT FIT** | Doesn't fit the project | Explain why, close issue |
+| ❌ **NOT FIT** | Doesn't fit the project | Explain why |
+| 🔁 **ALREADY EXISTS** | Feature already implemented | Point to existing feature |
 
 ### 2.2 Internet Research (for VIABLE features)
 
@@ -206,7 +218,7 @@ If the feature involves an external API, protocol, or standard:
 
 ### 2.3 Create Requirements File
 
-For each researched feature, create a requirements file in `_ideia/`:
+For each researched feature, create a requirements file alongside its idea file:
 
 **Filename**: `<NUMBER>-<kebab-case-short-title>.requirements.md`
 
@@ -215,7 +227,7 @@ For each researched feature, create a requirements file in `_ideia/`:
 
 > Feature Idea: [#<NUMBER>](./<NUMBER>-<kebab-case-short-title>.md)
 > Research Date: <YYYY-MM-DD>
-> Verdict: ✅ VIABLE / ❓ NEEDS DETAIL / ⏭️ DEFER
+> Verdict: ✅ VIABLE
 
 ## 🔍 Research Summary
 
@@ -227,12 +239,10 @@ For each researched feature, create a requirements file in `_ideia/`:
 |---|-----------|-------|-------------|----------|-----------|
 | 1 | [repo/name](url) | ⭐ N | YYYY-MM-DD | <brief> | High/Med/Low |
 | 2 | ... | | | | |
-| ... | | | | | |
 
 ### Key Patterns Found
 - <pattern 1 with code snippet or link>
 - <pattern 2>
-- ...
 
 ## 📐 Proposed Solution Architecture
 
@@ -243,24 +253,20 @@ For each researched feature, create a requirements file in `_ideia/`:
 | File | Purpose |
 |------|---------|
 | `path/to/new/file.ts` | <description> |
-| ... | |
 
 ### Modified Files
 | File | Changes |
 |------|---------|
 | `path/to/existing/file.ts` | <what changes> |
-| ... | |
 
 ### Database Changes
 - <migrations needed, if any>
 
 ### API Changes
-- <new endpoints, if any>
-- <modified endpoints, if any>
+- <new/modified endpoints, if any>
 
 ### UI Changes
-- <new pages/components, if any>
-- <modified pages/components, if any>
+- <new/modified pages/components, if any>
 
 ## ⚙️ Implementation Effort
 
@@ -273,15 +279,174 @@ For each researched feature, create a requirements file in `_ideia/`:
 
 ## ⚠️ Open Questions
 
-- <question 1 — what the agent couldn't resolve and needs the user or author to clarify>
+- <question 1>
 - <question 2>
 
 ## 🔗 External References
 
 - <documentation URLs>
 - <API references>
-- <relevant blog posts or technical articles>
 ```
+
+---
+
+## Phase 2.5 — Organize & Respond: Sort Files and Post GitHub Comments
+
+### 2.5.1 Create Directory Structure
+
+// turbo
+
+```bash
+mkdir -p <project_root>/_ideia/viable
+mkdir -p <project_root>/_ideia/defer
+mkdir -p <project_root>/_ideia/notfit
+```
+
+### 2.5.2 Move Idea Files to Category Subdirectories
+
+After classification, move EVERY idea file to its correct subdirectory:
+
+```bash
+# ✅ VIABLE — move idea + requirements files
+mv _ideia/<NUMBER>-*.md _ideia/viable/
+mv _ideia/<NUMBER>-*.requirements.md _ideia/viable/
+
+# ⏭️ DEFER — move idea files only
+mv _ideia/<NUMBER>-*.md _ideia/defer/
+
+# ❌ NOT FIT & 🔁 ALREADY EXISTS — move idea files only
+mv _ideia/<NUMBER>-*.md _ideia/notfit/
+```
+
+No files should remain in `_ideia/` root after this step (except subdirectories).
+
+### 2.5.3 Post GitHub Comments by Category
+
+**Each category has a specific comment template and action:**
+
+---
+
+#### For 🔁 ALREADY EXISTS — Comment + CLOSE issue
+
+// turbo
+
+The feature already exists in the system. Explain WHERE it is and HOW to use it.
+
+```markdown
+Hi @<author>! Thanks for the suggestion! 🙏
+
+Great news — this functionality **already exists** in OmniRoute:
+
+**📍 Where to find it:** <exact dashboard path or settings location>
+
+**🔧 How to use it:**
+1. <step 1>
+2. <step 2>
+3. <step 3>
+
+If you have any trouble finding or using it, feel free to ask in a Discussion. We're always happy to help!
+
+Closing this as the feature is already available. 🎉
+```
+
+```bash
+gh issue close <NUMBER> --repo <owner>/<repo> --comment "<comment above>"
+```
+
+---
+
+#### For ⏭️ DEFER — Comment + CLOSE issue
+
+// turbo
+
+Thank the user, explain the idea was cataloged, and that we'll study it before implementing.
+
+```markdown
+Hi @<author>! Thanks for this thoughtful feature request! 🙏
+
+We really appreciate the detailed proposal. We've **cataloged your idea** and it's now part of our improvement backlog.
+
+Due to the **significant architectural impact** of this feature, we'll need to conduct thorough use-case studies and architectural analysis before we start development. This ensures we build it right and don't introduce regressions.
+
+**What happens next:**
+- Your idea is saved in our internal feature backlog
+- We'll conduct architecture studies when this area is prioritized
+- We'll notify you here when development begins
+
+Thank you for contributing to OmniRoute's roadmap! Your input helps shape the product. 🚀
+```
+
+```bash
+gh issue close <NUMBER> --repo <owner>/<repo> --comment "<comment above>"
+```
+
+---
+
+#### For ❌ NOT FIT — Comment + CLOSE issue
+
+// turbo
+
+Politely explain why the feature doesn't fit the project scope.
+
+```markdown
+Hi @<author>! Thanks for the suggestion! 🙏
+
+After careful analysis, we've determined that this feature **falls outside OmniRoute's core scope** as a proxy/router.
+
+**Reason:** <explain why — e.g., "Telegram integration belongs in the application/orchestrator layer that consumes OmniRoute's API, not inside the router itself.">
+
+**Alternative:** <suggest an alternative approach if possible>
+
+We appreciate you thinking of ways to improve OmniRoute! If you'd like to discuss this further, feel free to open a Discussion. 🙏
+```
+
+```bash
+gh issue close <NUMBER> --repo <owner>/<repo> --comment "<comment above>"
+```
+
+---
+
+#### For ❓ NEEDS DETAIL — Comment (keep OPEN)
+
+// turbo
+
+Ask for the specific missing details needed.
+
+```markdown
+Hi @<author>! Thanks for the feature request — it's an interesting idea and we'd love to explore it further. 🙏
+
+To move forward, we need a few more details:
+
+1. <specific question 1>
+2. <specific question 2>
+3. <specific question 3>
+
+If you know of any **open-source projects or repositories** that implement something similar, please share links — it would help us design the best solution.
+
+Looking forward to your response! 🚀
+```
+
+---
+
+#### For ✅ VIABLE — Comment (keep OPEN)
+
+// turbo
+
+Thank the user, confirm we've cataloged their idea, and explain it may be implemented in future versions.
+
+```markdown
+Hi @<author>! Thanks for the great feature suggestion! 🙏
+
+We've analyzed your request and it aligns well with OmniRoute's roadmap. We've **cataloged this feature** and it's in our implementation backlog.
+
+**Status:** 📋 Cataloged for future implementation
+
+This feature may be included in upcoming releases. We'll **respond to this issue and tag you** as soon as implementation begins so you can test it.
+
+Thank you for helping improve OmniRoute! 🚀
+```
+
+**⚠️ Do NOT close viable issues — they remain OPEN for tracking.**
 
 ---
 
@@ -289,18 +454,19 @@ For each researched feature, create a requirements file in `_ideia/`:
 
 ### 3.1 🛑 MANDATORY STOP — Present Consolidated Report
 
-After completing Phase 1 and Phase 2, **STOP and present the following report** in the chat. Do NOT proceed to implementation.
+After completing Phase 1, Phase 2, and Phase 2.5, **STOP and present the following report** in the chat. Do NOT proceed to implementation.
 
 Present a structured report containing:
 
 #### 3.1a — Feature Summary Table
 
-| # | Issue | Title | Verdict | Idea File | Requirements | Effort |
-|---|-------|-------|---------|-----------|-------------|--------|
-| 1 | #N | Title | ✅ VIABLE | `_ideia/N-title.md` | `_ideia/N-title.requirements.md` | Medium |
-| 2 | #N | Title | ❓ NEEDS DETAIL | `_ideia/N-title.md` | — | — |
-| 3 | #N | Title | ⏭️ DEFERRED | `_ideia/N-title.md` | — | High |
-| 4 | #N | Title | ❌ NOT FIT | — | — | — |
+| # | Issue | Title | Verdict | Location | Action |
+|---|-------|-------|---------|----------|--------|
+| 1 | #N | Title | ✅ VIABLE | `_ideia/viable/` | Issue OPEN, comment posted |
+| 2 | #N | Title | ⏭️ DEFER | `_ideia/defer/` | Issue CLOSED with explanation |
+| 3 | #N | Title | ❌ NOT FIT | `_ideia/notfit/` | Issue CLOSED with explanation |
+| 4 | #N | Title | 🔁 EXISTS | `_ideia/notfit/` | Issue CLOSED with guidance |
+| 5 | #N | Title | ❓ NEEDS DETAIL | `_ideia/viable/` | Issue OPEN, questions posted |
 
 #### 3.1b — Viable Features Detail
 
@@ -315,40 +481,15 @@ For each VIABLE feature, provide a brief paragraph:
 For features marked ❓ NEEDS DETAIL, list:
 - What specific information is missing
 - What examples or repository references would help
-- The exact comment that will be posted on the issue
 
-#### 3.1d — Features Not Suitable
-
-For features marked ❌ NOT FIT, briefly explain why.
-
-#### 3.1e — Ask for User Confirmation
+#### 3.1d — Ask for User Confirmation
 
 End the report with:
 
-> **Ready to proceed?**
+> **Ready to proceed with implementation?**
 > - Reply **"sim"** or **"yes"** to generate full implementation plans for all VIABLE features.
 > - Reply with specific issue numbers to select only certain features.
 > - Reply **"não"** or **"no"** to stop here.
-
-### 3.2 Post Comments on GitHub
-
-After presenting the report (but before user confirmation):
-
-**For ❓ NEEDS DETAIL issues** — Post a comment asking for specifics:
-
-```markdown
-Hi @<author>! Thanks for the feature request — it's an interesting idea and we'd love to explore it further.
-
-To move forward with implementation, we need a few more details:
-
-1. <specific question 1>
-2. <specific question 2>
-3. <specific question 3>
-
-If you know of any open-source projects or repositories that implement something similar, please share links — it would help us design the best solution. 🙏
-```
-
-**For ❌ NOT FIT issues** — Post a polite explanatory comment and close.
 
 ---
 
@@ -372,8 +513,8 @@ For each VIABLE feature approved by the user, create:
 # Implementation Plan: <Feature Title>
 
 > Issue: #<NUMBER>
-> Idea: [_ideia/<NUMBER>-title.md](../../_ideia/<NUMBER>-title.md)
-> Requirements: [_ideia/<NUMBER>-title.requirements.md](../../_ideia/<NUMBER>-title.requirements.md)
+> Idea: [_ideia/viable/<NUMBER>-title.md](../../_ideia/viable/<NUMBER>-title.md)
+> Requirements: [_ideia/viable/<NUMBER>-title.requirements.md](../../_ideia/viable/<NUMBER>-title.requirements.md)
 > Branch: `release/vX.Y.Z`
 
 ## Overview
@@ -407,13 +548,11 @@ For each VIABLE feature approved by the user, create:
 **Test cases:**
 - [ ] <test case 1>
 - [ ] <test case 2>
-- ...
 
 ### Step N+1: i18n
 
 **Translation keys to add:**
 - `<namespace>.<key>` — "<English value>"
-- ...
 
 ### Step N+2: Documentation
 
@@ -443,7 +582,6 @@ Present a summary of all generated plans:
 > | # | Feature | Plan File | Steps | Effort |
 > |---|---------|-----------|-------|--------|
 > | 1 | <title> | `_tasks/features-vX.Y.Z/N-title.plan.md` | N steps | Medium |
-> | ... | | | | |
 >
 > Reply **"sim"** or **"yes"** to begin implementation of all features.
 > Reply with specific issue numbers to implement only certain ones.
@@ -465,14 +603,14 @@ For each approved plan, execute it step by step:
 5. **Update the plan** — Mark completed steps with `[x]` in the plan file
 6. **Continue** — Move to the next feature (do NOT switch branches)
 
-### 5.2 Respond to Authors
+### 5.2 Respond to Authors (Update Viable Issues)
 
-For each implemented feature, post a comment on the GitHub issue:
+For each implemented feature, **update the comment on the original issue** (which was left OPEN in Phase 2.5):
 
 ```markdown
 ## ✅ Feature Implemented!
 
-Hi @<author>! We've analyzed your request and implemented it.
+Hi @<author>! Great news — your feature request has been implemented! 🎉
 
 **Branch:** `release/vX.Y.Z` (upcoming release)
 
@@ -497,6 +635,14 @@ npm install && npm run dev
 This will be included in the next release. Looking forward to your feedback! 🚀
 ```
 
+Then close the issue:
+```bash
+gh issue close <NUMBER> --repo <owner>/<repo>
+```
+
+And move the idea file from `viable/` to indicate completion:
+- Update the idea file's Status line to: `> Status: ✅ Implemented in vX.Y.Z`
+
 ### 5.3 Finalize & Push
 
 After implementing all approved features:
@@ -512,14 +658,16 @@ Present a final summary report to the user:
 | Issue | Title | Verdict | Action | Commit |
 |-------|-------|---------|--------|--------|
 | #N | Title | ✅ Implemented | Committed on release/vX.Y.Z | `abc1234` |
-| #N | Title | ❓ Needs Detail | Comment posted asking for specifics | — |
-| #N | Title | ⏭️ Deferred | Cataloged in `_ideia/` for future cycle | — |
-| #N | Title | ❌ Not Fit | Closed with explanation | — |
+| #N | Title | ⏭️ Deferred | Closed with thanks + cataloged in `_ideia/defer/` | — |
+| #N | Title | ❌ Not Fit | Closed with explanation, filed in `_ideia/notfit/` | — |
+| #N | Title | 🔁 Exists | Closed with guidance on existing feature location | — |
+| #N | Title | ❓ Needs Detail | Left open, questions posted | — |
 
 Include:
 - Total features harvested
-- Total ideas cataloged in `_ideia/`
+- Total ideas cataloged (`viable/` + `defer/` + `notfit/`)
 - Total features implemented
 - Total features deferred
-- Total issues needing author response
+- Total issues closed
+- Total issues left open (viable + needs detail)
 - Test results (pass/fail count)
