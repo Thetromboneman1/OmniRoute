@@ -103,6 +103,8 @@ jobs:
   advanced-security:
     name: Advanced Security Scans
     runs-on: ubuntu-latest
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -130,11 +132,16 @@ jobs:
       - name: Check for known vulnerabilities
         run: npx is-my-node-vulnerable
 
+      - name: Explain Snyk skip
+        if: ${{ github.actor != 'dependabot[bot]' && env.SNYK_TOKEN == '' }}
+        run: |
+          echo "Snyk scan skipped because SNYK_TOKEN is not configured." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run Snyk Vulnerability checks
-        if: github.actor != 'dependabot[bot]'
+        if: ${{ github.actor != 'dependabot[bot]' && env.SNYK_TOKEN != '' }}
         uses: snyk/actions/node@master
         env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          SNYK_TOKEN: ${{ env.SNYK_TOKEN }}
         with:
           args: --severity-threshold=high
 
