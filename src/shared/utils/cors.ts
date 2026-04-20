@@ -17,12 +17,28 @@
 
 export const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
+function normalizeCorsOrigin(rawOrigin: string): string {
+  const trimmed = rawOrigin.trim();
+  if (!trimmed) {
+    return "*";
+  }
+
+  // Browsers accept only a single origin token (or "*") for this header.
+  // If users provide a comma-separated allow list in env, default to "*"
+  // so local tools (including file://-origin renderer bridges) can read responses.
+  if (trimmed.includes(",")) {
+    return "*";
+  }
+
+  return trimmed;
+}
+
 /**
  * Standard CORS headers to spread into any Response.
  * @type {Record<string, string>}
  */
 export const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": CORS_ORIGIN,
+  "Access-Control-Allow-Origin": normalizeCorsOrigin(CORS_ORIGIN),
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, anthropic-version",
 };

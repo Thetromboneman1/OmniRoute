@@ -238,6 +238,7 @@ export function unavailableResponse(
     status: statusCode,
     headers: {
       "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": getCorsOrigin(),
       "Retry-After": String(retryAfterSec),
     },
   });
