@@ -1,0 +1,44 @@
+name: Sync Fork From Upstream
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/diegosouzapw/OmniRoute.git || true
+          git fetch upstream main
+
+      - name: Fast-forward fork main from upstream
+        run: |
+          set -euo pipefail
+
+          if git merge-base --is-ancestor HEAD upstream/main; then
+            if [ "$(git rev-parse HEAD)" = "$(git rev-parse upstream/main)" ]; then
+              echo "Fork already up to date with upstream/main"
+              exit 0
+            fi
+            git merge --ff-only upstream/main
+            git push origin HEAD:main
+            echo "Fork updated from upstream/main"
+          else
+            echo "Fork has commits not in upstream; skipping auto-ff to avoid rewriting history"
+          fi
