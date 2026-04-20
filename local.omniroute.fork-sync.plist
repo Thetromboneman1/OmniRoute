@@ -4,6 +4,8 @@
 <dict>
     <key>Label</key>
     <string>local.omniroute.fork-sync</string>
+    <key>UserName</key>
+    <string>root</string>
     <key>ProgramArguments</key>
     <array>
         <string>/Users/corn/Documents/Hermes/OmniRoute/scripts/fork-sync-update.sh</string>
