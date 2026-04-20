@@ -71,6 +71,13 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Publishing Docker image version: $VERSION"
 
+      - name: Normalize image namespace
+        id: ns
+        shell: bash
+        run: |
+          OWNER_LC="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "owner_lc=$OWNER_LC" >> "$GITHUB_OUTPUT"
+
       - name: Build and push multi-arch image (GHCR)
         uses: docker/build-push-action@v7
         with:
@@ -79,8 +86,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/omniroute:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/omniroute:latest
+            ghcr.io/${{ steps.ns.outputs.owner_lc }}/omniroute:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.ns.outputs.owner_lc }}/omniroute:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
           no-cache: false
@@ -106,7 +113,7 @@ jobs:
 
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect "ghcr.io/${{ github.repository_owner }}/omniroute:${{ steps.version.outputs.version }}"
+          docker buildx imagetools inspect "ghcr.io/${{ steps.ns.outputs.owner_lc }}/omniroute:${{ steps.version.outputs.version }}"
 
       - name: Update Docker Hub description
         if: steps.dockerhub.outputs.enabled == 'true'
