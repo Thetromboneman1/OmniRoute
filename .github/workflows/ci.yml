@@ -104,7 +104,7 @@ jobs:
     name: Advanced Security Scans
     runs-on: ubuntu-latest
     env:
-      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      SNYK_TOKEN: ""
     steps:
       - uses: actions/checkout@v6
         with:
@@ -275,8 +275,8 @@ jobs:
     needs: test-coverage
     if: ${{ always() && needs.test-coverage.result == 'success' }}
     env:
-      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      SONAR_TOKEN: ""
+      SONAR_HOST_URL: ""
     steps:
       - uses: actions/checkout@v6
         with:
