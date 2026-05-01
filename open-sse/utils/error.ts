@@ -237,8 +237,8 @@ export function unavailableResponse(
   return new Response(JSON.stringify({ error: { message: msg } }), {
     status: statusCode,
     headers: {
+      ...CORS_HEADERS,
       "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": getCorsOrigin(),
       "Retry-After": String(retryAfterSec),
     },
   });
