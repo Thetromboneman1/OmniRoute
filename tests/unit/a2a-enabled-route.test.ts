@@ -99,7 +99,7 @@ test("A2A JSON-RPC checks auth before returning disabled state", async () => {
     error?: { code?: number; message?: string };
   };
 
-  assert.equal(response.status, 400);
+  assert.equal(response.status, 503);
   assert.equal(body.error?.code, -32600);
   assert.match(body.error?.message || "", /Unauthorized/i);
 });

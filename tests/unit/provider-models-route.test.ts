@@ -112,7 +112,7 @@ test("provider models route blocks private OpenAI-compatible base URLs", async (
 
   const response = await callRoute(connection.id);
 
-  assert.equal(response.status, 400);
+  assert.equal(response.status, 503);
   assert.deepEqual(await response.json(), {
     error: "Blocked private or local provider URL",
   });
