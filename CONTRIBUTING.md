@@ -112,6 +112,20 @@ Scopes: `db`, `sse`, `oauth`, `dashboard`, `api`, `cli`, `docker`, `ci`, `mcp`, 
 
 ---
 
+## Fork Maintenance Workflow
+
+Fork maintainers can use `.github/workflows/fork-sync.yml` to keep `main` aligned with upstream.
+
+- Schedule: every 30 minutes.
+- Manual trigger: GitHub Actions UI or `gh workflow run fork-sync.yml -R <owner>/<repo>`.
+- Reliability behavior:
+  - checkout does not persist repository-wide auth headers;
+  - push auth is applied only to `origin`;
+  - upstream fetch uses anonymous mode with retry backoff;
+  - transient GitHub runner/auth hiccups are tolerated so the next scheduled run can recover.
+
+---
+
 ## Running Tests
 
 ```bash

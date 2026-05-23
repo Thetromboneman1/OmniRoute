@@ -11,21 +11,46 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    # Keep scheduled fork sync resilient to transient GitHub runner/network auth issues.
+    continue-on-error: true
+    timeout-minutes: 10
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ github.token }}
+          persist-credentials: false
 
       - name: Configure git identity
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - name: Configure origin auth for push
+        run: |
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
       - name: Add upstream remote
         run: |
-          git remote add upstream https://github.com/diegosouzapw/OmniRoute.git || true
-          git fetch upstream main
+          set -euo pipefail
+
+          git remote add upstream https://github.com/diegosouzapw/OmniRoute.git || \
+            git remote set-url upstream https://github.com/diegosouzapw/OmniRoute.git
+
+          # Fetch upstream anonymously to avoid occasional credential-header prompt failures.
+          for attempt in 1 2 3; do
+            if git -c http.https://github.com/.extraheader= fetch --prune --no-tags upstream main; then
+              break
+            fi
+
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Failed to fetch upstream/main after 3 attempts"
+              exit 1
+            fi
+
+            sleep $((attempt * 5))
+          done
 
       - name: Fast-forward fork main from upstream
         run: |
