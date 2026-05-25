@@ -5,6 +5,7 @@
 ### 🐛 Bug Fixes
 
 - **fix(executors):** remove unsafe `any` usage in key executor adapters (`azure-openai`, `blackbox-web`, `cliproxyapi`, `codex`, `github`, `opencode`, `pollinations`, `puter`, `vertex`) to clean terminal/CI lint diagnostics.
+- **fix(github):** correctly read numeric `copilotTokenExpiresAt` values from provider-specific credentials so `needsRefresh` refreshes expiring Copilot tokens reliably.
 
 ### 🛠️ Maintenance
 

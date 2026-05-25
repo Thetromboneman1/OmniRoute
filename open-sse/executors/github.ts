@@ -11,10 +11,11 @@ type GithubProviderCredentials = ProviderCredentials & {
   copilotTokenExpiresAt?: string | number;
 };
 
-function getProviderSpecificString(
-  credentials: GithubProviderCredentials | null | undefined,
-  key: string
-): string | null {
+type ProviderSpecificRecord = Record<string, unknown>;
+
+function getProviderSpecificRecord(
+  credentials: GithubProviderCredentials | null | undefined
+): ProviderSpecificRecord | null {
   const providerSpecificData = credentials?.providerSpecificData;
   if (
     !providerSpecificData ||
@@ -23,7 +24,23 @@ function getProviderSpecificString(
   ) {
     return null;
   }
-  const value = (providerSpecificData as Record<string, unknown>)[key];
+  return providerSpecificData as ProviderSpecificRecord;
+}
+
+function getProviderSpecificValue(
+  credentials: GithubProviderCredentials | null | undefined,
+  key: string
+): unknown {
+  const providerSpecificData = getProviderSpecificRecord(credentials);
+  if (!providerSpecificData) return null;
+  return providerSpecificData[key];
+}
+
+function getProviderSpecificString(
+  credentials: GithubProviderCredentials | null | undefined,
+  key: string
+): string | null {
+  const value = getProviderSpecificValue(credentials, key);
   return typeof value === "string" ? value : null;
 }
 
@@ -37,11 +54,17 @@ export class GithubExecutor extends BaseExecutor {
   }
 
   getCopilotTokenExpiresAt(credentials: GithubProviderCredentials | null | undefined) {
-    return (
-      credentials?.copilotTokenExpiresAt ||
-      getProviderSpecificString(credentials, "copilotTokenExpiresAt") ||
-      null
-    );
+    const topLevel = credentials?.copilotTokenExpiresAt;
+    if (typeof topLevel === "string" || typeof topLevel === "number") {
+      return topLevel;
+    }
+
+    const providerValue = getProviderSpecificValue(credentials, "copilotTokenExpiresAt");
+    if (typeof providerValue === "string" || typeof providerValue === "number") {
+      return providerValue;
+    }
+
+    return null;
   }
 
   buildUrl(model: string, _stream: boolean, _urlIndex = 0) {
