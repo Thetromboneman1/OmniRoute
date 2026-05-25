@@ -9,6 +9,7 @@
 ### 🛠️ Maintenance
 
 - **chore(ci):** verify executor lint block remains clean with targeted ESLint validation and remote CI reruns.
+- **fix(workflow):** harden TruffleHog diff range resolution so `workflow_dispatch` runs skip gracefully when base/head resolve to the same commit.
 
 ---
 

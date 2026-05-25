@@ -110,13 +110,43 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Resolve TruffleHog diff range
+        id: trufflehog-range
+        shell: bash
+        run: |
+          HEAD_SHA="$(git rev-parse HEAD)"
+          BASE_SHA="${{ github.event.before }}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+              BASE_SHA="$(git rev-parse HEAD^)"
+            else
+              BASE_SHA="$HEAD_SHA"
+            fi
+          fi
+
+          echo "base=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+          if [ "$BASE_SHA" = "$HEAD_SHA" ]; then
+            echo "scan=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "scan=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: TruffleHog Secret Scan
+        if: ${{ steps.trufflehog-range.outputs.scan == 'true' }}
         uses: trufflesecurity/trufflehog@main
         with:
           path: ./
-          base: ${{ github.event.before || github.event.repository.default_branch }}
-          head: HEAD
+          base: ${{ steps.trufflehog-range.outputs.base }}
+          head: ${{ steps.trufflehog-range.outputs.head }}
           extra_args: --only-verified
+
+      - name: Explain TruffleHog skip
+        if: ${{ steps.trufflehog-range.outputs.scan != 'true' }}
+        run: |
+          echo "TruffleHog scan skipped because BASE and HEAD resolved to the same commit (${{ steps.trufflehog-range.outputs.head }})." >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-node@v6
         with:
