@@ -105,6 +105,18 @@ function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil((text || "").length / 4));
 }
 
+function getBlackboxSessionEmail(sessionData: Record<string, unknown> | null): string | undefined {
+  if (!sessionData || typeof sessionData !== "object") {
+    return undefined;
+  }
+  const user = (sessionData as Record<string, unknown>).user;
+  if (!user || typeof user !== "object") {
+    return undefined;
+  }
+  const email = (user as Record<string, unknown>).email;
+  return typeof email === "string" ? email : undefined;
+}
+
 function sseChunk(data: unknown): string {
   return `data: ${JSON.stringify(data)}\n\n`;
 }
@@ -333,7 +345,7 @@ export class BlackboxWebExecutor extends BaseExecutor {
           signal: sideSignal,
         });
         sessionData = sessionRes.ok ? ((await sessionRes.json()) as Record<string, unknown>) : null;
-        const email = (sessionData as any)?.user?.email as string | undefined;
+        const email = getBlackboxSessionEmail(sessionData);
         teamAccount = email || "";
         log?.debug?.("BLACKBOX-WEB", `Session email: ${email ?? "none"}`);
 

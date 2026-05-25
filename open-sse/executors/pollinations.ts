@@ -1,4 +1,5 @@
 import { BaseExecutor } from "./base.ts";
+import type { ProviderCredentials } from "./base.ts";
 import { PROVIDERS } from "../config/constants.ts";
 
 /**
@@ -16,14 +17,19 @@ export class PollinationsExecutor extends BaseExecutor {
     super("pollinations", PROVIDERS["pollinations"] || { format: "openai" });
   }
 
-  buildUrl(_model: string, _stream: boolean, urlIndex = 0, _credentials = null): string {
+  buildUrl(
+    _model: string,
+    _stream: boolean,
+    urlIndex = 0,
+    _credentials: ProviderCredentials | null = null
+  ): string {
     const baseUrls = this.getBaseUrls();
     return (
       baseUrls[urlIndex] || baseUrls[0] || "https://text.pollinations.ai/openai/chat/completions"
     );
   }
 
-  buildHeaders(credentials: any, stream = true): Record<string, string> {
+  buildHeaders(credentials: ProviderCredentials | null, stream = true): Record<string, string> {
     const key = credentials?.apiKey || credentials?.accessToken;
 
     const headers: Record<string, string> = {
@@ -41,7 +47,12 @@ export class PollinationsExecutor extends BaseExecutor {
     return headers;
   }
 
-  transformRequest(model: string, body: any, _stream: boolean, _credentials: any): any {
+  transformRequest(
+    _model: string,
+    body: unknown,
+    _stream: boolean,
+    _credentials: ProviderCredentials | null
+  ): unknown {
     // Pollinations uses provider aliases directly: "openai", "claude", "gemini", etc.
     return body;
   }

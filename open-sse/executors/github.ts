@@ -6,19 +6,40 @@ import {
   getGitHubCopilotRefreshHeaders,
 } from "../config/providerHeaderProfiles.ts";
 
+type GithubProviderCredentials = ProviderCredentials & {
+  copilotToken?: string;
+  copilotTokenExpiresAt?: string | number;
+};
+
+function getProviderSpecificString(
+  credentials: GithubProviderCredentials | null | undefined,
+  key: string
+): string | null {
+  const providerSpecificData = credentials?.providerSpecificData;
+  if (
+    !providerSpecificData ||
+    typeof providerSpecificData !== "object" ||
+    Array.isArray(providerSpecificData)
+  ) {
+    return null;
+  }
+  const value = (providerSpecificData as Record<string, unknown>)[key];
+  return typeof value === "string" ? value : null;
+}
+
 export class GithubExecutor extends BaseExecutor {
   constructor() {
     super("github", PROVIDERS.github);
   }
 
-  getCopilotToken(credentials: Record<string, any> | null | undefined) {
-    return credentials?.copilotToken || credentials?.providerSpecificData?.copilotToken || null;
+  getCopilotToken(credentials: GithubProviderCredentials | null | undefined) {
+    return credentials?.copilotToken || getProviderSpecificString(credentials, "copilotToken");
   }
 
-  getCopilotTokenExpiresAt(credentials: Record<string, any> | null | undefined) {
+  getCopilotTokenExpiresAt(credentials: GithubProviderCredentials | null | undefined) {
     return (
       credentials?.copilotTokenExpiresAt ||
-      credentials?.providerSpecificData?.copilotTokenExpiresAt ||
+      getProviderSpecificString(credentials, "copilotTokenExpiresAt") ||
       null
     );
   }
@@ -35,7 +56,10 @@ export class GithubExecutor extends BaseExecutor {
     return this.config.baseUrl;
   }
 
-  injectResponseFormat(messages: Array<Record<string, any>>, responseFormat: any) {
+  injectResponseFormat(
+    messages: Array<Record<string, unknown>>,
+    responseFormat: Record<string, unknown> | null
+  ) {
     if (!responseFormat) return messages;
 
     let formatInstruction = "";
@@ -43,8 +67,12 @@ export class GithubExecutor extends BaseExecutor {
       formatInstruction =
         "Respond only with valid JSON. Do not include any text before or after the JSON object.";
     } else if (responseFormat.type === "json_schema" && responseFormat.json_schema) {
+      const jsonSchema =
+        responseFormat.json_schema && typeof responseFormat.json_schema === "object"
+          ? (responseFormat.json_schema as Record<string, unknown>)
+          : null;
       formatInstruction = `Respond only with valid JSON matching this schema:\n${JSON.stringify(
-        responseFormat.json_schema.schema,
+        jsonSchema?.schema ?? {},
         null,
         2
       )}\nDo not include any text before or after the JSON.`;
@@ -54,38 +82,63 @@ export class GithubExecutor extends BaseExecutor {
 
     const systemIdx = messages.findIndex((m) => m.role === "system");
     if (systemIdx >= 0) {
-      return messages.map((m, i: number) =>
-        i === systemIdx ? { ...m, content: `${m.content}\n\n${formatInstruction}` } : m
-      );
+      return messages.map((message, i: number) => {
+        if (i !== systemIdx) {
+          return message;
+        }
+        const content =
+          typeof message.content === "string" ? message.content : JSON.stringify(message.content);
+        return { ...message, content: `${content}\n\n${formatInstruction}` };
+      });
     }
 
     return [{ role: "system", content: formatInstruction }, ...messages];
   }
 
-  transformRequest(model: string, body: any, stream: boolean, credentials: any): any {
+  transformRequest(
+    model: string,
+    body: unknown,
+    stream: boolean,
+    credentials: GithubProviderCredentials
+  ): Record<string, unknown> {
     void stream;
     void credentials;
 
-    const sourceBody = body && typeof body === "object" ? body : {};
+    const sourceBody =
+      body && typeof body === "object" ? (body as Record<string, unknown>) : ({} as Record<string, unknown>);
     const modifiedBody = { ...sourceBody };
 
     if (Array.isArray(sourceBody.messages)) {
-      modifiedBody.messages = sourceBody.messages.map((msg) => {
-        if (!msg || typeof msg !== "object") return msg;
-        const role = typeof msg.role === "string" ? msg.role.toLowerCase() : "";
-        if (role !== "assistant") return msg;
-        if (msg.reasoning_text === undefined && msg.reasoning_content === undefined) return msg;
-        const next = { ...msg };
+      modifiedBody.messages = sourceBody.messages.map((msg: unknown) => {
+        if (!msg || typeof msg !== "object") {
+          return msg;
+        }
+        const message = msg as Record<string, unknown>;
+        const role = typeof message.role === "string" ? message.role.toLowerCase() : "";
+        if (role !== "assistant") {
+          return message;
+        }
+        if (message.reasoning_text === undefined && message.reasoning_content === undefined) {
+          return message;
+        }
+        const next = { ...message };
         delete next.reasoning_text;
         delete next.reasoning_content;
         return next;
       });
     }
 
-    if (modifiedBody.response_format && model.toLowerCase().includes("claude")) {
+    if (
+      modifiedBody.response_format &&
+      typeof modifiedBody.response_format === "object" &&
+      !Array.isArray(modifiedBody.response_format) &&
+      model.toLowerCase().includes("claude")
+    ) {
       modifiedBody.messages = this.injectResponseFormat(
-        Array.isArray(modifiedBody.messages) ? modifiedBody.messages : [],
-        modifiedBody.response_format
+        Array.isArray(modifiedBody.messages)
+          ? (modifiedBody.messages as Array<Record<string, unknown>>)
+          : [],
+        modifiedBody.response_format as Record<string, unknown>
       );
       delete modifiedBody.response_format;
     }

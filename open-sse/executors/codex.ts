@@ -1253,19 +1253,35 @@ export class CodexExecutor extends BaseExecutor {
 
     // Issue #1832: Map messages to input for clients like Cursor 5.5 that use responses/compact but send messages instead of input
     if (!body.input && Array.isArray(body.messages)) {
-      body.input = body.messages.map((msg: any) => ({
-        type: "message",
-        role: typeof msg.role === "string" ? msg.role : "user",
-        content:
-          typeof msg.content === "string"
-            ? [{ type: "input_text", text: msg.content }]
-            : Array.isArray(msg.content)
-              ? msg.content.map((c: any) => {
-                  if (c && c.type === "text") return { type: "input_text", text: c.text };
-                  return c;
+      body.input = body.messages.map((msg: unknown) => {
+        const message = msg && typeof msg === "object" ? (msg as Record<string, unknown>) : {};
+        const role = typeof message.role === "string" ? message.role : "user";
+        const rawContent = message.content;
+        const content =
+          typeof rawContent === "string"
+            ? [{ type: "input_text", text: rawContent }]
+            : Array.isArray(rawContent)
+              ? rawContent.map((part: unknown) => {
+                  if (!part || typeof part !== "object") {
+                    return part;
+                  }
+                  const contentPart = part as Record<string, unknown>;
+                  if (contentPart.type === "text") {
+                    return {
+                      type: "input_text",
+                      text: typeof contentPart.text === "string" ? contentPart.text : "",
+                    };
+                  }
+                  return contentPart;
                 })
-              : [],
-      }));
+              : [];
+
+        return {
+          type: "message",
+          role,
+          content,
+        };
+      });
     }
 
     // Issue #806: Even for native passthrough, some clients (purist completions) might indiscriminately inject

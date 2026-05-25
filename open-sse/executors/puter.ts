@@ -1,4 +1,5 @@
 import { BaseExecutor } from "./base.ts";
+import type { ProviderCredentials } from "./base.ts";
 import { PROVIDERS } from "../config/constants.ts";
 
 /**
@@ -32,7 +33,7 @@ export class PuterExecutor extends BaseExecutor {
     return "https://api.puter.com/puterai/openai/v1/chat/completions";
   }
 
-  buildHeaders(credentials: any, stream = true): Record<string, string> {
+  buildHeaders(credentials: ProviderCredentials | null, stream = true): Record<string, string> {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
     };
@@ -49,7 +50,12 @@ export class PuterExecutor extends BaseExecutor {
     return headers;
   }
 
-  transformRequest(model: string, body: any, _stream: boolean, _credentials: any): any {
+  transformRequest(
+    _model: string,
+    body: unknown,
+    _stream: boolean,
+    _credentials: ProviderCredentials | null
+  ): unknown {
     // Puter accepts model IDs directly from its catalog.
     // No transformation required — model string is passed as-is.
     return body;

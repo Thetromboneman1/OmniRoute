@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### 🐛 Bug Fixes
+
+- **fix(executors):** remove unsafe `any` usage in key executor adapters (`azure-openai`, `blackbox-web`, `cliproxyapi`, `codex`, `github`, `opencode`, `pollinations`, `puter`, `vertex`) to clean terminal/CI lint diagnostics.
+
+### 🛠️ Maintenance
+
+- **chore(ci):** verify executor lint block remains clean with targeted ESLint validation and remote CI reruns.
+
 ---
 
 ## [3.7.8] — 2026-05-01

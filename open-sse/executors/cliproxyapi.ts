@@ -19,6 +19,7 @@ import {
   BaseExecutor,
   mergeUpstreamExtraHeaders,
   mergeAbortSignals,
+  type ExecuteInput,
   type ProviderCredentials,
 } from "./base.ts";
 import { HTTP_STATUS, FETCH_TIMEOUT_MS } from "../config/constants.ts";
@@ -102,15 +103,7 @@ export class CliproxyapiExecutor extends BaseExecutor {
     return transformed;
   }
 
-  async execute(input: {
-    model: string;
-    body: unknown;
-    stream: boolean;
-    credentials: ProviderCredentials;
-    signal?: AbortSignal | null;
-    log?: any;
-    upstreamExtraHeaders?: Record<string, string> | null;
-  }) {
+  async execute(input: ExecuteInput) {
     const url = this.buildUrl(input.model, input.stream, 0, input.credentials);
     const headers = this.buildHeaders(input.credentials, input.stream);
     const transformedBody = this.transformRequest(
