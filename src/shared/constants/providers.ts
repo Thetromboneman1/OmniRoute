@@ -1482,14 +1482,14 @@ export const LOCAL_PROVIDERS = {
   "docker-model-runner": {
     id: "docker-model-runner",
     alias: "dmr",
-    name: "Local MLX / Docker Model Runner",
+    name: "Docker Model Runner (vLLM-metal first)",
     icon: "inventory_2",
     color: "#2496ED",
     textIcon: "DM",
     website: "https://docs.docker.com/ai/model-runner/",
     authHint:
-      "API key optional. Configure the local MLX OpenAI-compatible base URL (default: http://localhost:18080/v1).",
-    localDefault: "http://localhost:18080/v1",
+      "API key optional. Configure Docker Model Runner OpenAI-compatible base URL (default: http://localhost:12434/engines/v1).",
+    localDefault: "http://localhost:12434/engines/v1",
     passthroughModels: true,
   },
   xinference: {
