@@ -296,7 +296,7 @@ test("providers route accepts managed local, audio, web-cookie and search provid
         provider: "docker-model-runner",
         name: "Docker Model Runner Local",
         providerSpecificData: {
-          baseUrl: "http://localhost:12434/v1",
+          baseUrl: "http://localhost:18080/v1",
         },
       },
     },
