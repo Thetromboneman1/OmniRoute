@@ -4,6 +4,8 @@ This guide explains how to install and configure all supported AI coding CLI too
 to use **OmniRoute** as the unified backend, giving you centralized key management,
 cost tracking, model switching, and request logging across every tool.
 
+Workspace canonical local profile reference: `LOCAL_LLM_CANONICAL_PROFILE.md`
+
 ---
 
 ## How It Works
