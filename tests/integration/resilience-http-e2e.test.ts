@@ -624,6 +624,9 @@ test("wait-for-cooldown honors upstream Retry-After when enabled", async () => {
           baseCooldownMs: 200,
         },
       },
+      requestQueue: {
+        maxWaitMs: 5_000,
+      },
       waitForCooldown: {
         enabled: true,
         maxRetries: 1,
