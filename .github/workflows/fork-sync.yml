@@ -8,15 +8,18 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   sync:
+    name: Synchronize fork with upstream
     runs-on: ubuntu-latest
-    # Keep scheduled fork sync resilient to transient GitHub runner/network auth issues.
-    continue-on-error: true
     timeout-minutes: 10
     steps:
       - name: Checkout fork
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           token: ${{ github.token }}
@@ -27,43 +30,109 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Configure origin auth for push
+      - name: Configure origin remote with authentication
         run: |
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
-      - name: Add upstream remote
+      - name: Add and fetch upstream
         run: |
-          set -euo pipefail
-
-          git remote add upstream https://github.com/diegosouzapw/OmniRoute.git || \
+          set -Eeuo pipefail
+          
+          # Add or update upstream remote
+          git remote add upstream https://github.com/diegosouzapw/OmniRoute.git 2>/dev/null || \
             git remote set-url upstream https://github.com/diegosouzapw/OmniRoute.git
-
-          # Fetch upstream anonymously to avoid occasional credential-header prompt failures.
+          
+          # Fetch upstream main with retries (3 attempts, 5s backoff between each)
+          # Use anonymous fetch to avoid occasional credential-header issues
           for attempt in 1 2 3; do
-            if git -c http.https://github.com/.extraheader= fetch --prune --no-tags upstream main; then
-              break
-            fi
-
-            if [ "$attempt" -eq 3 ]; then
-              echo "::error::Failed to fetch upstream/main after 3 attempts"
-              exit 1
-            fi
-
-            sleep $((attempt * 5))
-          done
-
-      - name: Fast-forward fork main from upstream
-        run: |
-          set -euo pipefail
-
-          if git merge-base --is-ancestor HEAD upstream/main; then
-            if [ "$(git rev-parse HEAD)" = "$(git rev-parse upstream/main)" ]; then
-              echo "Fork already up to date with upstream/main"
+            echo "Attempt $attempt: Fetching upstream/main..."
+            if git -c http.https://github.com/.extraheader= fetch --prune --no-tags upstream main 2>&1; then
+              echo "✓ Successfully fetched upstream/main"
               exit 0
             fi
+            
+            if [ "$attempt" -lt 3 ]; then
+              sleep_seconds=$((attempt * 5))
+              echo "⚠ Fetch failed, retrying in ${sleep_seconds}s..."
+              sleep "$sleep_seconds"
+            fi
+          done
+          
+          echo "::error::Failed to fetch upstream/main after 3 attempts"
+          exit 1
+
+      - name: Determine sync strategy
+        id: strategy
+        run: |
+          set -Eeuo pipefail
+          
+          # Check if fork is an ancestor of upstream (clean fork state)
+          if git merge-base --is-ancestor HEAD upstream/main; then
+            STRATEGY="fast-forward"
+            echo "strategy=fast-forward" >> "$GITHUB_OUTPUT"
+            
+            # Check if already up-to-date
+            if [ "$(git rev-parse HEAD)" = "$(git rev-parse upstream/main)" ]; then
+              echo "status=up-to-date" >> "$GITHUB_OUTPUT"
+              echo "✓ Fork is already up-to-date with upstream/main"
+            else
+              echo "status=behind" >> "$GITHUB_OUTPUT"
+              echo "ℹ Fork is behind upstream/main by $(git rev-list --count HEAD..upstream/main) commits"
+            fi
+          else
+            STRATEGY="diverged"
+            echo "strategy=diverged" >> "$GITHUB_OUTPUT"
+            echo "status=diverged" >> "$GITHUB_OUTPUT"
+            echo "⚠ Fork has diverged: $(git rev-list --count upstream/main..HEAD) local commits not in upstream"
+          fi
+
+      - name: Sync fork (fast-forward if possible)
+        if: steps.strategy.outputs.status != 'up-to-date'
+        run: |
+          set -Eeuo pipefail
+          
+          STRATEGY="${{ steps.strategy.outputs.strategy }}"
+          STATUS="${{ steps.strategy.outputs.status }}"
+          
+          if [ "$STRATEGY" = "fast-forward" ] && [ "$STATUS" = "behind" ]; then
+            echo "Performing fast-forward merge from upstream/main..."
             git merge --ff-only upstream/main
             git push origin HEAD:main
-            echo "Fork updated from upstream/main"
+            echo "✓ Fork successfully updated from upstream/main"
+          elif [ "$STRATEGY" = "diverged" ]; then
+            echo "::warning::Fork has commits not in upstream/main (diverged). Skipping auto-sync to preserve local changes."
+            echo "To recover, manually review commits: git log --oneline upstream/main..HEAD"
+            exit 0
           else
-            echo "Fork has commits not in upstream; skipping auto-ff to avoid rewriting history"
+            echo "No sync action needed"
+            exit 0
           fi
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## Fork Sync Summary"
+            echo ""
+            echo "**Workflow:** ${{ github.workflow }}"
+            echo "**Repository:** ${{ github.repository }}"
+            echo "**Branch:** ${{ github.ref_name }}"
+            echo "**Triggered by:** ${{ github.event_name }}"
+            echo "**Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            echo ""
+            
+            if [ "${{ job.status }}" = "success" ]; then
+              echo "### ✅ Status: SUCCESS"
+              if [ "${{ steps.strategy.outputs.status }}" = "up-to-date" ]; then
+                echo "Fork is synchronized with upstream/main."
+              else
+                echo "Fork has been synchronized with upstream/main."
+              fi
+            else
+              echo "### ❌ Status: FAILED"
+              echo "Fork synchronization encountered an error. Review logs above."
+            fi
+            echo ""
+            echo "**Strategy:** ${{ steps.strategy.outputs.strategy }}"
+            echo "**Status:** ${{ steps.strategy.outputs.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
