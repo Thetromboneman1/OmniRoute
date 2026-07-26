@@ -2390,3 +2390,11 @@ MIT License - see [LICENSE](LICENSE) for details.
   <sub><a href="https://omniroute.online">omniroute.online</a></sub>
 </div>
 <!-- GitHub Discussions enabled for community Q&A -->
+
+<!-- repository-maintenance -->
+
+## Repository maintenance
+
+The repository role, upstream relationship, workflow inventory, build and
+recovery procedure, secret names, notification status, and maintenance policy
+are documented in [docs/repository-maintenance.md](docs/repository-maintenance.md).
