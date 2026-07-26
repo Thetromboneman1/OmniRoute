@@ -5,4 +5,10 @@ if ! command -v npm >/dev/null 2>&1; then
   exit 0
 fi
 
+if ! node -e 'const major=Number(process.versions.node.split(".")[0]);process.exit([20,22,24].includes(major)?0:1)'; then
+  echo "❌ Unsupported Node.js runtime for OmniRoute pre-push tests: $(node --version)"
+  echo "   Use the version in .node-version (Node 24) before pushing."
+  exit 1
+fi
+
 npm run test:unit

@@ -2259,7 +2259,8 @@ Se não quiser criar credenciais próprias agora, ainda é possível usar o flux
 <details>
 <summary><b>Click to expand tech stack details</b></summary>
 
-- **Runtime**: Node.js 18–22 LTS (⚠️ Node.js 24+ is **not supported** — `better-sqlite3` native binaries are incompatible)
+- **Runtime**: Node.js 20.20.x, 22.22.x, or 24.x, matching the
+  `package.json` engine policy and `.node-version`.
 - **Language**: TypeScript 5.9 — **100% TypeScript** across `src/` and `open-sse/` (zero `any` in core modules since v2.0)
 - **Framework**: Next.js 16 + React 19 + Tailwind CSS 4
 - **Database**: better-sqlite3 (SQLite) + LowDB (JSON legacy) — domain state, proxy logs, MCP audit, routing decisions, memory, skills
