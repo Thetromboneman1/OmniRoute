@@ -284,13 +284,15 @@ test("handleChat returns stream readiness timeout without entering cooldown-awar
 test("handleChat aborts the pending cooldown wait when the client disconnects", async () => {
   await seedConnection("openai", {
     apiKey: "sk-openai-cooldown-abort",
-    rateLimitedUntil: new Date(Date.now() + 250).toISOString(),
+    // Keep the cooldown far enough in the future that a heavily loaded CI
+    // runner cannot let it expire before handleChat reaches the abortable wait.
+    rateLimitedUntil: new Date(Date.now() + 60_000).toISOString(),
     lastError: "abort retry wait",
     errorCode: 429,
   });
   await settingsDb.updateSettings({
     requestRetry: 1,
-    maxRetryIntervalSec: 1,
+    maxRetryIntervalSec: 120,
   });
 
   let fetchCalls = 0;
