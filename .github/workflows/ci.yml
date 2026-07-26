@@ -109,8 +109,12 @@ jobs:
   advanced-security:
     name: Advanced Security Scans
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: read
     env:
       SNYK_TOKEN: ""
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
@@ -179,8 +183,19 @@ jobs:
               exit "$audit_status"
             fi
             if [ "$attempt" -eq 3 ]; then
-              echo "::error::npm audit endpoint failed after ${attempt} attempts"
-              exit "$audit_status"
+              echo "::warning::npm audit endpoint failed after ${attempt} attempts; checking GitHub Dependabot alerts"
+              if ! high_alerts="$(gh api \
+                "repos/${GITHUB_REPOSITORY}/dependabot/alerts?state=open&per_page=100" \
+                --jq '[.[] | select(.security_advisory.severity == "high" or .security_advisory.severity == "critical")] | length')"; then
+                echo "::error::Both npm audit and the Dependabot alert fallback failed"
+                exit "$audit_status"
+              fi
+              if [ "$high_alerts" -gt 0 ]; then
+                echo "::error::Dependabot reports ${high_alerts} open high or critical alert(s)"
+                exit 1
+              fi
+              echo "npm audit transport failed, but Dependabot reports no open high or critical alerts." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
             fi
 
             delay=$((attempt * 5))
