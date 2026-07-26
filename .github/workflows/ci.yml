@@ -163,7 +163,30 @@ jobs:
       - run: npm run check:node-runtime
 
       - name: Dependency audit
-        run: npm audit --audit-level=high --omit=dev
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            set +e
+            audit_output="$(npm audit --audit-level=high --omit=dev 2>&1)"
+            audit_status=$?
+            set -e
+            printf '%s\n' "$audit_output"
+
+            if [ "$audit_status" -eq 0 ]; then
+              exit 0
+            fi
+            if ! grep -Eq 'audit endpoint returned an error|invalid json response body' <<<"$audit_output"; then
+              exit "$audit_status"
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::npm audit endpoint failed after ${attempt} attempts"
+              exit "$audit_status"
+            fi
+
+            delay=$((attempt * 5))
+            echo "::warning::npm audit endpoint failed on attempt ${attempt}; retrying in ${delay}s"
+            sleep "$delay"
+          done
 
       - name: Check for known vulnerabilities
         run: npx is-my-node-vulnerable
@@ -304,7 +327,29 @@ jobs:
       - run: npm ci
       - run: npm run check:node-runtime
       - name: Run coverage gate
-        run: npm run test:coverage
+        shell: bash
+        run: |
+          for attempt in 1 2; do
+            set +e
+            npm run test:coverage 2>&1 | tee /tmp/omniroute-coverage.log
+            coverage_status=${PIPESTATUS[0]}
+            set -e
+
+            if [ "$coverage_status" -eq 0 ]; then
+              exit 0
+            fi
+            if ! grep -Fq 'Unable to deserialize cloned data' /tmp/omniroute-coverage.log; then
+              exit "$coverage_status"
+            fi
+            if [ "$attempt" -eq 2 ]; then
+              echo "::error::Node test-runner IPC failed after ${attempt} attempts"
+              exit "$coverage_status"
+            fi
+
+            echo "::warning::Node test-runner IPC failed; retrying coverage once in 5s"
+            rm -rf coverage
+            sleep 5
+          done
       - name: Build coverage summary
         if: always()
         run: |
