@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           fetch-depth: 0
           token: ${{ github.token }}
@@ -68,7 +68,6 @@ jobs:
           
           # Check if fork is an ancestor of upstream (clean fork state)
           if git merge-base --is-ancestor HEAD upstream/main; then
-            STRATEGY="fast-forward"
             echo "strategy=fast-forward" >> "$GITHUB_OUTPUT"
             
             # Check if already up-to-date
@@ -80,7 +79,6 @@ jobs:
               echo "ℹ Fork is behind upstream/main by $(git rev-list --count HEAD..upstream/main) commits"
             fi
           else
-            STRATEGY="diverged"
             echo "strategy=diverged" >> "$GITHUB_OUTPUT"
             echo "status=diverged" >> "$GITHUB_OUTPUT"
             echo "⚠ Fork has diverged: $(git rev-list --count upstream/main..HEAD) local commits not in upstream"

@@ -24,8 +24,8 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
@@ -45,11 +45,17 @@ jobs:
     outputs:
       langs: ${{ steps.langs.outputs.langs }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
       - id: langs
         run: |
           LANG_DIR="src/i18n/messages"
-          LANGS=$(ls "$LANG_DIR"/*.json | xargs -n1 basename | sed 's/.json$//' | grep -v '^en$' | jq -R . | jq -s . | jq -c .)
+          LANGS=$(find "$LANG_DIR" -maxdepth 1 -type f -name '*.json' -print0 |
+            xargs -0 -n1 basename |
+            sed 's/.json$//' |
+            grep -v '^en$' |
+            jq -R . |
+            jq -s . |
+            jq -c .)
           echo "langs=${LANGS}" >> "$GITHUB_OUTPUT"
 
   i18n:
@@ -62,8 +68,8 @@ jobs:
         lang: ${{ fromJson(needs.i18n-matrix.outputs.langs) }}
     needs: i18n-matrix
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
         with:
           python-version: "3.12"
 
@@ -73,7 +79,7 @@ jobs:
 
       - name: Upload result
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: i18n-${{ matrix.lang }}
           path: result.txt
@@ -83,10 +89,10 @@ jobs:
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
       - name: Fetch base branch
@@ -106,7 +112,7 @@ jobs:
     env:
       SNYK_TOKEN: ""
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           fetch-depth: 0
 
@@ -136,7 +142,7 @@ jobs:
 
       - name: TruffleHog Secret Scan
         if: ${{ steps.trufflehog-range.outputs.scan == 'true' }}
-        uses: trufflesecurity/trufflehog@main
+        uses: trufflesecurity/trufflehog@6f3c981e7b77f235fd2702dd74af25fc4b72bf11  # main
         with:
           path: ./
           base: ${{ steps.trufflehog-range.outputs.base }}
@@ -148,7 +154,7 @@ jobs:
         run: |
           echo "TruffleHog scan skipped because BASE and HEAD resolved to the same commit (${{ steps.trufflehog-range.outputs.head }})." >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
@@ -169,7 +175,7 @@ jobs:
 
       - name: Run Snyk Vulnerability checks
         if: ${{ github.actor != 'dependabot[bot]' && env.SNYK_TOKEN != '' }}
-        uses: snyk/actions/node@master
+        uses: snyk/actions/node@8e119fbb6c251787721d34ba683ed48eba792766  # master
         env:
           SNYK_TOKEN: ${{ env.SNYK_TOKEN }}
         with:
@@ -179,8 +185,8 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
@@ -195,8 +201,8 @@ jobs:
     env:
       JWT_SECRET: ci-build-secret-with-sufficient-length-for-validation
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
@@ -214,8 +220,8 @@ jobs:
       JWT_SECRET: ci-build-secret-with-sufficient-length-for-validation
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
@@ -247,8 +253,8 @@ jobs:
       API_KEY_SECRET: ci-test-api-key-secret-long
       DISABLE_SQLITE_AUTO_BACKUP: "true"
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
@@ -270,8 +276,8 @@ jobs:
       API_KEY_SECRET: ci-test-api-key-secret-long
       DISABLE_SQLITE_AUTO_BACKUP: "true"
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
         with:
           node-version: ${{ env.CI_NODE_24_VERSION }}
           cache: npm
@@ -290,8 +296,8 @@ jobs:
       API_KEY_SECRET: ci-test-api-key-secret-long
       DISABLE_SQLITE_AUTO_BACKUP: "true"
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
@@ -318,7 +324,7 @@ jobs:
           cat coverage/coverage-report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Upload coverage artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: coverage-report
           path: |
@@ -336,10 +342,10 @@ jobs:
       SONAR_TOKEN: ""
       SONAR_HOST_URL: ""
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           name: coverage-report
           path: .
@@ -349,7 +355,7 @@ jobs:
           echo "SonarQube scan skipped because SONAR_TOKEN or SONAR_HOST_URL is not configured." >> "$GITHUB_STEP_SUMMARY"
       - name: SonarQube Scan
         if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' }}
-        uses: SonarSource/sonarqube-scan-action@v7
+        uses: SonarSource/sonarqube-scan-action@c7ee0f9df90b7aa20e8dcf9695dcfe2e7da5b4f2  # v7
         env:
           SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
@@ -369,7 +375,7 @@ jobs:
       - name: Download coverage artifact
         if: ${{ needs.test-coverage.result != 'cancelled' }}
         continue-on-error: true
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           name: coverage-report
           path: .
@@ -398,7 +404,7 @@ jobs:
               echo "This PR changes production code in \`src/\`, \`open-sse/\`, \`electron/\`, or \`bin/\` without accompanying automated tests."
             fi
           } > .artifacts/pr-coverage-comment.md
-      - uses: actions/github-script@v9
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9
         with:
           script: |
             const fs = require("fs");
@@ -447,8 +453,8 @@ jobs:
       DISABLE_SQLITE_AUTO_BACKUP: "true"
       OMNIROUTE_PLAYWRIGHT_SKIP_BUILD: "1"
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
@@ -474,8 +480,8 @@ jobs:
       DATA_DIR: /tmp/omniroute-ci-${{ matrix.shard }}
       DISABLE_SQLITE_AUTO_BACKUP: "true"
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
@@ -492,8 +498,8 @@ jobs:
       API_KEY_SECRET: ci-test-api-key-secret-long
       DISABLE_SQLITE_AUTO_BACKUP: "true"
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38  # v6
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
           cache: npm
@@ -524,7 +530,7 @@ jobs:
     steps:
       - name: Download i18n results
         continue-on-error: true
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           pattern: i18n-*
           path: results
@@ -544,7 +550,9 @@ jobs:
             esac
           }
 
+          # shellcheck disable=SC2129
           echo "# 🚀 CI Dashboard" >> "$GITHUB_STEP_SUMMARY"
+          # shellcheck disable=SC2129
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
           echo "## 🧱 Core Checks" >> "$GITHUB_STEP_SUMMARY"
@@ -590,6 +598,7 @@ jobs:
             done
           fi
 
+          # shellcheck disable=SC2129
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|--------|------|" >> "$GITHUB_STEP_SUMMARY"
