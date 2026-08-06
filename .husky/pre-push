@@ -11,4 +11,7 @@ if ! node -e 'const major=Number(process.versions.node.split(".")[0]);process.ex
   exit 1
 fi
 
-npm run test:unit
+test_data_dir="$(mktemp -d "${TMPDIR:-/tmp}/omniroute-pre-push.XXXXXX")"
+trap 'rm -rf -- "$test_data_dir"' EXIT HUP INT TERM
+
+DATA_DIR="$test_data_dir" npm run test:unit
