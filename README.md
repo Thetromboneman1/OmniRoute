@@ -2399,3 +2399,19 @@ MIT License - see [LICENSE](LICENSE) for details.
 The repository role, upstream relationship, workflow inventory, build and
 recovery procedure, secret names, notification status, and maintenance policy
 are documented in [docs/repository-maintenance.md](docs/repository-maintenance.md).
+
+<!-- documentation-health:start -->
+## Current repository state
+
+![OmniRoute system architecture](docs/architecture/omniroute-system-architecture.png)
+
+- **Default branch:** `main`
+- **Implementation fingerprint:** `9b5861c83ad3621a`
+- **Detected structure:** Source modules, Automation modules, GitHub Actions, Tests and validation, Maintained documentation.
+- **Documentation contract:** editable diagram sources, committed PNG renderings,
+  resolved local image links, and generated state are checked on every commit.
+- **Refresh command:** `python3 scripts/documentation_health.py --write`
+
+See [repository state](docs/REPOSITORY_STATE.md) and the
+[architecture asset guide](docs/architecture/README.md).
+<!-- documentation-health:end -->

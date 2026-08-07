@@ -1,0 +1,25 @@
+flowchart TD
+    A[Incoming model string] --> B{Is combo name?}
+    B -- Yes --> C[Load combo models sequence]
+    B -- No --> D[Single model path]
+
+    C --> E[Try model N]
+    E --> F[Resolve provider/model]
+    D --> F
+
+    F --> G[Select account credentials]
+    G --> H{Credentials available?}
+    H -- No --> I[Return provider unavailable]
+    H -- Yes --> J[Execute request]
+
+    J --> K{Success?}
+    K -- Yes --> L[Return response]
+    K -- No --> M{Fallback-eligible error?}
+
+    M -- No --> N[Return error]
+    M -- Yes --> O[Mark account unavailable cooldown]
+    O --> P{Another account for provider?}
+    P -- Yes --> G
+    P -- No --> Q{In combo with next model?}
+    Q -- Yes --> E
+    Q -- No --> R[Return all unavailable]

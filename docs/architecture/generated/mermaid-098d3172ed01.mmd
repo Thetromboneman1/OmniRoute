@@ -1,0 +1,16 @@
+flowchart TD
+    A["App starts"] --> B["constants.ts defines PROVIDERS\nwith hardcoded defaults"]
+    B --> C{"data/provider-credentials.json\nexists?"}
+    C -->|Yes| D["credentialLoader reads JSON"]
+    C -->|No| E["Use hardcoded defaults"]
+    D --> F{"For each provider in JSON"}
+    F --> G{"Provider exists\nin PROVIDERS?"}
+    G -->|No| H["Log warning, skip"]
+    G -->|Yes| I{"Value is object?"}
+    I -->|No| J["Log warning, skip"]
+    I -->|Yes| K["Merge clientId, clientSecret,\ntokenUrl, authUrl, refreshUrl"]
+    K --> F
+    H --> F
+    J --> F
+    F -->|Done| L["PROVIDERS ready with\nmerged credentials"]
+    E --> L

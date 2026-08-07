@@ -20,48 +20,8 @@ Think of it like a universal translator at the United Nations — any delegate c
 
 ## 2. Architecture Overview
 
-```mermaid
-graph LR
-    subgraph Clients
-        A[Claude CLI]
-        B[Codex]
-        C[Cursor IDE]
-        D[OpenAI-compatible]
-    end
+![Rendered system diagram](../../../architecture/generated/mermaid-fe9649d8dc77.png)
 
-    subgraph omniroute
-        E[Handler Layer]
-        F[Translator Layer]
-        G[Executor Layer]
-        H[Services Layer]
-    end
-
-    subgraph Providers
-        I[Anthropic Claude]
-        J[Google Gemini]
-        K[OpenAI / Codex]
-        L[GitHub Copilot]
-        M[AWS Kiro]
-        N[Antigravity]
-        O[Cursor API]
-    end
-
-    A --> E
-    B --> E
-    C --> E
-    D --> E
-    E --> F
-    F --> G
-    G --> I
-    G --> J
-    G --> K
-    G --> L
-    G --> M
-    G --> N
-    G --> O
-    H -.-> E
-    H -.-> G
-```
 
 ### Core Principle: Hub-and-Spoke Translation
 
@@ -123,24 +83,8 @@ The **single source of truth** for all provider configuration.
 
 #### Credential Loading Flow
 
-```mermaid
-flowchart TD
-    A["App starts"] --> B["constants.ts defines PROVIDERS\nwith hardcoded defaults"]
-    B --> C{"data/provider-credentials.json\nexists?"}
-    C -->|Yes| D["credentialLoader reads JSON"]
-    C -->|No| E["Use hardcoded defaults"]
-    D --> F{"For each provider in JSON"}
-    F --> G{"Provider exists\nin PROVIDERS?"}
-    G -->|No| H["Log warning, skip"]
-    G -->|Yes| I{"Value is object?"}
-    I -->|No| J["Log warning, skip"]
-    I -->|Yes| K["Merge clientId, clientSecret,\ntokenUrl, authUrl, refreshUrl"]
-    K --> F
-    H --> F
-    J --> F
-    F -->|Done| L["PROVIDERS ready with\nmerged credentials"]
-    E --> L
-```
+![Rendered system diagram](../../../architecture/generated/mermaid-098d3172ed01.png)
+
 
 ---
 
@@ -148,53 +92,8 @@ flowchart TD
 
 Executors encapsulate **provider-specific logic** using the **Strategy Pattern**. Each executor overrides base methods as needed.
 
-```mermaid
-classDiagram
-    class BaseExecutor {
-        +buildUrl(model, stream, options)
-        +buildHeaders(credentials, stream, body)
-        +transformRequest(body, model, stream, credentials)
-        +execute(url, options)
-        +shouldRetry(status, error)
-        +refreshCredentials(credentials, log)
-    }
+![Rendered system diagram](../../../architecture/generated/mermaid-a5d1a5557f15.png)
 
-    class DefaultExecutor {
-        +refreshCredentials()
-    }
-
-    class AntigravityExecutor {
-        +buildUrl()
-        +buildHeaders()
-        +transformRequest()
-        +shouldRetry()
-        +refreshCredentials()
-    }
-
-    class CursorExecutor {
-        +buildUrl()
-        +buildHeaders()
-        +transformRequest()
-        +parseResponse()
-        +generateChecksum()
-    }
-
-    class KiroExecutor {
-        +buildUrl()
-        +buildHeaders()
-        +transformRequest()
-        +parseEventStream()
-        +refreshCredentials()
-    }
-
-    BaseExecutor <|-- DefaultExecutor
-    BaseExecutor <|-- AntigravityExecutor
-    BaseExecutor <|-- CursorExecutor
-    BaseExecutor <|-- KiroExecutor
-    BaseExecutor <|-- CodexExecutor
-    BaseExecutor <|-- GeminiCLIExecutor
-    BaseExecutor <|-- GithubExecutor
-```
 
 | Executor         | Provider                                   | Key Specializations                                                                                                 |
 | ---------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
@@ -223,40 +122,8 @@ The **orchestration layer** — coordinates translation, execution, streaming, a
 
 #### Request Lifecycle (chatCore.ts)
 
-```mermaid
-sequenceDiagram
-    participant Client
-    participant chatCore
-    participant Translator
-    participant Executor
-    participant Provider
+![Rendered system diagram](../../../architecture/generated/mermaid-b00e0a3041f7.png)
 
-    Client->>chatCore: Request (any format)
-    chatCore->>chatCore: Detect source format
-    chatCore->>chatCore: Check bypass patterns
-    chatCore->>chatCore: Resolve model & provider
-    chatCore->>Translator: Translate request (source → OpenAI → target)
-    chatCore->>Executor: Get executor for provider
-    Executor->>Executor: Build URL, headers, transform request
-    Executor->>Executor: Refresh credentials if needed
-    Executor->>Provider: HTTP fetch (streaming or non-streaming)
-
-    alt Streaming
-        Provider-->>chatCore: SSE stream
-        chatCore->>chatCore: Pipe through SSE transform stream
-        Note over chatCore: Transform stream translates<br/>each chunk: target → OpenAI → source
-        chatCore-->>Client: Translated SSE stream
-    else Non-streaming
-        Provider-->>chatCore: JSON response
-        chatCore->>Translator: Translate response
-        chatCore-->>Client: Translated JSON
-    end
-
-    alt Error (401, 429, 500...)
-        chatCore->>Executor: Retry with credential refresh
-        chatCore->>chatCore: Account fallback logic
-    end
-```
 
 ---
 
@@ -283,66 +150,18 @@ Business logic that supports the handlers and executors.
 
 #### Token Refresh Deduplication
 
-```mermaid
-sequenceDiagram
-    participant R1 as Request 1
-    participant R2 as Request 2
-    participant Cache as refreshPromiseCache
-    participant OAuth as OAuth Provider
+![Rendered system diagram](../../../architecture/generated/mermaid-2e76529c5aba.png)
 
-    R1->>Cache: getAccessToken("gemini", token)
-    Cache->>Cache: No in-flight promise
-    Cache->>OAuth: Start refresh
-    R2->>Cache: getAccessToken("gemini", token)
-    Cache->>Cache: Found in-flight promise
-    Cache-->>R2: Return existing promise
-    OAuth-->>Cache: New access token
-    Cache-->>R1: New access token
-    Cache-->>R2: Same access token (shared)
-    Cache->>Cache: Delete cache entry
-```
 
 #### Account Fallback State Machine
 
-```mermaid
-stateDiagram-v2
-    [*] --> Active
-    Active --> Error: Request fails (401/429/500)
-    Error --> Cooldown: Apply backoff
-    Cooldown --> Active: Cooldown expires
-    Active --> Active: Request succeeds (reset backoff)
+![Rendered system diagram](../../../architecture/generated/mermaid-d071e1e963c9.png)
 
-    state Error {
-        [*] --> ClassifyError
-        ClassifyError --> ShouldFallback: Rate limit / Auth / Transient
-        ClassifyError --> NoFallback: 400 Bad Request
-    }
-
-    state Cooldown {
-        [*] --> ExponentialBackoff
-        ExponentialBackoff: Level 0 = 1s
-        ExponentialBackoff: Level 1 = 2s
-        ExponentialBackoff: Level 2 = 4s
-        ExponentialBackoff: Max = 2min
-    }
-```
 
 #### Combo Model Chain
 
-```mermaid
-flowchart LR
-    A["Request with\ncombo model"] --> B["Model A"]
-    B -->|"2xx Success"| C["Return response"]
-    B -->|"429/401/500"| D{"Fallback\neligible?"}
-    D -->|Yes| E["Model B"]
-    D -->|No| F["Return error"]
-    E -->|"2xx Success"| C
-    E -->|"429/401/500"| G{"Fallback\neligible?"}
-    G -->|Yes| H["Model C"]
-    G -->|No| F
-    H -->|"2xx Success"| C
-    H -->|"Fail"| I["All failed →\nReturn last status"]
-```
+![Rendered system diagram](../../../architecture/generated/mermaid-b632ad28d0e5.png)
+
 
 ---
 
@@ -352,29 +171,8 @@ The **format translation engine** using a self-registering plugin system.
 
 #### 아키텍처
 
-```mermaid
-graph TD
-    subgraph "Request Translation"
-        A["Claude → OpenAI"]
-        B["Gemini → OpenAI"]
-        C["Antigravity → OpenAI"]
-        D["OpenAI Responses → OpenAI"]
-        E["OpenAI → Claude"]
-        F["OpenAI → Gemini"]
-        G["OpenAI → Kiro"]
-        H["OpenAI → Cursor"]
-    end
+![Rendered system diagram](../../../architecture/generated/mermaid-d6de54a43525.png)
 
-    subgraph "Response Translation"
-        I["Claude → OpenAI"]
-        J["Gemini → OpenAI"]
-        K["Kiro → OpenAI"]
-        L["Cursor → OpenAI"]
-        M["OpenAI → Claude"]
-        N["OpenAI → Antigravity"]
-        O["OpenAI → Responses"]
-    end
-```
 
 | Directory    | Files         | Description                                                                                                                                                                                                                                                      |
 | ------------ | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -411,25 +209,8 @@ import "./request/claude-to-openai.js"; // ← self-registers
 
 #### SSE Streaming Pipeline
 
-```mermaid
-flowchart TD
-    A["Provider SSE stream"] --> B["TextDecoder\n(per-stream instance)"]
-    B --> C["Buffer lines\n(split on newline)"]
-    C --> D["parseSSELine()\n(trim whitespace, parse JSON)"]
-    D --> E{"Mode?"}
-    E -->|TRANSLATE| F["translateResponse()\ntarget → OpenAI → source"]
-    E -->|PASSTHROUGH| G["fixInvalidId()\nnormalize chunk"]
-    F --> H["hasValuableContent()\nfilter empty chunks"]
-    G --> H
-    H -->|"Has content"| I["extractUsage()\ntrack token counts"]
-    H -->|"Empty"| J["Skip chunk"]
-    I --> K["formatSSE()\nserialize + clean perf_metrics"]
-    K --> L["TextEncoder\n(per-stream instance)"]
-    L --> M["Enqueue to\nclient stream"]
+![Rendered system diagram](../../../architecture/generated/mermaid-3e5540b8f5e8.png)
 
-    style A fill:#f9f,stroke:#333
-    style M fill:#9f9,stroke:#333
-```
 
 #### Request Logger Session Structure
 
@@ -553,39 +334,14 @@ A 2000-token buffer is added to reported usage to prevent clients from hitting c
 
 ### Streaming Request
 
-```mermaid
-flowchart LR
-    A["Client"] --> B["detectFormat()"]
-    B --> C["translateRequest()\nsource → OpenAI → target"]
-    C --> D["Executor\nbuildUrl + buildHeaders"]
-    D --> E["fetch(providerURL)"]
-    E --> F["createSSEStream()\nTRANSLATE mode"]
-    F --> G["parseSSELine()"]
-    G --> H["translateResponse()\ntarget → OpenAI → source"]
-    H --> I["extractUsage()\n+ addBuffer"]
-    I --> J["formatSSE()"]
-    J --> K["Client receives\ntranslated SSE"]
-    K --> L["logUsage()\nsaveRequestUsage()"]
-```
+![Rendered system diagram](../../../architecture/generated/mermaid-8fd3accded87.png)
+
 
 ### Non-Streaming Request
 
-```mermaid
-flowchart LR
-    A["Client"] --> B["detectFormat()"]
-    B --> C["translateRequest()\nsource → OpenAI → target"]
-    C --> D["Executor.execute()"]
-    D --> E["translateResponse()\ntarget → OpenAI → source"]
-    E --> F["Return JSON\nresponse"]
-```
+![Rendered system diagram](../../../architecture/generated/mermaid-1cb1bbee531f.png)
+
 
 ### Bypass Flow (Claude CLI)
 
-```mermaid
-flowchart LR
-    A["Claude CLI request"] --> B{"Match bypass\npattern?"}
-    B -->|"Title/Warmup/Count"| C["Generate fake\nOpenAI response"]
-    B -->|"No match"| D["Normal flow"]
-    C --> E["Translate to\nsource format"]
-    E --> F["Return without\ncalling provider"]
-```
+![Rendered system diagram](../../../architecture/generated/mermaid-cdfe573c6a5f.png)

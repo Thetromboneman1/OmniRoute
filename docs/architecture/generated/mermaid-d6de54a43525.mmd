@@ -1,0 +1,21 @@
+graph TD
+    subgraph "Request Translation"
+        A["Claude → OpenAI"]
+        B["Gemini → OpenAI"]
+        C["Antigravity → OpenAI"]
+        D["OpenAI Responses → OpenAI"]
+        E["OpenAI → Claude"]
+        F["OpenAI → Gemini"]
+        G["OpenAI → Kiro"]
+        H["OpenAI → Cursor"]
+    end
+
+    subgraph "Response Translation"
+        I["Claude → OpenAI"]
+        J["Gemini → OpenAI"]
+        K["Kiro → OpenAI"]
+        L["Cursor → OpenAI"]
+        M["OpenAI → Claude"]
+        N["OpenAI → Antigravity"]
+        O["OpenAI → Responses"]
+    end

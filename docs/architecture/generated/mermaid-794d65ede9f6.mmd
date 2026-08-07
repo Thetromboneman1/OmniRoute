@@ -1,0 +1,26 @@
+flowchart TD
+    subgraph LocalHost[Developer Host]
+        CLI[CLI Tools]
+        Browser[Dashboard Browser]
+    end
+
+    subgraph ContainerOrProcess[OmniRoute Runtime]
+        Next[Next.js Server\nPORT=20128]
+        Core[SSE Core + Executors]
+        MainDB[(storage.sqlite)]
+        UsageDB[(usage tables + log artifacts)]
+    end
+
+    subgraph External[External Services]
+        Providers[AI Providers]
+        SyncCloud[Cloud Sync Service]
+    end
+
+    CLI --> Next
+    Browser --> Next
+    Next --> Core
+    Next --> MainDB
+    Core --> MainDB
+    Core --> UsageDB
+    Core --> Providers
+    Next --> SyncCloud

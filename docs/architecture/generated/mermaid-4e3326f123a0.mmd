@@ -1,0 +1,42 @@
+sequenceDiagram
+    autonumber
+    participant Client as CLI/SDK Client
+    participant Route as /api/v1/chat/completions
+    participant Chat as src/sse/handlers/chat
+    participant Core as open-sse/handlers/chatCore
+    participant Model as Model Resolver
+    participant Auth as Credential Selector
+    participant Exec as Provider Executor
+    participant Prov as Upstream Provider
+    participant Stream as Stream Translator
+    participant Usage as usageDb
+
+    Client->>Route: POST /v1/chat/completions
+    Route->>Chat: handleChat(request)
+    Chat->>Model: parse/resolve model or combo
+
+    alt Combo model
+        Chat->>Chat: iterate combo models (handleComboChat)
+    end
+
+    Chat->>Auth: getProviderCredentials(provider)
+    Auth-->>Chat: active account + tokens/api key
+
+    Chat->>Core: handleChatCore(body, modelInfo, credentials)
+    Core->>Core: detect source format
+    Core->>Core: translate request to target format
+    Core->>Exec: execute(provider, transformedBody)
+    Exec->>Prov: upstream API call
+    Prov-->>Exec: SSE/JSON response
+    Exec-->>Core: response + metadata
+
+    alt 401/403
+        Core->>Exec: refreshCredentials()
+        Exec-->>Core: updated tokens
+        Core->>Exec: retry request
+    end
+
+    Core->>Stream: translate/normalize stream to client format
+    Stream-->>Client: SSE chunks / JSON response
+
+    Stream->>Usage: extract usage + persist history/log

@@ -12,7 +12,7 @@ Visual guide to every section of the OmniRoute dashboard.
 
 Manage AI provider connections: OAuth providers (Claude Code, Codex, Gemini CLI), API key providers (Groq, DeepSeek, OpenRouter), and free providers (Qoder, Qwen, Kiro). Kiro accounts include credit balance tracking — remaining credits, total allowance, and renewal date visible in Dashboard → Usage.
 
-![Providers Dashboard](screenshots/01-providers.png)
+![Providers Dashboard](../../../screenshots/01-providers.png)
 
 ---
 
@@ -27,7 +27,7 @@ Recent combo improvements:
 - **Combo target health** — analytics and health surfaces now distinguish individual combo targets/steps instead of collapsing everything into model strings
 - **Composite tier ordering** — `defaultTier -> fallbackTier` now influences runtime execution/fallback order for top-level combo steps
 
-![Combos Dashboard](screenshots/02-combos.png)
+![Combos Dashboard](../../../screenshots/02-combos.png)
 
 ---
 
@@ -35,7 +35,7 @@ Recent combo improvements:
 
 Comprehensive usage analytics with token consumption, cost estimates, activity heatmaps, weekly distribution charts, and per-provider breakdowns.
 
-![Analytics Dashboard](screenshots/03-analytics.png)
+![Analytics Dashboard](../../../screenshots/03-analytics.png)
 
 ---
 
@@ -43,7 +43,7 @@ Comprehensive usage analytics with token consumption, cost estimates, activity h
 
 Real-time monitoring: uptime, memory, version, latency percentiles (p50/p95/p99), cache statistics, provider circuit breaker states, active quota-monitored sessions, and combo target health.
 
-![Health Dashboard](screenshots/04-health.png)
+![Health Dashboard](../../../screenshots/04-health.png)
 
 ---
 
@@ -51,7 +51,7 @@ Real-time monitoring: uptime, memory, version, latency percentiles (p50/p95/p99)
 
 Four modes for debugging API translations: **Playground** (format converter), **Chat Tester** (live requests), **Test Bench** (batch tests), and **Live Monitor** (real-time stream).
 
-![Translator Playground](screenshots/05-translator.png)
+![Translator Playground](../../../screenshots/05-translator.png)
 
 ---
 
@@ -78,7 +78,7 @@ Comprehensive settings panel with tabs:
 - **Resilience** — Rate limit persistence, circuit breaker tuning, auto-disable banned accounts, provider expiration monitoring, **Context Relay** handoff threshold and summary model configuration
 - **Advanced** — Configuration overrides, configuration audit trail, fallback degradation mode
 
-![Settings Dashboard](screenshots/06-settings.png)
+![Settings Dashboard](../../../screenshots/06-settings.png)
 
 ---
 
@@ -86,7 +86,7 @@ Comprehensive settings panel with tabs:
 
 One-click configuration for AI coding tools: Claude Code, Codex CLI, Gemini CLI, OpenClaw, Kilo Code, Antigravity, Cline, Continue, Cursor, and Factory Droid. Features automated config apply/reset, connection profiles, and model mapping.
 
-![CLI Tools Dashboard](screenshots/07-cli-tools.png)
+![CLI Tools Dashboard](../../../screenshots/07-cli-tools.png)
 
 ---
 
@@ -173,7 +173,7 @@ Generate images, videos, and music from the dashboard. Supports OpenAI, xAI, Tog
 
 Real-time request logging with filtering by provider, model, account, and API key. Shows status codes, token usage, latency, and response details.
 
-![Usage Logs](screenshots/08-usage.png)
+![Usage Logs](../../../screenshots/08-usage.png)
 
 ---
 
@@ -181,7 +181,7 @@ Real-time request logging with filtering by provider, model, account, and API ke
 
 Your unified API endpoint with capability breakdown: Chat Completions, Responses API, Embeddings, Image Generation, Reranking, Audio Transcription, Text-to-Speech, Moderations, and registered API keys. Cloudflare Quick Tunnel integration and cloud proxy support for remote access.
 
-![Endpoint Dashboard](screenshots/09-endpoint.png)
+![Endpoint Dashboard](../../../screenshots/09-endpoint.png)
 
 ---
 

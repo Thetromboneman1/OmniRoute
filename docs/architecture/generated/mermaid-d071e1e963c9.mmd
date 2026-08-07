@@ -1,0 +1,20 @@
+stateDiagram-v2
+    [*] --> Active
+    Active --> Error: Request fails (401/429/500)
+    Error --> Cooldown: Apply backoff
+    Cooldown --> Active: Cooldown expires
+    Active --> Active: Request succeeds (reset backoff)
+
+    state Error {
+        [*] --> ClassifyError
+        ClassifyError --> ShouldFallback: Rate limit / Auth / Transient
+        ClassifyError --> NoFallback: 400 Bad Request
+    }
+
+    state Cooldown {
+        [*] --> ExponentialBackoff
+        ExponentialBackoff: Level 0 = 1s
+        ExponentialBackoff: Level 1 = 2s
+        ExponentialBackoff: Level 2 = 4s
+        ExponentialBackoff: Max = 2min
+    }

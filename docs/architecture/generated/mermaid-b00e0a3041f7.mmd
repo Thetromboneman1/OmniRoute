@@ -1,0 +1,32 @@
+sequenceDiagram
+    participant Client
+    participant chatCore
+    participant Translator
+    participant Executor
+    participant Provider
+
+    Client->>chatCore: Request (any format)
+    chatCore->>chatCore: Detect source format
+    chatCore->>chatCore: Check bypass patterns
+    chatCore->>chatCore: Resolve model & provider
+    chatCore->>Translator: Translate request (source → OpenAI → target)
+    chatCore->>Executor: Get executor for provider
+    Executor->>Executor: Build URL, headers, transform request
+    Executor->>Executor: Refresh credentials if needed
+    Executor->>Provider: HTTP fetch (streaming or non-streaming)
+
+    alt Streaming
+        Provider-->>chatCore: SSE stream
+        chatCore->>chatCore: Pipe through SSE transform stream
+        Note over chatCore: Transform stream translates<br/>each chunk: target → OpenAI → source
+        chatCore-->>Client: Translated SSE stream
+    else Non-streaming
+        Provider-->>chatCore: JSON response
+        chatCore->>Translator: Translate response
+        chatCore-->>Client: Translated JSON
+    end
+
+    alt Error (401, 429, 500...)
+        chatCore->>Executor: Retry with credential refresh
+        chatCore->>chatCore: Account fallback logic
+    end

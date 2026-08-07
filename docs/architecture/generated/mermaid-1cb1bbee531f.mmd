@@ -1,0 +1,6 @@
+flowchart TD
+    A["Client"] --> B["detectFormat()"]
+    B --> C["translateRequest()\nsource → OpenAI → target"]
+    C --> D["Executor.execute()"]
+    D --> E["translateResponse()\ntarget → OpenAI → source"]
+    E --> F["Return JSON\nresponse"]

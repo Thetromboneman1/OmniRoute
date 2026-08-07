@@ -1,0 +1,43 @@
+flowchart TD
+    subgraph Clients[Developer Clients]
+        C1[Claude Code]
+        C2[Codex CLI]
+        C3[OpenClaw / Droid / Cline / Continue / Roo]
+        C4[Custom OpenAI-compatible clients]
+        BROWSER[Browser Dashboard]
+    end
+
+    subgraph Router[OmniRoute Local Process]
+        API[V1 Compatibility API\n/v1/*]
+        DASH[Dashboard + Management API\n/api/*]
+        CORE[SSE + Translation Core\nopen-sse + src/sse]
+        DB[(storage.sqlite)]
+        UDB[(usage tables + log artifacts)]
+    end
+
+    subgraph Upstreams[Upstream Providers]
+        P1[OAuth Providers\nClaude/Codex/Gemini/Qwen/Qoder/GitHub/Kiro/Cursor/Antigravity]
+        P2[API Key Providers\nOpenAI/Anthropic/OpenRouter/GLM/Kimi/MiniMax\nDeepSeek/Groq/xAI/Mistral/Perplexity\nTogether/Fireworks/Cerebras/Cohere/NVIDIA]
+        P3[Compatible Nodes\nOpenAI-compatible / Anthropic-compatible]
+    end
+
+    subgraph Cloud[Optional Cloud Sync]
+        CLOUD[Cloud Sync Endpoint\nNEXT_PUBLIC_CLOUD_URL]
+    end
+
+    C1 --> API
+    C2 --> API
+    C3 --> API
+    C4 --> API
+    BROWSER --> DASH
+
+    API --> CORE
+    DASH --> DB
+    CORE --> DB
+    CORE --> UDB
+
+    CORE --> P1
+    CORE --> P2
+    CORE --> P3
+
+    DASH --> CLOUD

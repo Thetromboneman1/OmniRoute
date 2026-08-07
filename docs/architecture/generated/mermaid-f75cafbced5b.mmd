@@ -1,0 +1,96 @@
+erDiagram
+    SETTINGS ||--o{ PROVIDER_CONNECTION : controls
+    PROVIDER_NODE ||--o{ PROVIDER_CONNECTION : backs_compatible_provider
+    PROVIDER_CONNECTION ||--o{ USAGE_ENTRY : emits_usage
+
+    SETTINGS {
+      boolean cloudEnabled
+      number stickyRoundRobinLimit
+      boolean requireLogin
+      string password_hash
+      string fallbackStrategy
+      json rateLimitDefaults
+      json providerProfiles
+    }
+
+    PROVIDER_CONNECTION {
+      string id
+      string provider
+      string authType
+      string name
+      number priority
+      boolean isActive
+      string apiKey
+      string accessToken
+      string refreshToken
+      string expiresAt
+      string testStatus
+      string lastError
+      string rateLimitedUntil
+      json providerSpecificData
+    }
+
+    PROVIDER_NODE {
+      string id
+      string type
+      string name
+      string prefix
+      string apiType
+      string baseUrl
+    }
+
+    MODEL_ALIAS {
+      string alias
+      string targetModel
+    }
+
+    COMBO {
+      string id
+      string name
+      string[] models
+    }
+
+    API_KEY {
+      string id
+      string name
+      string key
+      string machineId
+    }
+
+    USAGE_ENTRY {
+      string provider
+      string model
+      number prompt_tokens
+      number completion_tokens
+      string connectionId
+      string timestamp
+    }
+
+    CUSTOM_MODEL {
+      string id
+      string name
+      string providerId
+    }
+
+    PROXY_CONFIG {
+      string global
+      json providers
+    }
+
+    IP_FILTER {
+      string mode
+      string[] allowlist
+      string[] blocklist
+    }
+
+    THINKING_BUDGET {
+      string mode
+      number customBudget
+      string effortLevel
+    }
+
+    SYSTEM_PROMPT {
+      boolean enabled
+      string prompt
+      string position
+    }

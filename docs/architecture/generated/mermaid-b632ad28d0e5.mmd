@@ -1,0 +1,12 @@
+flowchart TD
+    A["Request with\ncombo model"] --> B["Model A"]
+    B -->|"2xx Success"| C["Return response"]
+    B -->|"429/401/500"| D{"Fallback\neligible?"}
+    D -->|Yes| E["Model B"]
+    D -->|No| F["Return error"]
+    E -->|"2xx Success"| C
+    E -->|"429/401/500"| G{"Fallback\neligible?"}
+    G -->|Yes| H["Model C"]
+    G -->|No| F
+    H -->|"2xx Success"| C
+    H -->|"Fail"| I["All failed →\nReturn last status"]

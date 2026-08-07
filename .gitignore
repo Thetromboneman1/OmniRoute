@@ -97,6 +97,9 @@ docs/*
 !docs/i18n/**
 !docs/features/
 !docs/features/**
+!docs/REPOSITORY_STATE.md
+!docs/architecture/
+!docs/architecture/**
 !docs/A2A-SERVER.md
 !docs/AUTO-COMBO.md
 !docs/MCP-SERVER.md

@@ -1,0 +1,17 @@
+flowchart TD
+    A["Provider SSE stream"] --> B["TextDecoder\n(per-stream instance)"]
+    B --> C["Buffer lines\n(split on newline)"]
+    C --> D["parseSSELine()\n(trim whitespace, parse JSON)"]
+    D --> E{"Mode?"}
+    E -->|TRANSLATE| F["translateResponse()\ntarget → OpenAI → source"]
+    E -->|PASSTHROUGH| G["fixInvalidId()\nnormalize chunk"]
+    F --> H["hasValuableContent()\nfilter empty chunks"]
+    G --> H
+    H -->|"Has content"| I["extractUsage()\ntrack token counts"]
+    H -->|"Empty"| J["Skip chunk"]
+    I --> K["formatSSE()\nserialize + clean perf_metrics"]
+    K --> L["TextEncoder\n(per-stream instance)"]
+    L --> M["Enqueue to\nclient stream"]
+
+    style A fill:#f9f,stroke:#333
+    style M fill:#9f9,stroke:#333

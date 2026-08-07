@@ -1,0 +1,27 @@
+sequenceDiagram
+    autonumber
+    participant UI as Endpoint Page UI
+    participant Sync as /api/sync/cloud
+    participant DB as localDb
+    participant Cloud as External Cloud Sync
+    participant Claude as ~/.claude/settings.json
+
+    UI->>Sync: POST action=enable
+    Sync->>DB: set cloudEnabled=true
+    Sync->>DB: ensure API key exists
+    Sync->>Cloud: POST /sync/{machineId} (providers/aliases/combos/keys)
+    Cloud-->>Sync: sync result
+    Sync->>Cloud: GET /{machineId}/v1/verify
+    Sync-->>UI: enabled + verification status
+
+    UI->>Sync: POST action=sync
+    Sync->>Cloud: POST /sync/{machineId}
+    Cloud-->>Sync: remote data
+    Sync->>DB: update newer local tokens/status
+    Sync-->>UI: synced
+
+    UI->>Sync: POST action=disable
+    Sync->>DB: set cloudEnabled=false
+    Sync->>Cloud: DELETE /sync/{machineId}
+    Sync->>Claude: switch ANTHROPIC_BASE_URL back to local (if needed)
+    Sync-->>UI: disabled

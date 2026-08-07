@@ -1,0 +1,45 @@
+classDiagram
+    class BaseExecutor {
+        +buildUrl(model, stream, options)
+        +buildHeaders(credentials, stream, body)
+        +transformRequest(body, model, stream, credentials)
+        +execute(url, options)
+        +shouldRetry(status, error)
+        +refreshCredentials(credentials, log)
+    }
+
+    class DefaultExecutor {
+        +refreshCredentials()
+    }
+
+    class AntigravityExecutor {
+        +buildUrl()
+        +buildHeaders()
+        +transformRequest()
+        +shouldRetry()
+        +refreshCredentials()
+    }
+
+    class CursorExecutor {
+        +buildUrl()
+        +buildHeaders()
+        +transformRequest()
+        +parseResponse()
+        +generateChecksum()
+    }
+
+    class KiroExecutor {
+        +buildUrl()
+        +buildHeaders()
+        +transformRequest()
+        +parseEventStream()
+        +refreshCredentials()
+    }
+
+    BaseExecutor <|-- DefaultExecutor
+    BaseExecutor <|-- AntigravityExecutor
+    BaseExecutor <|-- CursorExecutor
+    BaseExecutor <|-- KiroExecutor
+    BaseExecutor <|-- CodexExecutor
+    BaseExecutor <|-- GeminiCLIExecutor
+    BaseExecutor <|-- GithubExecutor

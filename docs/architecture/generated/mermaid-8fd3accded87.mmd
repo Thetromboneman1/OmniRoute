@@ -1,0 +1,12 @@
+flowchart TD
+    A["Client"] --> B["detectFormat()"]
+    B --> C["translateRequest()\nsource → OpenAI → target"]
+    C --> D["Executor\nbuildUrl + buildHeaders"]
+    D --> E["fetch(providerURL)"]
+    E --> F["createSSEStream()\nTRANSLATE mode"]
+    F --> G["parseSSELine()"]
+    G --> H["translateResponse()\ntarget → OpenAI → source"]
+    H --> I["extractUsage()\n+ addBuffer"]
+    I --> J["formatSSE()"]
+    J --> K["Client receives\ntranslated SSE"]
+    K --> L["logUsage()\nsaveRequestUsage()"]

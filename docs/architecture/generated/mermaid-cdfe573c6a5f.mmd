@@ -1,0 +1,6 @@
+flowchart TD
+    A["Claude CLI request"] --> B{"Match bypass\npattern?"}
+    B -->|"Title/Warmup/Count"| C["Generate fake\nOpenAI response"]
+    B -->|"No match"| D["Normal flow"]
+    C --> E["Translate to\nsource format"]
+    E --> F["Return without\ncalling provider"]

@@ -1,0 +1,16 @@
+sequenceDiagram
+    participant R1 as Request 1
+    participant R2 as Request 2
+    participant Cache as refreshPromiseCache
+    participant OAuth as OAuth Provider
+
+    R1->>Cache: getAccessToken("gemini", token)
+    Cache->>Cache: No in-flight promise
+    Cache->>OAuth: Start refresh
+    R2->>Cache: getAccessToken("gemini", token)
+    Cache->>Cache: Found in-flight promise
+    Cache-->>R2: Return existing promise
+    OAuth-->>Cache: New access token
+    Cache-->>R1: New access token
+    Cache-->>R2: Same access token (shared)
+    Cache->>Cache: Delete cache entry

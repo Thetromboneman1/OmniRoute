@@ -118,51 +118,8 @@ Main pages under `src/app/(dashboard)/dashboard/`:
 
 ## High-Level System Context
 
-```mermaid
-flowchart LR
-    subgraph Clients[Developer Clients]
-        C1[Claude Code]
-        C2[Codex CLI]
-        C3[OpenClaw / Droid / Cline / Continue / Roo]
-        C4[Custom OpenAI-compatible clients]
-        BROWSER[Browser Dashboard]
-    end
+![Rendered system diagram](../../../architecture/generated/mermaid-a2f91d3438f3.png)
 
-    subgraph Router[OmniRoute Local Process]
-        API[V1 Compatibility API\n/v1/*]
-        DASH[Dashboard + Management API\n/api/*]
-        CORE[SSE + Translation Core\nopen-sse + src/sse]
-        DB[(storage.sqlite)]
-        UDB[(usage tables + log artifacts)]
-    end
-
-    subgraph Upstreams[Upstream Providers]
-        P1[OAuth Providers\nClaude/Codex/Gemini/Qwen/Qoder/GitHub/Kiro/Cursor/Antigravity]
-        P2[API Key Providers\nOpenAI/Anthropic/OpenRouter/GLM/Kimi/MiniMax\nDeepSeek/Groq/xAI/Mistral/Perplexity\nTogether/Fireworks/Cerebras/Cohere/NVIDIA]
-        P3[Compatible Nodes\nOpenAI-compatible / Anthropic-compatible]
-    end
-
-    subgraph Cloud[Optional Cloud Sync]
-        CLOUD[Cloud Sync Endpoint\nNEXT_PUBLIC_CLOUD_URL]
-    end
-
-    C1 --> API
-    C2 --> API
-    C3 --> API
-    C4 --> API
-    BROWSER --> DASH
-
-    API --> CORE
-    DASH --> DB
-    CORE --> DB
-    CORE --> UDB
-
-    CORE --> P1
-    CORE --> P2
-    CORE --> P3
-
-    DASH --> CLOUD
-```
 
 ## Core Runtime Components
 
@@ -329,249 +286,34 @@ Domain State DB (SQLite):
 
 ## Request Lifecycle (`/v1/chat/completions`)
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Client as CLI/SDK Client
-    participant Route as /api/v1/chat/completions
-    participant Chat as src/sse/handlers/chat
-    participant Core as open-sse/handlers/chatCore
-    participant Model as Model Resolver
-    participant Auth as Credential Selector
-    participant Exec as Provider Executor
-    participant Prov as Upstream Provider
-    participant Stream as Stream Translator
-    participant Usage as usageDb
+![Rendered system diagram](../../../architecture/generated/mermaid-4e3326f123a0.png)
 
-    Client->>Route: POST /v1/chat/completions
-    Route->>Chat: handleChat(request)
-    Chat->>Model: parse/resolve model or combo
-
-    alt Combo model
-        Chat->>Chat: iterate combo models (handleComboChat)
-    end
-
-    Chat->>Auth: getProviderCredentials(provider)
-    Auth-->>Chat: active account + tokens/api key
-
-    Chat->>Core: handleChatCore(body, modelInfo, credentials)
-    Core->>Core: detect source format
-    Core->>Core: translate request to target format
-    Core->>Exec: execute(provider, transformedBody)
-    Exec->>Prov: upstream API call
-    Prov-->>Exec: SSE/JSON response
-    Exec-->>Core: response + metadata
-
-    alt 401/403
-        Core->>Exec: refreshCredentials()
-        Exec-->>Core: updated tokens
-        Core->>Exec: retry request
-    end
-
-    Core->>Stream: translate/normalize stream to client format
-    Stream-->>Client: SSE chunks / JSON response
-
-    Stream->>Usage: extract usage + persist history/log
-```
 
 ## Combo + Account Fallback Flow
 
-```mermaid
-flowchart TD
-    A[Incoming model string] --> B{Is combo name?}
-    B -- Yes --> C[Load combo models sequence]
-    B -- No --> D[Single model path]
+![Rendered system diagram](../../../architecture/generated/mermaid-827dbbaf142b.png)
 
-    C --> E[Try model N]
-    E --> F[Resolve provider/model]
-    D --> F
-
-    F --> G[Select account credentials]
-    G --> H{Credentials available?}
-    H -- No --> I[Return provider unavailable]
-    H -- Yes --> J[Execute request]
-
-    J --> K{Success?}
-    K -- Yes --> L[Return response]
-    K -- No --> M{Fallback-eligible error?}
-
-    M -- No --> N[Return error]
-    M -- Yes --> O[Mark account unavailable cooldown]
-    O --> P{Another account for provider?}
-    P -- Yes --> G
-    P -- No --> Q{In combo with next model?}
-    Q -- Yes --> E
-    Q -- No --> R[Return all unavailable]
-```
 
 Fallback decisions are driven by `open-sse/services/accountFallback.ts` using status codes and error-message heuristics. Combo routing adds one extra guard: provider-scoped 400s such as upstream content-block and role-validation failures are treated as model-local failures so later combo targets can still run.
 
 ## OAuth Onboarding and Token Refresh Lifecycle
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant UI as Dashboard UI
-    participant OAuth as /api/oauth/[provider]/[action]
-    participant ProvAuth as Provider Auth Server
-    participant DB as localDb
-    participant Test as /api/providers/[id]/test
-    participant Exec as Provider Executor
+![Rendered system diagram](../../../architecture/generated/mermaid-30b702e2d5f6.png)
 
-    UI->>OAuth: GET authorize or device-code
-    OAuth->>ProvAuth: create auth/device flow
-    ProvAuth-->>OAuth: auth URL or device code payload
-    OAuth-->>UI: flow data
-
-    UI->>OAuth: POST exchange or poll
-    OAuth->>ProvAuth: token exchange/poll
-    ProvAuth-->>OAuth: access/refresh tokens
-    OAuth->>DB: createProviderConnection(oauth data)
-    OAuth-->>UI: success + connection id
-
-    UI->>Test: POST /api/providers/[id]/test
-    Test->>Exec: validate credentials / optional refresh
-    Exec-->>Test: valid or refreshed token info
-    Test->>DB: update status/tokens/errors
-    Test-->>UI: validation result
-```
 
 Refresh during live traffic is executed inside `open-sse/handlers/chatCore.ts` via executor `refreshCredentials()`.
 
 ## Cloud Sync Lifecycle (Enable / Sync / Disable)
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant UI as Endpoint Page UI
-    participant Sync as /api/sync/cloud
-    participant DB as localDb
-    participant Cloud as External Cloud Sync
-    participant Claude as ~/.claude/settings.json
+![Rendered system diagram](../../../architecture/generated/mermaid-dcdb656d952c.png)
 
-    UI->>Sync: POST action=enable
-    Sync->>DB: set cloudEnabled=true
-    Sync->>DB: ensure API key exists
-    Sync->>Cloud: POST /sync/{machineId} (providers/aliases/combos/keys)
-    Cloud-->>Sync: sync result
-    Sync->>Cloud: GET /{machineId}/v1/verify
-    Sync-->>UI: enabled + verification status
-
-    UI->>Sync: POST action=sync
-    Sync->>Cloud: POST /sync/{machineId}
-    Cloud-->>Sync: remote data
-    Sync->>DB: update newer local tokens/status
-    Sync-->>UI: synced
-
-    UI->>Sync: POST action=disable
-    Sync->>DB: set cloudEnabled=false
-    Sync->>Cloud: DELETE /sync/{machineId}
-    Sync->>Claude: switch ANTHROPIC_BASE_URL back to local (if needed)
-    Sync-->>UI: disabled
-```
 
 Periodic sync is triggered by `CloudSyncScheduler` when cloud is enabled.
 
 ## Data Model and Storage Map
 
-```mermaid
-erDiagram
-    SETTINGS ||--o{ PROVIDER_CONNECTION : controls
-    PROVIDER_NODE ||--o{ PROVIDER_CONNECTION : backs_compatible_provider
-    PROVIDER_CONNECTION ||--o{ USAGE_ENTRY : emits_usage
+![Rendered system diagram](../../../architecture/generated/mermaid-f75cafbced5b.png)
 
-    SETTINGS {
-      boolean cloudEnabled
-      number stickyRoundRobinLimit
-      boolean requireLogin
-      string password_hash
-      string fallbackStrategy
-      json rateLimitDefaults
-      json providerProfiles
-    }
-
-    PROVIDER_CONNECTION {
-      string id
-      string provider
-      string authType
-      string name
-      number priority
-      boolean isActive
-      string apiKey
-      string accessToken
-      string refreshToken
-      string expiresAt
-      string testStatus
-      string lastError
-      string rateLimitedUntil
-      json providerSpecificData
-    }
-
-    PROVIDER_NODE {
-      string id
-      string type
-      string name
-      string prefix
-      string apiType
-      string baseUrl
-    }
-
-    MODEL_ALIAS {
-      string alias
-      string targetModel
-    }
-
-    COMBO {
-      string id
-      string name
-      string[] models
-    }
-
-    API_KEY {
-      string id
-      string name
-      string key
-      string machineId
-    }
-
-    USAGE_ENTRY {
-      string provider
-      string model
-      number prompt_tokens
-      number completion_tokens
-      string connectionId
-      string timestamp
-    }
-
-    CUSTOM_MODEL {
-      string id
-      string name
-      string providerId
-    }
-
-    PROXY_CONFIG {
-      string global
-      json providers
-    }
-
-    IP_FILTER {
-      string mode
-      string[] allowlist
-      string[] blocklist
-    }
-
-    THINKING_BUDGET {
-      string mode
-      number customBudget
-      string effortLevel
-    }
-
-    SYSTEM_PROMPT {
-      boolean enabled
-      string prompt
-      string position
-    }
-```
 
 Physical storage files:
 
@@ -582,34 +324,8 @@ Physical storage files:
 
 ## Deployment Topology
 
-```mermaid
-flowchart LR
-    subgraph LocalHost[Developer Host]
-        CLI[CLI Tools]
-        Browser[Dashboard Browser]
-    end
+![Rendered system diagram](../../../architecture/generated/mermaid-794d65ede9f6.png)
 
-    subgraph ContainerOrProcess[OmniRoute Runtime]
-        Next[Next.js Server\nPORT=20128]
-        Core[SSE Core + Executors]
-        MainDB[(storage.sqlite)]
-        UsageDB[(usage tables + log artifacts)]
-    end
-
-    subgraph External[External Services]
-        Providers[AI Providers]
-        SyncCloud[Cloud Sync Service]
-    end
-
-    CLI --> Next
-    Browser --> Next
-    Next --> Core
-    Next --> MainDB
-    Core --> MainDB
-    Core --> UsageDB
-    Core --> Providers
-    Next --> SyncCloud
-```
 
 ## Module Mapping (Decision-Critical)
 

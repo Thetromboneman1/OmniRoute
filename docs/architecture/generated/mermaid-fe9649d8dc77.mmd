@@ -1,0 +1,40 @@
+graph TD
+    subgraph Clients
+        A[Claude CLI]
+        B[Codex]
+        C[Cursor IDE]
+        D[OpenAI-compatible]
+    end
+
+    subgraph omniroute
+        E[Handler Layer]
+        F[Translator Layer]
+        G[Executor Layer]
+        H[Services Layer]
+    end
+
+    subgraph Providers
+        I[Anthropic Claude]
+        J[Google Gemini]
+        K[OpenAI / Codex]
+        L[GitHub Copilot]
+        M[AWS Kiro]
+        N[Antigravity]
+        O[Cursor API]
+    end
+
+    A --> E
+    B --> E
+    C --> E
+    D --> E
+    E --> F
+    F --> G
+    G --> I
+    G --> J
+    G --> K
+    G --> L
+    G --> M
+    G --> N
+    G --> O
+    H -.-> E
+    H -.-> G
