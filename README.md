@@ -2407,7 +2407,7 @@ are documented in [docs/repository-maintenance.md](docs/repository-maintenance.m
 ![OmniRoute system architecture](docs/architecture/omniroute-system-architecture.png)
 
 - **Default branch:** `main`
-- **Implementation fingerprint:** `9b5861c83ad3621a`
+- **Implementation fingerprint:** `08d72b5fb792b96b`
 - **Detected structure:** Source modules, Automation modules, GitHub Actions, Tests and validation, Maintained documentation.
 - **Documentation contract:** editable diagram sources, committed PNG renderings,
   resolved local image links, and generated state are checked on every commit.
