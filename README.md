@@ -2401,6 +2401,7 @@ recovery procedure, secret names, notification status, and maintenance policy
 are documented in [docs/repository-maintenance.md](docs/repository-maintenance.md).
 
 <!-- documentation-health:start -->
+
 ## Current repository state
 
 ![OmniRoute system architecture](docs/architecture/omniroute-system-architecture.png)
