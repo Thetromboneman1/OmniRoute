@@ -95,8 +95,6 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: ${{ env.CI_NODE_VERSION }}
-      - name: Fetch base branch
-        run: git fetch --no-tags origin "${GITHUB_BASE_REF}" --depth=1
       - name: Validate source changes include tests
         run: node scripts/check-pr-test-policy.mjs --summary-file .artifacts/pr-test-policy.md
       - name: Publish PR test policy summary
