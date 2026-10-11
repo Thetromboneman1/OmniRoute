@@ -69,7 +69,7 @@ test("combo routes requests by exact combo name", async () => {
   assert.equal(response.status, 200);
   assert.equal(fetchCalls.length, 1);
   assert.match(fetchCalls[0].url, /\/chat\/completions$/);
-  assert.equal(fetchCalls[0].headers.Authorization, "Bearer sk-openai-combo-exact");
+  assert.equal(fetchCalls[0].headers.authorization, "Bearer sk-openai-combo-exact");
   assert.equal(json.choices[0].message.content, "Exact combo route");
 });
 
@@ -81,7 +81,7 @@ test("round-robin combo cycles through three providers", async () => {
     name: "router-rr",
     strategy: "round-robin",
     config: { maxRetries: 0, retryDelayMs: 0 },
-    models: ["openai/gpt-4o-mini", "claude/claude-3-5-sonnet-20241022", "gemini/gemini-2.5-flash"],
+    models: ["openai/gpt-4o-mini", "claude/claude-sonnet-4-6", "gemini/gemini-2.5-flash"],
   });
 
   const seenProviders = [];
@@ -99,14 +99,29 @@ test("round-robin combo cycles through three providers", async () => {
     return buildGeminiResponse("Gemini round-robin");
   };
 
-  const first = await handleChat(buildRequest({ body: buildOpenAIChatBody("router-rr") }));
-  const second = await handleChat(buildRequest({ body: buildOpenAIChatBody("router-rr") }));
-  const third = await handleChat(buildRequest({ body: buildOpenAIChatBody("router-rr") }));
+  // `stickyRoundRobinLimit` defaults to 3 (src/lib/db/settings.ts), so a combo using the
+  // round-robin strategy serves 3 consecutive requests per target before advancing to the
+  // next one — batched rotation, not one-request-per-target. Nine requests therefore cover
+  // a full cycle: openai x3 -> claude x3 -> gemini x3.
+  const responses = [];
+  for (let i = 0; i < 9; i++) {
+    responses.push(await handleChat(buildRequest({ body: buildOpenAIChatBody("router-rr") })));
+  }
 
-  assert.equal(first.status, 200);
-  assert.equal(second.status, 200);
-  assert.equal(third.status, 200);
-  assert.deepEqual(seenProviders, ["openai", "claude", "gemini"]);
+  for (const response of responses) {
+    assert.equal(response.status, 200);
+  }
+  assert.deepEqual(seenProviders, [
+    "openai",
+    "openai",
+    "openai",
+    "claude",
+    "claude",
+    "claude",
+    "gemini",
+    "gemini",
+    "gemini",
+  ]);
 });
 
 test("priority combo sticks to the primary model while healthy", async () => {
@@ -115,7 +130,7 @@ test("priority combo sticks to the primary model while healthy", async () => {
   await combosDb.createCombo({
     name: "router-priority-healthy",
     strategy: "priority",
-    models: ["openai/gpt-4o-mini", "claude/claude-3-5-sonnet-20241022"],
+    models: ["openai/gpt-4o-mini", "claude/claude-sonnet-4-6"],
   });
 
   const seenTargets = [];
@@ -148,7 +163,7 @@ test("priority combo falls back to the secondary model when the first one fails"
     name: "router-fallback",
     strategy: "priority",
     config: { maxRetries: 0, retryDelayMs: 0 },
-    models: ["openai/gpt-4o-mini", "claude/claude-3-5-sonnet-20241022"],
+    models: ["openai/gpt-4o-mini", "claude/claude-sonnet-4-6"],
   });
 
   const attempts = [];
@@ -210,9 +225,9 @@ test("priority combo can repeat the same provider/model with different fixed acc
   let firstAttemptHeader = null;
   globalThis.fetch = async (_url, init = {}) => {
     const headers = toPlainHeaders(init.headers);
-    authHeaders.push(headers.Authorization);
+    authHeaders.push(headers.authorization);
     if (!firstAttemptHeader) {
-      firstAttemptHeader = headers.Authorization;
+      firstAttemptHeader = headers.authorization;
       return new Response(JSON.stringify({ error: { message: "first account down" } }), {
         status: 503,
         headers: { "Content-Type": "application/json" },
@@ -301,7 +316,7 @@ test("model combo mappings route explicit model ids through the configured combo
 
   assert.equal(response.status, 200);
   assert.equal(fetchCalls.length, 1);
-  assert.equal(fetchCalls[0].headers.Authorization, "Bearer sk-openai-mapped");
+  assert.equal(fetchCalls[0].headers.authorization, "Bearer sk-openai-mapped");
   assert.equal(json.choices[0].message.content, "Mapped combo route");
 });
 
@@ -349,8 +364,12 @@ test("unmapped custom model requests fail after combo resolution falls through",
   );
   const json = (await response.json()) as any;
 
-  assert.equal(response.status, 400);
-  assert.match(json.error.message, /No credentials for provider: tenant/);
+  // Upstream port decolua/9router#336: 400 → 404 so combo routing can fall through
+  // to the next target when a provider has zero usable credentials. This request
+  // never resolves to a combo target (unmapped model), so it takes the
+  // single-model path — #10797 remaps that 404 → 401.
+  assert.equal(response.status, 401);
+  assert.match(json.error.message, /No active credentials for provider: tenant/);
 });
 
 test("strategy updates take effect for later requests on the same combo name", async () => {
@@ -359,7 +378,7 @@ test("strategy updates take effect for later requests on the same combo name", a
   const combo = await combosDb.createCombo({
     name: "router-dynamic",
     strategy: "priority",
-    models: ["openai/gpt-4o-mini", "claude/claude-3-5-sonnet-20241022"],
+    models: ["openai/gpt-4o-mini", "claude/claude-sonnet-4-6"],
   });
 
   const seenProviders = [];
@@ -382,19 +401,23 @@ test("strategy updates take effect for later requests on the same combo name", a
     strategy: "round-robin",
     config: { maxRetries: 0, retryDelayMs: 0 },
   });
-  const second = await handleChat(
-    buildRequest({
-      body: buildOpenAIChatBody("router-dynamic", "Route dynamic second"),
-    })
-  );
-  const third = await handleChat(
-    buildRequest({
-      body: buildOpenAIChatBody("router-dynamic", "Route dynamic third"),
-    })
-  );
+  // After the strategy flips to round-robin the new behavior must take effect. With the
+  // default stickyRoundRobinLimit of 3 the round-robin batch serves openai three times
+  // before advancing, so the 4th post-update request rotates to claude — a provider the
+  // previous "priority" strategy would never have reached. That rotation is the proof the
+  // updated strategy is live.
+  const postUpdate = [];
+  for (let i = 0; i < 4; i++) {
+    postUpdate.push(
+      await handleChat(
+        buildRequest({ body: buildOpenAIChatBody("router-dynamic", `Route dynamic ${i}`) })
+      )
+    );
+  }
 
   assert.equal(initial.status, 200);
-  assert.equal(second.status, 200);
-  assert.equal(third.status, 200);
-  assert.deepEqual(seenProviders, ["openai", "openai", "claude"]);
+  for (const response of postUpdate) {
+    assert.equal(response.status, 200);
+  }
+  assert.deepEqual(seenProviders, ["openai", "openai", "openai", "openai", "claude"]);
 });

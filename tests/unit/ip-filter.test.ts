@@ -1,6 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
+// Isolate DATA_DIR before importing ipFilter: since #6131 the filter lazily
+// loads/persists its config to the DB, so an un-isolated run would touch the
+// real ~/.omniroute DB (side-effect + WAL-lock flake). Pin a throwaway dir.
+const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-ipfilter-unit-"));
+process.env.DATA_DIR = TEST_DATA_DIR;
+
+const core = await import("../../src/lib/db/core.ts");
 const {
   checkIP,
   configureIPFilter,
@@ -15,7 +25,17 @@ const {
   resetIPFilter,
 } = await import("../../open-sse/services/ipFilter.ts");
 
-test.beforeEach(() => resetIPFilter());
+test.after(() => {
+  core.resetDbInstance();
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+});
+
+test.beforeEach(() => {
+  core.resetDbInstance();
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
+  resetIPFilter();
+});
 
 // ─── Disabled ───────────────────────────────────────────────────────────────
 
@@ -55,6 +75,18 @@ test("whitelist: CIDR match", () => {
   configureIPFilter({ enabled: true, mode: "whitelist", whitelist: ["10.0.0.0/8"] });
   assert.equal(checkIP("10.255.255.255").allowed, true);
   assert.equal(checkIP("11.0.0.1").allowed, false);
+});
+
+test("whitelist: empty whitelist allows all IPs (admin can still reach dashboard)", () => {
+  configureIPFilter({ enabled: true, mode: "whitelist", whitelist: [] });
+  assert.equal(checkIP("1.2.3.4").allowed, true);
+  assert.equal(checkIP("5.6.7.8").allowed, true);
+});
+
+test("whitelist: non-empty whitelist blocks unlisted IPs", () => {
+  configureIPFilter({ enabled: true, mode: "whitelist", whitelist: ["1.2.3.4"] });
+  assert.equal(checkIP("1.2.3.4").allowed, true);
+  assert.equal(checkIP("5.6.7.8").allowed, false);
 });
 
 // ─── Whitelist Priority Mode ────────────────────────────────────────────────
@@ -100,9 +132,14 @@ test("addToBlacklist/removeFromBlacklist: dynamic updates", () => {
 test("addToWhitelist/removeFromWhitelist: dynamic updates", () => {
   configureIPFilter({ enabled: true, mode: "whitelist" });
   addToWhitelist("1.1.1.1");
+  addToWhitelist("2.2.2.2");
   assert.equal(checkIP("1.1.1.1").allowed, true);
   removeFromWhitelist("1.1.1.1");
   assert.equal(checkIP("1.1.1.1").allowed, false);
+  // #13534: removing the last entry leaves an empty whitelist, which no longer
+  // enforces (so an admin who has not populated the list yet is not locked out).
+  removeFromWhitelist("2.2.2.2");
+  assert.equal(checkIP("1.1.1.1").allowed, true);
 });
 
 // ─── IPv6 Normalization ─────────────────────────────────────────────────────

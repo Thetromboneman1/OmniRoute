@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
-import { getEvalScorecard, listEvalRuns, getApiKeys } from "@/lib/localDb";
+import { getEvalScorecard, listEvalRuns } from "@/lib/db/evals";
+import { getApiKeys } from "@/lib/db/apiKeys";
 import { listSuites, runSuite, createScorecard } from "@/lib/evals/evalRunner";
 import { buildEvalTargetOptions, runEvalSuiteAgainstTarget } from "@/lib/evals/runtime";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { evalRunSuiteSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 export async function GET(request: Request) {
   const authError = await requireManagementAuth(request);
@@ -31,8 +33,8 @@ export async function GET(request: Request) {
         isActive: key.isActive !== false,
       })),
     });
-  } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+  } catch (error: unknown) {
+    return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }
 }
 
@@ -105,7 +107,7 @@ export async function POST(request: Request) {
       recentRuns: listEvalRuns({ limit: 20 }),
       historyScorecard: getEvalScorecard({ limit: 50 }),
     });
-  } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+  } catch (error: unknown) {
+    return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }
 }

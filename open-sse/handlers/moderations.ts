@@ -6,7 +6,10 @@ import { CORS_HEADERS } from "../utils/cors.ts";
  */
 
 import { getModerationProvider, parseModerationModel } from "../config/moderationRegistry.ts";
-import { errorResponse } from "../utils/error.ts";
+import { errorResponse, sanitizeErrorMessage } from "../utils/error.ts";
+import { buildSanitizedUpstreamErrorResponse } from "../utils/upstreamErrorResponse.ts";
+import { attachOmniRouteMetaHeaders } from "@/domain/omnirouteResponseMeta";
+import { generateRequestId } from "@/shared/utils/requestId";
 
 /**
  * Handle moderation request
@@ -18,6 +21,7 @@ import { errorResponse } from "../utils/error.ts";
  */
 /** @returns {Promise<unknown>} */
 export async function handleModeration({ body, credentials }) {
+  const startTime = Date.now();
   if (!body.input) {
     return errorResponse(400, "input is required");
   }
@@ -54,20 +58,29 @@ export async function handleModeration({ body, credentials }) {
 
     if (!res.ok) {
       const errText = await res.text();
-      return new Response(errText, {
+      return buildSanitizedUpstreamErrorResponse({
         status: res.status,
-        headers: {
-          "Content-Type": "application/json",
-          ...CORS_HEADERS,
-        },
+        rawBody: errText,
+        fallbackMessage: `Moderation provider returned HTTP ${res.status}`,
+        headers: CORS_HEADERS,
       });
     }
 
     const data = await res.json();
-    return Response.json(data, {
-      headers: { ...CORS_HEADERS },
+    const headers = new Headers({ ...CORS_HEADERS, "Content-Type": "application/json" });
+    attachOmniRouteMetaHeaders(headers, {
+      provider: providerId,
+      model: modelId,
+      costUsd: 0,
+      latencyMs: Date.now() - startTime,
+      requestId: generateRequestId(),
     });
+    return new Response(JSON.stringify(data), { status: 200, headers });
   } catch (err) {
-    return errorResponse(500, `Moderation request failed: ${err.message}`);
+    const safeDetail =
+      sanitizeErrorMessage(err)
+        .replace(/^[A-Za-z]*Error:\s*/, "")
+        .trim() || "unknown upstream failure";
+    return errorResponse(500, `Moderation request failed: ${safeDetail}`);
   }
 }

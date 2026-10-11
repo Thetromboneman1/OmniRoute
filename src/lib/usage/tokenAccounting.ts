@@ -31,13 +31,34 @@ export function getPromptCacheReadTokens(tokens: unknown): number {
   );
 }
 
+/**
+ * Every key a provider may use to report prompt cache-CREATION (write) tokens,
+ * in precedence order. Anthropic uses `cache_creation_input_tokens`; the OpenAI
+ * -shaped containers nest it under prompt/input token details, and several
+ * gateways (OpenRouter, Devin Desktop, the codex-chatgpt-web bridge) spell it
+ * `cache_write_tokens`. Consumers that only read the Anthropic key silently
+ * dropped the value whenever usage travelled in OpenAI shape (#Cache Write N/A).
+ */
+export const CACHE_CREATION_TOKEN_KEYS = [
+  "cacheCreation",
+  "cache_creation_input_tokens",
+  "cache_write_tokens",
+] as const;
+
+export const CACHE_CREATION_TOKEN_DETAIL_KEYS = [
+  "cache_creation_tokens",
+  "cache_write_tokens",
+] as const;
+
 export function getPromptCacheCreationTokens(tokens: unknown): number {
   const tokenRecord = asRecord(tokens);
   const promptDetails = getPromptTokenDetails(tokenRecord);
   return toFiniteNumber(
     tokenRecord.cacheCreation ??
       tokenRecord.cache_creation_input_tokens ??
-      promptDetails.cache_creation_tokens
+      tokenRecord.cache_write_tokens ??
+      promptDetails.cache_creation_tokens ??
+      promptDetails.cache_write_tokens
   );
 }
 
@@ -46,6 +67,13 @@ export function getLoggedInputTokens(tokens: unknown): number {
 
   if (tokenRecord.input !== undefined && tokenRecord.input !== null) {
     return toFiniteNumber(tokenRecord.input);
+  }
+
+  // Prefer prompt_tokens when present: translators normalize provider-specific
+  // usage into OpenAI shape there, and may keep input_tokens for compatibility.
+  // Treating that input_tokens as raw Claude usage would add cache tokens again.
+  if (tokenRecord.prompt_tokens !== undefined && tokenRecord.prompt_tokens !== null) {
+    return toFiniteNumber(tokenRecord.prompt_tokens);
   }
 
   if (tokenRecord.input_tokens !== undefined && tokenRecord.input_tokens !== null) {
@@ -60,13 +88,7 @@ export function getLoggedInputTokens(tokens: unknown): number {
     );
   }
 
-  // prompt_tokens from translator/extractor already includes cache tokens:
-  //   - OpenAI format: prompt_tokens inherently includes cached
-  //   - Claude non-streaming: extractUsageFromResponse sums input + cache_read + cache_creation
-  //   - Claude streaming: extractUsage (after fix) sums input + cache_read + cache_creation
-  // Do NOT add cache fields here — would double-count.
-  const promptTokens = toFiniteNumber(tokenRecord.prompt_tokens);
-  return promptTokens;
+  return 0;
 }
 
 export function getLoggedOutputTokens(tokens: unknown): number {
@@ -90,6 +112,77 @@ export function getReasoningTokens(tokens: unknown): number {
   return toFiniteNumber(
     tokenRecord.reasoning ?? tokenRecord.reasoning_tokens ?? completionDetails.reasoning_tokens
   );
+}
+
+// Non-greedy, single-capture, no nested variable-length quantifiers → ReDoS-safe.
+const THINK_BLOCK_RE = /<think>([\s\S]*?)<\/think>/gi;
+
+type ObservedReasoning = { source: "content" | "think" | null; chars: number };
+
+function countThinkTagChars(text: string): number {
+  let chars = 0;
+  for (const match of text.matchAll(THINK_BLOCK_RE)) {
+    chars += (match[1] ?? "").length;
+  }
+  return chars;
+}
+
+// #13965: Claude-format content arrays — native Claude bodies, or the same blocks
+// wrapped in an OpenAI `choices[0].message` by Claude-compatible upstreams. Only
+// readable `thinking` text counts; `redacted_thinking` carries no observable chars.
+function observeContentBlocks(blocks: unknown[]): ObservedReasoning {
+  let thinkingChars = 0;
+  let thinkTagChars = 0;
+  for (const block of blocks) {
+    const record = asRecord(block);
+    if (
+      record.type === "thinking" &&
+      typeof record.thinking === "string" &&
+      record.thinking.trim().length > 0
+    ) {
+      thinkingChars += record.thinking.length;
+    } else if (record.type === "text" && typeof record.text === "string") {
+      thinkTagChars += countThinkTagChars(record.text);
+    }
+  }
+  if (thinkingChars > 0) return { source: "content", chars: thinkingChars };
+  if (thinkTagChars > 0) return { source: "think", chars: thinkTagChars };
+  return { source: null, chars: 0 };
+}
+
+/**
+ * Inspect an assistant message for reasoning/thinking content that the usage
+ * object may not have metered (#6187 — e.g. stepfun step-3.7-flash emits
+ * `reasoning_content` but reports `reasoning_tokens=0`).
+ *
+ * Returns the reasoning SOURCE and the raw CHARACTER count of the observed
+ * reasoning text.
+ *
+ * IMPORTANT: `chars` is a CHARACTER count, NOT a token count. It must NEVER be
+ * fed into cost math (`costCalculator` prices `tokens.reasoning`). It exists
+ * only so call logs can distinguish "reasoned but metered 0" from
+ * "did not reason at all" without corrupting billing.
+ */
+export function getObservedReasoning(message: unknown): ObservedReasoning {
+  const record = asRecord(message);
+
+  // Explicit reasoning field: `reasoning_content` is the raw provider field;
+  // `reasoning` is what sseTextTransform maps it to.
+  const explicit = record.reasoning_content ?? record.reasoning;
+  if (typeof explicit === "string" && explicit.trim().length > 0) {
+    return { source: "content", chars: explicit.length };
+  }
+
+  const content = record.content;
+  if (Array.isArray(content)) return observeContentBlocks(content);
+
+  // Inline <think>...</think> blocks embedded in message content.
+  if (typeof content === "string" && content.length > 0) {
+    const chars = countThinkTagChars(content);
+    if (chars > 0) return { source: "think", chars };
+  }
+
+  return { source: null, chars: 0 };
 }
 
 // ─── Nullable variants ──────────────────────────────────────────────────
@@ -124,8 +217,8 @@ export function getPromptCacheCreationTokensOrNull(tokens: unknown): number | nu
   const tokenRecord = asRecord(tokens);
   const promptDetails = getPromptTokenDetails(tokenRecord);
   if (
-    hasAnyKey(tokenRecord, ["cacheCreation", "cache_creation_input_tokens"]) ||
-    hasAnyKey(promptDetails, ["cache_creation_tokens"])
+    hasAnyKey(tokenRecord, [...CACHE_CREATION_TOKEN_KEYS]) ||
+    hasAnyKey(promptDetails, [...CACHE_CREATION_TOKEN_DETAIL_KEYS])
   ) {
     return getPromptCacheCreationTokens(tokens);
   }
@@ -144,6 +237,23 @@ export function getReasoningTokensOrNull(tokens: unknown): number | null {
     hasAnyKey(completionDetails, ["reasoning_tokens"])
   ) {
     return getReasoningTokens(tokens);
+  }
+  return null;
+}
+
+/**
+ * Return non-cached (fresh) input tokens, or `null` if the provider didn't
+ * report any. Command Code reports this as `inputTokenDetails.noCacheTokens`.
+ * Informational only — the value is already included in prompt_tokens, so it
+ * must never be added to metering totals (see commandCode.ts usageFromCommandCode).
+ */
+export function getNoCacheTokens(tokens: unknown): number | null {
+  const tokenRecord = asRecord(tokens);
+  const promptDetails = getPromptTokenDetails(tokenRecord);
+  if (hasAnyKey(tokenRecord, ["no_cache_tokens"]) || hasAnyKey(promptDetails, ["noCacheTokens"])) {
+    return toFiniteNumber(
+      tokenRecord.no_cache_tokens ?? promptDetails.noCacheTokens ?? tokenRecord.noCacheTokens
+    );
   }
   return null;
 }

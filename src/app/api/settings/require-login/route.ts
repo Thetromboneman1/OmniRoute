@@ -1,13 +1,32 @@
 import { NextResponse } from "next/server";
-import { getSettings, updateSettings } from "@/lib/localDb";
+import { cookies } from "next/headers";
+import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
+import { getSettings, updateSettings } from "@/lib/db/settings";
 import {
   hasManagementPasswordConfigured,
   hashManagementPassword,
 } from "@/lib/auth/managementPassword";
+import { consumeBootstrapToken } from "@/lib/auth/bootstrapToken";
 import { isAuthenticated } from "@/shared/utils/apiAuth";
+import { BOOTSTRAP_TOKEN_HEADER } from "@/server/authz/headers";
+import {
+  getDashboardJwtSecret,
+  verifyDashboardSessionToken,
+  DASHBOARD_SESSION_COOKIE,
+} from "@/shared/utils/dashboardSessionToken";
 import { getNodeRuntimeSupport } from "@/shared/utils/nodeRuntimeSupport.ts";
 import { updateRequireLoginSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+
+async function checkSessionAuthenticated(): Promise<boolean> {
+  try {
+    const cookieStore = await cookies();
+    const token = cookieStore.get(DASHBOARD_SESSION_COOKIE)?.value;
+    return (await verifyDashboardSessionToken(token, getDashboardJwtSecret())) !== null;
+  } catch {
+    return false;
+  }
+}
 
 // Node.js compatibility check — reflect the supported secure runtime floors used by CLI/CI.
 function getNodeCompatibility() {
@@ -20,7 +39,7 @@ function hasConfiguredPassword(settings: Record<string, unknown>) {
 }
 
 function isBootstrapSecurityWindow(settings: Record<string, unknown>) {
-  return settings.setupComplete !== true && !hasConfiguredPassword(settings);
+  return !hasConfiguredPassword(settings);
 }
 
 export async function GET() {
@@ -28,13 +47,37 @@ export async function GET() {
   try {
     const settings = await getSettings();
     const requireLogin = settings.requireLogin !== false;
+    const authenticated = await checkSessionAuthenticated();
     const hasPassword = hasManagementPasswordConfigured(settings);
     const setupComplete = !!settings.setupComplete;
-    return NextResponse.json({ requireLogin, hasPassword, setupComplete, ...nodeInfo });
+    const oidcEnabled = !!settings.oidcEnabled;
+    const oidcDisablePasswordLogin =
+      oidcEnabled &&
+      (settings.oidcDisablePasswordLogin === true ||
+        isFeatureFlagEnabled("OMNIROUTE_OIDC_DISABLE_PASSWORD_LOGIN") ||
+        process.env.OMNIROUTE_OIDC_DISABLE_PASSWORD_LOGIN === "true" ||
+        process.env.OIDC_DISABLE_PASSWORD_LOGIN === "true");
+    return NextResponse.json({
+      authenticated,
+      requireLogin,
+      hasPassword,
+      setupComplete,
+      oidcEnabled,
+      oidcDisablePasswordLogin,
+      ...nodeInfo,
+    });
   } catch (error) {
     console.error("[API] Error fetching require-login settings:", error);
     return NextResponse.json(
-      { requireLogin: true, hasPassword: true, setupComplete: true, ...nodeInfo },
+      {
+        authenticated: false,
+        requireLogin: true,
+        hasPassword: true,
+        setupComplete: true,
+        oidcEnabled: false,
+        oidcDisablePasswordLogin: false,
+        ...nodeInfo,
+      },
       { status: 200 }
     );
   }
@@ -85,6 +128,10 @@ export async function POST(request: Request) {
     }
 
     await updateSettings(updates);
+    // #14296: one-shot — a Docker/NAT-forwarded operator that authenticated
+    // this write via the bootstrap token cannot replay it for a second write.
+    // A no-op when the header is absent or stale (never matches).
+    consumeBootstrapToken(request.headers.get(BOOTSTRAP_TOKEN_HEADER));
     return NextResponse.json({ success: true });
   } catch (error) {
     console.error("[API] Error updating require-login settings:", error);

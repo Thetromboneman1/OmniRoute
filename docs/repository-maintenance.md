@@ -16,10 +16,12 @@ OmniRoute is an AI gateway for multi-provider LLMs: an OpenAI-compatible endpoin
 
 ## Upstream synchronization
 
-- Strategy: merge upstream into a dedicated review branch and rebuild downstream overlays
+- Strategy: automatically merge clean upstream updates into `main`; use a dedicated review branch
+  for conflicts and rebuild any affected downstream overlays before promotion
 - Automation status: `configured`
 - Schedule and manual recovery: use the repository's registered upstream-sync workflow when configured.
-- Safety rule: synchronize through a dedicated review branch; never discard downstream commits or force-push a shared branch.
+- Safety rule: never discard downstream commits or force-push a shared branch. A conflicted
+  upstream update must be resolved and validated on a dedicated review branch.
 
 ## Workflows
 

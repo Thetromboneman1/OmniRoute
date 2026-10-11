@@ -11,8 +11,8 @@ process.env.OMNIROUTE_CONFIG_HOT_RELOAD_MS = "100";
 const core = await import("../../src/lib/db/core.ts");
 const settingsDb = await import("../../src/lib/db/settings.ts");
 const { getDbInstance } = core;
-const { applyRuntimeSettings, resetRuntimeSettingsStateForTests } =
-  await import("../../src/lib/config/runtimeSettings.ts");
+const runtimeSettings = await import("../../src/lib/config/runtimeSettings.ts");
+const { applyRuntimeSettings, resetRuntimeSettingsStateForTests } = runtimeSettings;
 const { startRuntimeConfigHotReload, stopRuntimeConfigHotReloadForTests } =
   await import("../../src/lib/config/hotReload.ts");
 const { getCliCompatProviders } = await import("../../open-sse/config/cliFingerprints.ts");
@@ -30,6 +30,7 @@ const { getPayloadRulesConfig, resetPayloadRulesConfigForTests } =
   await import("../../open-sse/services/payloadRules.ts");
 const { getCacheControlSettings, invalidateCacheControlSettingsCache } =
   await import("../../src/lib/cacheControlSettings.ts");
+const { getSyncStatus, stopPeriodicSync } = await import("../../src/lib/modelsDevSync.ts");
 
 async function resetStorage() {
   stopRuntimeConfigHotReloadForTests();
@@ -44,7 +45,7 @@ async function resetStorage() {
   });
   invalidateCacheControlSettingsCache();
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -64,6 +65,16 @@ test.beforeEach(async () => {
 
 test.after(async () => {
   await resetStorage();
+});
+
+test("runtime settings public surface excludes removed snapshot inspection helper", () => {
+  assert.equal(
+    Object.hasOwn(runtimeSettings, "getLastAppliedRuntimeSettingsSnapshotForTests"),
+    false
+  );
+  assert.equal(typeof runtimeSettings.applyRuntimeSettings, "function");
+  assert.equal(typeof runtimeSettings.getAuthzBypassSnapshot, "function");
+  assert.equal(typeof runtimeSettings.resetRuntimeSettingsStateForTests, "function");
 });
 
 test("updateSettings applies runtime settings incrementally without restart", async () => {
@@ -116,6 +127,50 @@ test("updateSettings applies runtime settings incrementally without restart", as
   assert.equal((await getPayloadRulesConfig()).override.length, 0);
   assert.equal(await getCacheControlSettings(), "auto");
   assert.equal(getGeminiThoughtSignatureMode(), "enabled");
+});
+
+test("MODELS_DEV_SYNC_ENABLED=0 blocks a live settings update from starting the sync timer", async () => {
+  const previousEnvFlag = process.env.MODELS_DEV_SYNC_ENABLED;
+  const previousBackgroundTasks = process.env.OMNIROUTE_ENABLE_RUNTIME_BACKGROUND_TASKS;
+  process.env.MODELS_DEV_SYNC_ENABLED = "0";
+  process.env.OMNIROUTE_ENABLE_RUNTIME_BACKGROUND_TASKS = "1";
+  stopPeriodicSync();
+
+  try {
+    await applyRuntimeSettings(
+      {
+        ...(await settingsDb.getSettings()),
+        modelsDevSyncEnabled: false,
+        modelsDevSyncInterval: 3_600_000,
+      },
+      { force: true, source: "test:startup" }
+    );
+
+    const persistedSettings = await settingsDb.updateSettings({
+      modelsDevSyncEnabled: true,
+      modelsDevSyncInterval: 3_600_000,
+    });
+
+    assert.equal(
+      persistedSettings.modelsDevSyncEnabled,
+      true,
+      "the live settings update must persist the dashboard toggle"
+    );
+    assert.equal(
+      getSyncStatus().enabled,
+      false,
+      "MODELS_DEV_SYNC_ENABLED=0 must prevent a live settings update from starting the timer"
+    );
+  } finally {
+    stopPeriodicSync();
+    if (previousEnvFlag === undefined) delete process.env.MODELS_DEV_SYNC_ENABLED;
+    else process.env.MODELS_DEV_SYNC_ENABLED = previousEnvFlag;
+    if (previousBackgroundTasks === undefined) {
+      delete process.env.OMNIROUTE_ENABLE_RUNTIME_BACKGROUND_TASKS;
+    } else {
+      process.env.OMNIROUTE_ENABLE_RUNTIME_BACKGROUND_TASKS = previousBackgroundTasks;
+    }
+  }
 });
 
 test("hot-reload watcher picks up external sqlite changes via polling fallback", async () => {

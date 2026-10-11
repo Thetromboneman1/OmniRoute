@@ -1,33 +1,32 @@
 "use server";
 
 import { NextResponse } from "next/server";
-import { restartTool } from "@/lib/versionManager";
-import { versionManagerToolSchema } from "@/shared/validation/schemas";
-import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { getServiceRow } from "@/lib/db/versionManager";
+import { getOrInitSupervisor } from "@/app/api/services/cliproxy/_lib";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
+
+import { parseVersionManagerToolRequest } from "../request";
 
 export async function POST(request: Request) {
-  const authError = await requireManagementAuth(request);
-  if (authError) return authError;
-
-  let rawBody;
-  try {
-    rawBody = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
-  }
-
-  const validation = validateBody(versionManagerToolSchema, rawBody);
-  if (isValidationFailure(validation)) {
-    return NextResponse.json({ error: validation.error }, { status: 400 });
+  const parsed = await parseVersionManagerToolRequest(request);
+  if (!parsed.ok) {
+    return parsed.response;
   }
 
   try {
-    const { tool } = validation.data;
-    const result = await restartTool(tool);
-    return NextResponse.json({ success: true, ...result });
+    const row = await getServiceRow("cliproxy");
+    if (!row || row.status === "not_installed") {
+      return NextResponse.json({ error: "CLIProxyAPI is not installed." }, { status: 409 });
+    }
+
+    const sup = await getOrInitSupervisor();
+    const status = await sup.restart();
+    // Preserve legacy response shape: { success: true, pid, port }
+    return NextResponse.json({ success: true, pid: status.pid, port: status.port });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Failed to restart";
+    const message = sanitizeErrorMessage(
+      error instanceof Error ? error.message : "Failed to restart"
+    );
     console.error("[version-manager] restart error:", message);
     return NextResponse.json({ error: message }, { status: 500 });
   }

@@ -1,8 +1,17 @@
 "use client";
 
 import { useEffect, useRef, useId } from "react";
+import { useTranslations } from "next-intl";
 import { cn } from "@/shared/utils/cn";
-import Button from "./Button";
+import Button, { type ButtonVariant } from "./Button";
+
+// #6265 — preset for content-heavy modals: caps height on the OUTERMOST dialog
+// wrapper only (single scroll owner) and keeps the inner body plain (no
+// independent max-h/overflow), avoiding a double height cap that clips content.
+export const TALL_MODAL_PROPS = {
+  className: "max-h-[90vh] overflow-y-auto",
+  bodyClassName: "p-6",
+};
 
 interface ModalProps {
   isOpen: boolean;
@@ -14,7 +23,21 @@ interface ModalProps {
   closeOnOverlay?: boolean;
   showCloseButton?: boolean;
   className?: string;
+  bodyClassName?: string;
+  compactHeader?: boolean;
   maxWidth?: string;
+}
+
+interface ConfirmModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onConfirm: () => void | Promise<void>;
+  title?: React.ReactNode;
+  message: React.ReactNode;
+  confirmText?: React.ReactNode;
+  cancelText?: React.ReactNode;
+  variant?: ButtonVariant;
+  loading?: boolean;
 }
 
 export default function Modal({
@@ -27,9 +50,13 @@ export default function Modal({
   closeOnOverlay = true,
   showCloseButton = true,
   className,
+  bodyClassName,
+  compactHeader = false,
 }: ModalProps) {
+  const t = useTranslations("common");
   const titleId = useId();
   const dialogRef = useRef(null);
+  const previouslyFocusedRef = useRef<HTMLElement | null>(null);
 
   const sizes = {
     sm: "max-w-sm",
@@ -62,6 +89,22 @@ export default function Modal({
     return () => document.removeEventListener("keydown", handleEscape);
   }, [isOpen, onClose]);
 
+  // Return keyboard users to the control that opened the dialog.
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const activeElement = document.activeElement;
+    previouslyFocusedRef.current = activeElement instanceof HTMLElement ? activeElement : null;
+
+    return () => {
+      const previouslyFocused = previouslyFocusedRef.current;
+      previouslyFocusedRef.current = null;
+      if (previouslyFocused?.isConnected) {
+        previouslyFocused.focus();
+      }
+    };
+  }, [isOpen]);
+
   // Focus trap
   useEffect(() => {
     if (!isOpen || !dialogRef.current) return;
@@ -72,9 +115,9 @@ export default function Modal({
 
     // Focus first focusable element
     const firstFocusable = dialog.querySelector(focusableSelector);
-    if (firstFocusable) {
-      setTimeout(() => firstFocusable.focus(), 50);
-    }
+    const focusTimer = firstFocusable
+      ? window.setTimeout(() => firstFocusable.focus(), 50)
+      : undefined;
 
     const handleTab = (e) => {
       if (e.key !== "Tab") return;
@@ -95,7 +138,10 @@ export default function Modal({
     };
 
     dialog.addEventListener("keydown", handleTab);
-    return () => dialog.removeEventListener("keydown", handleTab);
+    return () => {
+      if (focusTimer !== undefined) window.clearTimeout(focusTimer);
+      dialog.removeEventListener("keydown", handleTab);
+    };
   }, [isOpen]);
 
   if (!isOpen) return null;
@@ -118,7 +164,7 @@ export default function Modal({
         className={cn(
           "relative w-full bg-surface",
           "border border-black/10 dark:border-white/10",
-          "rounded-xl shadow-2xl",
+          "rounded-card shadow-2xl",
           "animate-in fade-in zoom-in-95 duration-200",
           sizes[size],
           className
@@ -126,15 +172,47 @@ export default function Modal({
       >
         {/* Header */}
         {(title || showCloseButton) && (
-          <div className="flex items-center justify-between p-6 border-b border-black/5 dark:border-white/5">
-            <div className="flex items-center">
-              <div className="flex items-center gap-2 mr-4" aria-hidden="true">
-                <div className="w-3 h-3 rounded-full bg-[#FF5F56]" />
-                <div className="w-3 h-3 rounded-full bg-[#FFBD2E]" />
-                <div className="w-3 h-3 rounded-full bg-[#27C93F]" />
+          <div
+            className={cn(
+              "flex items-center justify-between border-b border-black/5 dark:border-white/5",
+              compactHeader ? "px-4 py-2.5" : "p-6"
+            )}
+          >
+            <div className="flex items-center min-w-0">
+              <div
+                className={cn(
+                  "flex items-center gap-1.5 mr-3 shrink-0",
+                  compactHeader ? "" : "gap-2 mr-4"
+                )}
+                aria-hidden="true"
+              >
+                <div
+                  className={cn(
+                    "rounded-full bg-[#FF5F56]",
+                    compactHeader ? "w-2.5 h-2.5" : "w-3 h-3"
+                  )}
+                />
+                <div
+                  className={cn(
+                    "rounded-full bg-[#FFBD2E]",
+                    compactHeader ? "w-2.5 h-2.5" : "w-3 h-3"
+                  )}
+                />
+                <div
+                  className={cn(
+                    "rounded-full bg-[#27C93F]",
+                    compactHeader ? "w-2.5 h-2.5" : "w-3 h-3"
+                  )}
+                />
               </div>
               {title && (
-                <h2 id={titleId} className="text-lg font-semibold text-text-main">
+                <h2
+                  id={titleId}
+                  className={cn(
+                    "font-semibold text-text-main truncate min-w-0",
+                    compactHeader ? "text-sm" : "text-lg"
+                  )}
+                >
                   {title}
                 </h2>
               )}
@@ -142,8 +220,8 @@ export default function Modal({
             {showCloseButton && (
               <button
                 onClick={onClose}
-                aria-label="Close"
-                className="p-1.5 rounded-lg text-text-muted hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
+                aria-label={t("close")}
+                className="p-1.5 rounded-lg text-text-muted hover:bg-black/5 dark:hover:bg-white/5 transition-colors shrink-0"
               >
                 <span className="material-symbols-outlined text-[20px]" aria-hidden="true">
                   close
@@ -154,7 +232,9 @@ export default function Modal({
         )}
 
         {/* Body */}
-        <div className="p-6 max-h-[calc(80vh-140px)] overflow-y-auto">{children}</div>
+        <div className={bodyClassName ?? "p-6 max-h-[calc(80vh-140px)] overflow-y-auto"}>
+          {children}
+        </div>
 
         {/* Footer */}
         {footer && (
@@ -172,26 +252,31 @@ export function ConfirmModal({
   isOpen,
   onClose,
   onConfirm,
-  title = "Confirm",
+  title,
   message,
-  confirmText = "Confirm",
-  cancelText = "Cancel",
+  confirmText,
+  cancelText,
   variant = "danger",
   loading = false,
-}) {
+}: ConfirmModalProps) {
+  const t = useTranslations("common");
+  const resolvedTitle = title ?? t("confirmTitle");
+  const resolvedConfirmText = confirmText ?? t("confirmAction");
+  const resolvedCancelText = cancelText ?? t("cancel");
+
   return (
     <Modal
       isOpen={isOpen}
       onClose={onClose}
-      title={title}
+      title={resolvedTitle}
       size="sm"
       footer={
         <>
           <Button variant="ghost" onClick={onClose} disabled={loading}>
-            {cancelText}
+            {resolvedCancelText}
           </Button>
-          <Button variant={variant as any} onClick={onConfirm} loading={loading}>
-            {confirmText}
+          <Button variant={variant} onClick={() => void onConfirm()} loading={loading}>
+            {resolvedConfirmText}
           </Button>
         </>
       }

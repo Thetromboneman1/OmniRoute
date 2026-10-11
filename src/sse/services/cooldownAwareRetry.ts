@@ -3,12 +3,15 @@ import { resolveResilienceSettings } from "@/lib/resilience/settings";
 
 const MAX_REQUEST_RETRY = 10;
 const MAX_RETRY_INTERVAL_SEC = 300;
+const MAX_BUDGET_MS = 5 * 60 * 1000;
 
 export interface CooldownAwareRetrySettings {
   enabled: boolean;
   maxRetries: number;
   maxRetryWaitSec: number;
   maxRetryWaitMs: number;
+  /** Cumulative cap (ms) across all retry waits for one request — see settings/types.ts. */
+  budgetMs: number;
 }
 
 function normalizeInteger(
@@ -48,13 +51,34 @@ export function resolveCooldownAwareRetrySettings(
       max: MAX_RETRY_INTERVAL_SEC,
     }
   );
+  const maxRetryWaitMs = maxRetryWaitSec * 1000;
+  const budgetMs = normalizeInteger(waitForCooldown.budgetMs, waitForCooldown.budgetMs, {
+    min: maxRetryWaitMs,
+    max: MAX_BUDGET_MS,
+  });
   const enabled = Boolean(waitForCooldown.enabled) && maxRetries > 0 && maxRetryWaitSec > 0;
 
   return {
     enabled,
     maxRetries,
     maxRetryWaitSec,
-    maxRetryWaitMs: maxRetryWaitSec * 1000,
+    maxRetryWaitMs,
+    budgetMs,
+  };
+}
+
+export function disableCooldownAwareRetry(
+  settings: CooldownAwareRetrySettings,
+  disabled: boolean
+): CooldownAwareRetrySettings {
+  if (!disabled) return settings;
+  return {
+    ...settings,
+    enabled: false,
+    maxRetries: 0,
+    maxRetryWaitSec: 0,
+    maxRetryWaitMs: 0,
+    budgetMs: 0,
   };
 }
 
@@ -84,10 +108,25 @@ export function getCooldownAwareRetryDecision({
   retryAfter,
   settings,
   attempt,
+  budgetLeftMs,
+  lastErrorCode,
 }: {
   retryAfter: unknown;
   settings: CooldownAwareRetrySettings;
   attempt: number;
+  /**
+   * Remaining cumulative wait budget (ms) for this request. Defaults to
+   * settings.budgetMs when omitted (single-call-site backward compat) —
+   * pass the caller's tracked remainder once it starts decrementing it
+   * across attempts (#7360 follow-up).
+   */
+  budgetLeftMs?: number;
+  /**
+   * errorCode of the connection whose cooldown ends first. An auth cooldown (401) has no
+   * known end: waiting for it re-sends the request into the same 401 and another token
+   * refresh on every retry, turning a ~3 s failure into minutes.
+   */
+  lastErrorCode?: unknown;
 }): {
   shouldRetry: boolean;
   retryAfter: string | null;
@@ -95,12 +134,14 @@ export function getCooldownAwareRetryDecision({
   waitMs: number;
 } {
   const closest = computeClosestRetryAfter(retryAfter);
+  const effectiveBudgetLeftMs = budgetLeftMs ?? settings.budgetMs;
   if (
     !settings.enabled ||
     settings.maxRetries <= 0 ||
     settings.maxRetryWaitMs <= 0 ||
     attempt >= settings.maxRetries ||
-    closest.waitMs === null
+    closest.waitMs === null ||
+    Number(lastErrorCode) === 401
   ) {
     return {
       shouldRetry: false,
@@ -110,7 +151,7 @@ export function getCooldownAwareRetryDecision({
     };
   }
 
-  if (closest.waitMs > settings.maxRetryWaitMs) {
+  if (closest.waitMs > settings.maxRetryWaitMs || closest.waitMs > effectiveBudgetLeftMs) {
     return {
       shouldRetry: false,
       retryAfter: closest.retryAfter,

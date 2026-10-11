@@ -1,11 +1,12 @@
 import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
 import { getTaskManager } from "@/lib/a2a/taskManager";
-import { getSettings } from "@/lib/db/settings";
+import { getCachedSettings } from "@/lib/db/settings";
 
-export async function GET() {
+export async function GET(request?: NextRequest) {
   try {
     const [settings, stats] = await Promise.all([
-      getSettings(),
+      getCachedSettings(),
       Promise.resolve(getTaskManager().getStats()),
     ]);
     const enabled = settings.a2aEnabled === true;
@@ -14,7 +15,7 @@ export async function GET() {
     if (enabled) {
       try {
         const agentModule = await import("@/app/.well-known/agent.json/route");
-        const cardResponse = await agentModule.GET();
+        const cardResponse = await agentModule.GET(request);
         agentCard = await cardResponse.json();
       } catch {
         agentCard = null;

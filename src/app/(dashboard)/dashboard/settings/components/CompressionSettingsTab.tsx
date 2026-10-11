@@ -1,10 +1,16 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Card, Button } from "@/shared/components";
 import { useTranslations } from "next-intl";
+import CompressionTokenSaverCard, {
+  type CompressionTokenSaverConfig,
+} from "./CompressionTokenSaverCard";
 
-type CompressionMode = "off" | "lite" | "standard" | "aggressive" | "ultra";
+type CompressionMode =
+  "off" | "lite" | "standard" | "aggressive" | "ultra" | "rtk" | "codex-responses" | "stacked";
+type CavemanIntensity = "lite" | "full" | "ultra";
+type RtkIntensity = "minimal" | "standard" | "aggressive";
 
 interface CavemanConfig {
   enabled: boolean;
@@ -12,6 +18,29 @@ interface CavemanConfig {
   skipRules: string[];
   minMessageLength: number;
   preservePatterns: string[];
+  intensity: CavemanIntensity;
+}
+
+interface CavemanOutputModeConfig {
+  enabled: boolean;
+  intensity: CavemanIntensity;
+  autoClarity: boolean;
+}
+
+interface RtkConfig {
+  enabled: boolean;
+  intensity: RtkIntensity;
+}
+
+interface CodexResponsesConfig {
+  enabled: boolean;
+  minBytes: number;
+  maxOutputBytes: number;
+  maxCandidateBytes: number;
+  maxLines: number;
+  minSearchMatches: number;
+  minLogLines: number;
+  preserveToolNames: string[];
 }
 
 interface AggressiveConfig {
@@ -42,16 +71,45 @@ interface UltraConfig {
   maxTokensPerMessage: number;
 }
 
-interface CompressionConfig {
-  enabled: boolean;
+interface CompressionConfig extends CompressionTokenSaverConfig {
   defaultMode: CompressionMode;
+  autoTriggerMode?: CompressionMode;
   autoTriggerTokens: number;
   cacheMinutes: number;
   preserveSystemPrompt: boolean;
+  preserveSystemPromptMode?: "always" | "whenNoCache" | "never";
+  mcpDescriptionCompressionEnabled?: boolean;
   comboOverrides: Record<string, CompressionMode>;
   cavemanConfig?: CavemanConfig;
+  cavemanOutputMode?: CavemanOutputModeConfig;
+  rtkConfig?: RtkConfig;
+  codexResponsesConfig?: CodexResponsesConfig;
   aggressive?: AggressiveConfig;
   ultra?: UltraConfig;
+}
+
+interface RuleMetadata {
+  name: string;
+  category: string;
+  context: string;
+  minIntensity: CavemanIntensity;
+  intensities?: CavemanIntensity[];
+  description: string;
+}
+
+// A save names only the fields it changes, including fields inside nested objects.
+type SettingsPatch<T> = {
+  [K in keyof T]?: T[K] extends unknown[] ? T[K] : T[K] extends object ? SettingsPatch<T[K]> : T[K];
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+function withPatch<T>(base: T, patch: unknown): T {
+  if (!isRecord(base) || !isRecord(patch)) return patch as T;
+  const merged: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(patch)) merged[key] = withPatch(base[key], value);
+  return merged as T;
 }
 
 const MODES: { value: CompressionMode; labelKey: string; descKey: string; icon: string }[] = [
@@ -85,44 +143,30 @@ const MODES: { value: CompressionMode; labelKey: string; descKey: string; icon: 
     descKey: "compressionModeUltraDesc",
     icon: "filter_alt",
   },
+  {
+    value: "rtk",
+    labelKey: "compressionModeRtk",
+    descKey: "compressionModeRtkDesc",
+    icon: "filter_list",
+  },
+  {
+    value: "codex-responses",
+    labelKey: "compressionModeCodexResponses",
+    descKey: "compressionModeCodexResponsesDesc",
+    icon: "data_object",
+  },
+  {
+    value: "stacked",
+    labelKey: "compressionModeStacked",
+    descKey: "compressionModeStackedDesc",
+    icon: "hub",
+  },
 ];
 
 const ROLE_OPTIONS: { value: "user" | "assistant" | "system"; labelKey: string }[] = [
   { value: "user", labelKey: "compressionRoleUser" },
   { value: "assistant", labelKey: "compressionRoleAssistant" },
   { value: "system", labelKey: "compressionRoleSystem" },
-];
-
-const ALL_CAVEMAN_RULES = [
-  "polite_framing",
-  "hedging",
-  "verbose_instructions",
-  "filler_adverbs",
-  "filler_phrases",
-  "redundant_openers",
-  "verbose_requests",
-  "self_reference",
-  "excessive_gratitude",
-  "qualifier_removal",
-  "compound_collapse",
-  "explanatory_prefix",
-  "question_to_directive",
-  "context_setup",
-  "intent_clarification",
-  "background_removal",
-  "meta_commentary",
-  "purpose_statement",
-  "list_conjunction",
-  "purpose_phrases",
-  "redundant_quantifiers",
-  "verbose_connectors",
-  "transition_removal",
-  "emphasis_removal",
-  "passive_voice",
-  "repeated_context",
-  "repeated_question",
-  "reestablished_context",
-  "summary_replacement",
 ];
 
 export default function CompressionSettingsTab() {
@@ -140,6 +184,26 @@ export default function CompressionSettingsTab() {
       skipRules: [],
       minMessageLength: 50,
       preservePatterns: [],
+      intensity: "full",
+    },
+    cavemanOutputMode: {
+      enabled: false,
+      intensity: "full",
+      autoClarity: true,
+    },
+    rtkConfig: {
+      enabled: true,
+      intensity: "standard",
+    },
+    codexResponsesConfig: {
+      enabled: false,
+      minBytes: 512,
+      maxOutputBytes: 2 * 1024 * 1024,
+      maxCandidateBytes: 512 * 1024,
+      maxLines: 160,
+      minSearchMatches: 8,
+      minLogLines: 24,
+      preserveToolNames: ["Read", "Glob", "Grep", "Write", "Edit", "WebSearch", "WebFetch"],
     },
     aggressive: {
       thresholds: { fullSummary: 5, moderate: 3, light: 2, verbatim: 2 },
@@ -165,39 +229,80 @@ export default function CompressionSettingsTab() {
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
   const [status, setStatus] = useState<"" | "saved" | "error">("");
+  const [ruleMetadata, setRuleMetadata] = useState<RuleMetadata[]>([]);
+  // A save sends only the fields it changes, so it never writes back a stale copy of settings
+  // another page or tab changed after this one loaded. Saves go out one at a time and the form
+  // shows the last saved config plus the saves still queued, so a failed save rolls back only
+  // its own fields. A PUT that never settles holds up the saves queued behind it.
+  const savedRef = useRef(config);
+  const queuedRef = useRef<SettingsPatch<CompressionConfig>[]>([]);
+  const saveQueueRef = useRef(Promise.resolve());
 
   useEffect(() => {
     fetch("/api/settings/compression")
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
-        if (data) setConfig(data);
+        if (data) {
+          savedRef.current = data;
+          setConfig(data);
+        }
       })
       .catch(() => {})
       .finally(() => setLoading(false));
+    fetch("/api/compression/rules")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (Array.isArray(data?.rules)) setRuleMetadata(data.rules);
+      })
+      .catch(() => {});
   }, []);
 
-  const save = async (updates: Partial<CompressionConfig>) => {
-    const newConfig = { ...config, ...updates };
-    setConfig(newConfig);
+  const save = (updates: SettingsPatch<CompressionConfig>) => {
+    const showQueued = () =>
+      setConfig(
+        queuedRef.current.reduce<CompressionConfig>(
+          (shown, queued) => withPatch(shown, queued),
+          savedRef.current
+        )
+      );
+    queuedRef.current.push(updates);
+    showQueued();
     setSaving(true);
     setStatus("");
-    try {
-      const res = await fetch("/api/settings/compression", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(newConfig),
-      });
-      if (res.ok) {
-        setStatus("saved");
-        setTimeout(() => setStatus(""), 2000);
-      } else {
-        setStatus("error");
-      }
-    } catch {
-      setStatus("error");
-    } finally {
-      setSaving(false);
-    }
+    saveQueueRef.current = saveQueueRef.current.then(async () => {
+      // The server stores each nested object as one row, so a PUT carries the whole object.
+      // Its other fields come from the server's current row, not this tab's copy, so a sibling
+      // field saved elsewhere since the tab loaded is not written back.
+      const current: CompressionConfig | null = Object.values(updates).some(isRecord)
+        ? await fetch("/api/settings/compression")
+            .then((res) => (res.ok ? res.json() : null))
+            .catch(() => null)
+        : savedRef.current;
+      const merged = current && withPatch(current, updates);
+      const body =
+        merged &&
+        Object.fromEntries(
+          Object.keys(updates).map((key) => [key, merged[key as keyof CompressionConfig]])
+        );
+      const ok =
+        !!body &&
+        (await fetch("/api/settings/compression", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }).then(
+          (res) => res.ok,
+          () => false
+        ));
+      queuedRef.current.shift();
+      if (ok) savedRef.current = { ...savedRef.current, ...body };
+      showQueued();
+      setSaving(queuedRef.current.length > 0);
+      // A failure stays on screen until the next edit, so a queued success or an earlier
+      // save's timeout cannot hide a field that just rolled back.
+      setStatus((shown) => (ok ? (shown === "error" ? shown : "saved") : "error"));
+      if (ok) setTimeout(() => setStatus((shown) => (shown === "saved" ? "" : shown)), 2000);
+    });
   };
 
   const toggleCavemanRole = (role: "user" | "assistant" | "system") => {
@@ -206,7 +311,7 @@ export default function CompressionSettingsTab() {
       ? currentRoles.filter((r) => r !== role)
       : [...currentRoles, role];
     save({
-      cavemanConfig: { ...config.cavemanConfig!, compressRoles: newRoles },
+      cavemanConfig: { compressRoles: newRoles },
     });
   };
 
@@ -216,7 +321,7 @@ export default function CompressionSettingsTab() {
       ? currentSkip.filter((r) => r !== rule)
       : [...currentSkip, rule];
     save({
-      cavemanConfig: { ...config.cavemanConfig!, skipRules: newSkip },
+      cavemanConfig: { skipRules: newSkip },
     });
   };
 
@@ -253,26 +358,12 @@ export default function CompressionSettingsTab() {
       </div>
 
       <div className="space-y-6">
-        <label className="flex items-center justify-between">
-          <span className="text-sm text-text-muted">{t("enabled")}</span>
-          <button
-            onClick={() => save({ enabled: !config.enabled })}
-            className={`relative w-10 h-5 rounded-full transition-colors ${
-              config.enabled ? "bg-green-500" : "bg-border"
-            }`}
-          >
-            <span
-              className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                config.enabled ? "left-5" : "left-0.5"
-              }`}
-            />
-          </button>
-        </label>
+        <CompressionTokenSaverCard config={config} />
 
         {config.enabled && (
           <div className="space-y-3">
             <h4 className="text-sm font-medium text-text-main">{t("compressionMode")}</h4>
-            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-2">
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-7 gap-2">
               {MODES.map((m) => (
                 <button
                   key={m.value}
@@ -327,12 +418,29 @@ export default function CompressionSettingsTab() {
             </label>
 
             <label className="flex items-center justify-between">
+              <span className="text-sm text-text-muted">
+                {t("compressionSettingsAutoTriggerMode")}
+              </span>
+              <select
+                value={config.autoTriggerMode ?? "lite"}
+                onChange={(e) => save({ autoTriggerMode: e.target.value as CompressionMode })}
+                className="w-36 px-2 py-1 text-sm rounded border border-border bg-surface text-text-main"
+              >
+                {MODES.filter((mode) => mode.value !== "off").map((mode) => (
+                  <option key={mode.value} value={mode.value}>
+                    {mode.value}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="flex items-center justify-between">
               <span className="text-sm text-text-muted">{t("compressionCacheTTL")}</span>
               <div className="flex items-center gap-2">
                 <input
                   type="number"
-                  min={0}
-                  max={1440}
+                  min={1}
+                  max={60}
                   value={config.cacheMinutes}
                   onChange={(e) => save({ cacheMinutes: parseInt(e.target.value) || 5 })}
                   className="w-24 px-2 py-1 text-sm rounded border border-border bg-surface text-text-main"
@@ -343,15 +451,43 @@ export default function CompressionSettingsTab() {
 
             <label className="flex items-center justify-between">
               <span className="text-sm text-text-muted">{t("compressionPreserveSystem")}</span>
+              <select
+                value={
+                  config.preserveSystemPromptMode ??
+                  (config.preserveSystemPrompt === false ? "whenNoCache" : "always")
+                }
+                onChange={(e) =>
+                  save({
+                    preserveSystemPromptMode: e.target.value as "always" | "whenNoCache" | "never",
+                  })
+                }
+                className="w-36 px-2 py-1 text-sm rounded border border-border bg-surface text-text-main"
+                data-testid="preserve-system-mode-select"
+              >
+                <option value="always">{t("compressionPreserveSystemAlways")}</option>
+                <option value="whenNoCache">{t("compressionPreserveSystemWhenNoCache")}</option>
+                <option value="never">{t("compressionPreserveSystemNever")}</option>
+              </select>
+            </label>
+
+            <label className="flex items-center justify-between">
+              <span className="text-sm text-text-muted">
+                {t("compressionSettingsMcpDescriptionCompression")}
+              </span>
               <button
-                onClick={() => save({ preserveSystemPrompt: !config.preserveSystemPrompt })}
+                onClick={() =>
+                  save({
+                    mcpDescriptionCompressionEnabled:
+                      config.mcpDescriptionCompressionEnabled === false,
+                  })
+                }
                 className={`relative w-10 h-5 rounded-full transition-colors ${
-                  config.preserveSystemPrompt ? "bg-green-500" : "bg-border"
+                  config.mcpDescriptionCompressionEnabled !== false ? "bg-green-500" : "bg-border"
                 }`}
               >
                 <span
                   className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                    config.preserveSystemPrompt ? "left-5" : "left-0.5"
+                    config.mcpDescriptionCompressionEnabled !== false ? "left-5" : "left-0.5"
                   }`}
                 />
               </button>
@@ -364,123 +500,143 @@ export default function CompressionSettingsTab() {
           config.defaultMode !== "lite" &&
           config.cavemanConfig && (
             <div className="space-y-3 pt-4 border-t border-border/30">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h4 className="text-sm font-medium text-text-main">
-                    {t("compressionCavemanConfig")}
-                  </h4>
-                  <p className="text-xs text-text-muted mt-0.5">
-                    {t("compressionCavemanConfigDesc")}
-                  </p>
-                </div>
-                <button
-                  onClick={() =>
-                    save({
-                      cavemanConfig: {
-                        ...config.cavemanConfig!,
-                        enabled: !config.cavemanConfig!.enabled,
-                      },
-                    })
-                  }
-                  className={`relative w-10 h-5 rounded-full transition-colors ${
-                    config.cavemanConfig.enabled ? "bg-green-500" : "bg-border"
-                  }`}
-                >
-                  <span
-                    className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
-                      config.cavemanConfig.enabled ? "left-5" : "left-0.5"
-                    }`}
-                  />
-                </button>
+              {/* Engine on/off is owned by the single-source panel (/dashboard/context/settings):
+                  the panel's `engines.caveman.enabled` is authoritative (planResolution.ts). This tab
+                  keeps only the advanced caveman tuning the panel does not expose. */}
+              <div data-testid="caveman-panel-note">
+                <h4 className="text-sm font-medium text-text-main">
+                  {t("compressionCavemanConfig")}
+                </h4>
+                <p className="text-xs text-text-muted mt-0.5">
+                  {t("compressionCavemanConfigDesc")} {t("compressionCavemanPanelHint")}{" "}
+                  <code className="text-text-muted">/dashboard/context/settings</code>
+                </p>
               </div>
 
-              {config.cavemanConfig.enabled && (
-                <>
-                  <div className="space-y-2">
-                    <p className="text-sm text-text-muted">{t("compressionRoles")}</p>
-                    <div className="flex flex-wrap gap-2">
-                      {ROLE_OPTIONS.map((opt) => (
-                        <button
-                          key={opt.value}
-                          onClick={() => toggleCavemanRole(opt.value)}
-                          className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${
-                            config.cavemanConfig!.compressRoles.includes(opt.value)
-                              ? "border-blue-500/50 bg-blue-500/10 text-blue-400"
-                              : "border-border/50 text-text-muted hover:border-border"
-                          }`}
-                        >
-                          {t(opt.labelKey)}
-                        </button>
-                      ))}
-                    </div>
+              <>
+                <div className="space-y-2">
+                  <p className="text-sm text-text-muted">{t("compressionRoles")}</p>
+                  <div className="flex flex-wrap gap-2">
+                    {ROLE_OPTIONS.map((opt) => (
+                      <button
+                        key={opt.value}
+                        onClick={() => toggleCavemanRole(opt.value)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${
+                          config.cavemanConfig!.compressRoles.includes(opt.value)
+                            ? "border-blue-500/50 bg-blue-500/10 text-blue-400"
+                            : "border-border/50 text-text-muted hover:border-border"
+                        }`}
+                      >
+                        {t(opt.labelKey)}
+                      </button>
+                    ))}
                   </div>
+                </div>
 
-                  <label className="flex items-center justify-between">
-                    <span className="text-sm text-text-muted">{t("compressionMinLength")}</span>
-                    <input
-                      type="number"
-                      min={0}
-                      max={100000}
-                      value={config.cavemanConfig.minMessageLength}
-                      onChange={(e) =>
-                        save({
-                          cavemanConfig: {
-                            ...config.cavemanConfig!,
-                            minMessageLength: parseInt(e.target.value) || 50,
-                          },
-                        })
-                      }
-                      className="w-24 px-2 py-1 text-sm rounded border border-border bg-surface text-text-main"
-                    />
-                  </label>
+                <label className="flex items-center justify-between">
+                  <span className="text-sm text-text-muted">{t("compressionMinLength")}</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={100000}
+                    value={config.cavemanConfig.minMessageLength}
+                    onChange={(e) =>
+                      save({
+                        cavemanConfig: {
+                          minMessageLength: parseInt(e.target.value) || 50,
+                        },
+                      })
+                    }
+                    className="w-24 px-2 py-1 text-sm rounded border border-border bg-surface text-text-main"
+                  />
+                </label>
 
-                  <div className="space-y-2">
-                    <p className="text-sm text-text-muted">{t("compressionSkipRules")}</p>
-                    <p className="text-xs text-text-muted">{t("compressionSkipRulesDesc")}</p>
-                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
-                      {ALL_CAVEMAN_RULES.map((rule) => (
-                        <button
-                          key={rule}
-                          onClick={() => toggleCavemanRule(rule)}
-                          className={`px-2 py-1 rounded text-xs border transition-all ${
-                            config.cavemanConfig!.skipRules.includes(rule)
-                              ? "border-red-500/50 bg-red-500/10 text-red-400 line-through"
-                              : "border-border/50 text-text-muted hover:border-border"
-                          }`}
-                        >
-                          {rule.replace(/_/g, " ")}
-                        </button>
-                      ))}
-                    </div>
+                {/* Caveman intensity (level) is set in the panel
+                      (/dashboard/context/settings); kept out of this tab to avoid a
+                      duplicate level control. */}
+
+                <div className="space-y-2">
+                  <p className="text-sm text-text-muted">{t("compressionSkipRules")}</p>
+                  <p className="text-xs text-text-muted">{t("compressionSkipRulesDesc")}</p>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+                    {ruleMetadata.map((rule) => (
+                      <button
+                        key={rule.name}
+                        onClick={() => toggleCavemanRule(rule.name)}
+                        title={`${rule.category} · ${rule.context} · ${(rule.intensities ?? [rule.minIntensity]).join("/")}`}
+                        className={`px-2 py-1 rounded text-xs border transition-all ${
+                          config.cavemanConfig!.skipRules.includes(rule.name)
+                            ? "border-red-500/50 bg-red-500/10 text-red-400 line-through"
+                            : "border-border/50 text-text-muted hover:border-border"
+                        }`}
+                      >
+                        {rule.name.replace(/_/g, " ")}
+                      </button>
+                    ))}
                   </div>
+                </div>
 
-                  <div className="space-y-2">
-                    <p className="text-sm text-text-muted">{t("compressionPreservePatterns")}</p>
-                    <p className="text-xs text-text-muted">
-                      {t("compressionPreservePatternsDesc")}
-                    </p>
-                    <textarea
-                      value={(config.cavemanConfig.preservePatterns ?? []).join("\n")}
-                      onChange={(e) => {
-                        const patterns = e.target.value
-                          .split("\n")
-                          .map((p) => p.trim())
-                          .filter(Boolean);
-                        save({
-                          cavemanConfig: {
-                            ...config.cavemanConfig!,
-                            preservePatterns: patterns,
-                          },
-                        });
-                      }}
-                      placeholder="https?://\S+\n```[\s\S]*?```"
-                      className="w-full min-h-[80px] px-3 py-2 text-sm rounded-lg border border-border bg-surface text-text-main font-mono resize-y"
-                    />
-                  </div>
-                </>
-              )}
+                <div className="space-y-2">
+                  <p className="text-sm text-text-muted">{t("compressionPreservePatterns")}</p>
+                  <p className="text-xs text-text-muted">{t("compressionPreservePatternsDesc")}</p>
+                  <textarea
+                    value={(config.cavemanConfig.preservePatterns ?? []).join("\n")}
+                    onChange={(e) => {
+                      const patterns = e.target.value
+                        .split("\n")
+                        .map((p) => p.trim())
+                        .filter(Boolean);
+                      save({
+                        cavemanConfig: {
+                          preservePatterns: patterns,
+                        },
+                      });
+                    }}
+                    placeholder="https?://\S+\n```[\s\S]*?```"
+                    className="w-full min-h-[80px] px-3 py-2 text-sm rounded-lg border border-border bg-surface text-text-main font-mono resize-y"
+                  />
+                </div>
+              </>
             </div>
           )}
+
+        {config.enabled && config.cavemanOutputMode && (
+          <div className="space-y-3 pt-4 border-t border-border/30">
+            <div>
+              <h4 className="text-sm font-medium text-text-main">
+                {t("compressionSettingsCavemanOutputMode")}
+              </h4>
+              <p className="text-xs text-text-muted mt-0.5">
+                Injects terse response instructions without rewriting provider output. Its on/off
+                and level are set in the panel (/dashboard/context/settings).
+              </p>
+            </div>
+
+            <label className="flex items-center justify-between">
+              <span className="text-sm text-text-muted">
+                {t("compressionSettingsAutoClarityBypass")}
+              </span>
+              <button
+                onClick={() =>
+                  save({
+                    cavemanOutputMode: {
+                      autoClarity: !config.cavemanOutputMode!.autoClarity,
+                    },
+                  })
+                }
+                className={`relative w-10 h-5 rounded-full transition-colors ${
+                  config.cavemanOutputMode.autoClarity ? "bg-green-500" : "bg-border"
+                }`}
+              >
+                <span
+                  className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${
+                    config.cavemanOutputMode.autoClarity ? "left-5" : "left-0.5"
+                  }`}
+                />
+              </button>
+            </label>
+          </div>
+        )}
 
         {config.enabled && config.defaultMode === "aggressive" && config.aggressive && (
           <div className="space-y-3 pt-4 border-t border-border/30">
@@ -501,7 +657,6 @@ export default function CompressionSettingsTab() {
                 onClick={() =>
                   save({
                     aggressive: {
-                      ...config.aggressive!,
                       summarizerEnabled: !config.aggressive!.summarizerEnabled,
                     },
                   })
@@ -529,7 +684,6 @@ export default function CompressionSettingsTab() {
                   onChange={(e) =>
                     save({
                       aggressive: {
-                        ...config.aggressive!,
                         maxTokensPerMessage: parseInt(e.target.value) || 2048,
                       },
                     })
@@ -552,7 +706,6 @@ export default function CompressionSettingsTab() {
                   onChange={(e) =>
                     save({
                       aggressive: {
-                        ...config.aggressive!,
                         minSavingsThreshold: parseFloat(e.target.value) || 0.05,
                       },
                     })
@@ -585,9 +738,7 @@ export default function CompressionSettingsTab() {
                       onChange={(e) =>
                         save({
                           aggressive: {
-                            ...config.aggressive!,
                             thresholds: {
-                              ...config.aggressive!.thresholds,
                               [tier]: parseInt(e.target.value) || 2,
                             },
                           },
@@ -612,9 +763,7 @@ export default function CompressionSettingsTab() {
                     onClick={() =>
                       save({
                         aggressive: {
-                          ...config.aggressive!,
                           toolStrategies: {
-                            ...config.aggressive!.toolStrategies,
                             [strategy]: !config.aggressive!.toolStrategies[strategy],
                           },
                         },
@@ -647,7 +796,6 @@ export default function CompressionSettingsTab() {
                 onClick={() =>
                   save({
                     ultra: {
-                      ...config.ultra!,
                       enabled: !config.ultra!.enabled,
                     },
                   })
@@ -675,7 +823,6 @@ export default function CompressionSettingsTab() {
                 onChange={(e) =>
                   save({
                     ultra: {
-                      ...config.ultra!,
                       compressionRate: parseFloat(e.target.value) || 0,
                     },
                   })
@@ -695,7 +842,6 @@ export default function CompressionSettingsTab() {
                 onChange={(e) =>
                   save({
                     ultra: {
-                      ...config.ultra!,
                       minScoreThreshold: parseFloat(e.target.value) || 0,
                     },
                   })
@@ -715,7 +861,6 @@ export default function CompressionSettingsTab() {
                   onChange={(e) =>
                     save({
                       ultra: {
-                        ...config.ultra!,
                         maxTokensPerMessage: parseInt(e.target.value) || 0,
                       },
                     })
@@ -732,7 +877,6 @@ export default function CompressionSettingsTab() {
                 onClick={() =>
                   save({
                     ultra: {
-                      ...config.ultra!,
                       slmFallbackToAggressive: !config.ultra!.slmFallbackToAggressive,
                     },
                   })
@@ -757,7 +901,6 @@ export default function CompressionSettingsTab() {
                 onChange={(e) =>
                   save({
                     ultra: {
-                      ...config.ultra!,
                       modelPath: e.target.value.trim() || undefined,
                     },
                   })

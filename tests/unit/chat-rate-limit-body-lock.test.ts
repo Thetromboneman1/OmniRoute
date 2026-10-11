@@ -32,8 +32,8 @@ test.after(async () => {
 test("handleChat applies body-derived retry-after to the runtime limiter", async () => {
   const connection = await seedConnection("openai", { apiKey: "sk-openai-body-retry" });
 
-  globalThis.fetch = async () =>
-    new Response(
+  globalThis.fetch = async () => {
+    return new Response(
       JSON.stringify({
         error: {
           message: "Rate limit exceeded. Please retry after 20s.",
@@ -44,11 +44,12 @@ test("handleChat applies body-derived retry-after to the runtime limiter", async
         headers: { "Content-Type": "application/json" },
       }
     );
+  };
 
   const response = await handleChat(
     buildRequest({
       body: {
-        model: "openai/gpt-4o-mini",
+        model: "openai/gpt-4.1",
         stream: false,
         messages: [{ role: "user", content: "Trigger 429 from body retry-after" }],
       },
@@ -62,10 +63,19 @@ test("handleChat applies body-derived retry-after to the runtime limiter", async
   const limiterState = await rateLimitManager.__getLimiterStateForTests(
     "openai",
     connection.id,
-    "gpt-4o-mini"
+    "gpt-4.1"
   );
   assert.ok(limiterState, "expected limiter state to exist for the active connection");
-  assert.equal(limiterState.reservoir, 0, "body-derived retry-after should drain the limiter");
+  // #9604's rolling-lease gate (reservoir: null) was clobbered by the #9041 merge;
+  // the underlying Bottleneck heartbeat defect it worked around is now fixed at the
+  // root (bottleneckPatch.ts, base-reds round 3 #9985), so RPM enforcement is back
+  // on the reservoir: the body-derived 429 lock must leave it drained (0), never
+  // refilled-and-forgotten (the pre-patch heartbeat bug) nor untracked.
+  assert.equal(
+    limiterState.reservoir,
+    0,
+    "body-derived retry-after must drain the runtime reservoir"
+  );
 });
 
 test("handleChat tolerates non-JSON rate-limit bodies without breaking fallback flow", async () => {
@@ -80,7 +90,7 @@ test("handleChat tolerates non-JSON rate-limit bodies without breaking fallback 
   const response = await handleChat(
     buildRequest({
       body: {
-        model: "openai/gpt-4o-mini",
+        model: "openai/gpt-4.1",
         stream: false,
         messages: [{ role: "user", content: "Trigger plain text 429" }],
       },

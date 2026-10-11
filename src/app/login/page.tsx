@@ -11,15 +11,17 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [hasPassword, setHasPassword] = useState(null);
-  const [setupComplete, setSetupComplete] = useState(null);
+  const [hasPassword, setHasPassword] = useState<boolean | null>(null);
+  const [setupComplete, setSetupComplete] = useState<boolean | null>(null);
+  const [oidcEnabled, setOidcEnabled] = useState<boolean | null>(null);
+  const [oidcDisablePasswordLogin, setOidcDisablePasswordLogin] = useState<boolean | null>(null);
   const [mounted, setMounted] = useState(false);
   const [nodeVersion, setNodeVersion] = useState(null);
   const [nodeCompatible, setNodeCompatible] = useState(true);
   const router = useRouter();
 
   useEffect(() => {
-    setMounted(true);
+    const raf = requestAnimationFrame(() => setMounted(true));
     async function checkAuth() {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 5000);
@@ -35,21 +37,26 @@ export default function LoginPage() {
           const data = await res.json();
           if (data.nodeVersion) setNodeVersion(data.nodeVersion);
           if (data.nodeCompatible === false) setNodeCompatible(false);
-          if (data.requireLogin === false) {
-            router.push("/dashboard");
-            router.refresh();
+          if (data.authenticated === true || data.requireLogin === false) {
+            window.location.href = "/dashboard";
             return;
           }
           setHasPassword(!!data.hasPassword);
           setSetupComplete(!!data.setupComplete);
+          setOidcEnabled(!!data.oidcEnabled);
+          setOidcDisablePasswordLogin(!!data.oidcDisablePasswordLogin);
         } else {
           setHasPassword(true);
           setSetupComplete(true);
+          setOidcEnabled(false);
+          setOidcDisablePasswordLogin(false);
         }
       } catch (err) {
         clearTimeout(timeoutId);
         setHasPassword(true);
         setSetupComplete(true);
+        setOidcEnabled(false);
+        setOidcDisablePasswordLogin(false);
       }
     }
     checkAuth();
@@ -69,13 +76,12 @@ export default function LoginPage() {
 
       if (res.ok) {
         sessionStorage.setItem("omniroute_login_time", String(Date.now()));
-        router.push("/dashboard");
-        router.refresh();
+        window.location.href = "/dashboard";
       } else {
         const data = await res.json();
         // (#521) If no password is set, redirect to onboarding instead of showing an error
         if (data.needsSetup) {
-          router.push("/dashboard/onboarding");
+          window.location.href = "/dashboard/onboarding";
           return;
         }
         setError(data.error || t("invalidPassword"));
@@ -87,38 +93,45 @@ export default function LoginPage() {
     }
   };
 
-  const nodeWarningBanner = !nodeCompatible && nodeVersion ? (
-    <div className="w-full max-w-lg mx-auto mb-6 animate-in fade-in slide-in-from-top-2 duration-500">
-      <div className="bg-red-950/60 border-2 border-red-500/40 rounded-2xl p-6 shadow-lg shadow-red-900/20 backdrop-blur-sm">
-        <div className="flex items-start gap-4">
-          <div className="w-12 h-12 rounded-xl bg-red-500/20 flex items-center justify-center flex-shrink-0 mt-0.5">
-            <span className="material-symbols-outlined text-red-400 text-[28px]">error</span>
-          </div>
-          <div className="flex-1 min-w-0">
-            <h3 className="text-base font-bold text-red-300 mb-1">{t("nodeIncompatibleTitle")}</h3>
-            <p className="text-sm text-red-200/80 leading-relaxed mb-3">
-              {t("nodeIncompatibleDesc", { version: nodeVersion })}
-            </p>
-            <div className="bg-black/40 rounded-lg px-4 py-3 font-mono text-sm border border-red-500/20">
-              <div className="flex items-center gap-2 text-red-300/60 mb-1">
-                <span className="material-symbols-outlined text-[14px]">terminal</span>
-                <span className="text-xs">{t("nodeIncompatibleFixLabel")}</span>
-              </div>
-              <code className="text-amber-300">nvm install 22 && nvm use 22</code>
+  const nodeWarningBanner =
+    !nodeCompatible && nodeVersion ? (
+      <div className="w-full max-w-lg mx-auto mb-6 animate-in fade-in slide-in-from-top-2 duration-500">
+        <div className="bg-red-950/60 border-2 border-red-500/40 rounded-2xl p-6 shadow-lg shadow-red-900/20 backdrop-blur-sm">
+          <div className="flex items-start gap-4">
+            <div className="w-12 h-12 rounded-xl bg-red-500/20 flex items-center justify-center flex-shrink-0 mt-0.5">
+              <span className="material-symbols-outlined text-red-400 text-[28px]">error</span>
             </div>
-            <p className="text-xs text-red-300/50 mt-3 flex items-center gap-1.5">
-              <span className="material-symbols-outlined text-[14px]">info</span>
-              {t("nodeIncompatibleHint")}
-            </p>
+            <div className="flex-1 min-w-0">
+              <h3 className="text-base font-bold text-red-300 mb-1">
+                {t("nodeIncompatibleTitle")}
+              </h3>
+              <p className="text-sm text-red-200/80 leading-relaxed mb-3">
+                {t("nodeIncompatibleDesc", { version: nodeVersion })}
+              </p>
+              <div className="bg-black/40 rounded-lg px-4 py-3 font-mono text-sm border border-red-500/20">
+                <div className="flex items-center gap-2 text-red-300/60 mb-1">
+                  <span className="material-symbols-outlined text-[14px]">terminal</span>
+                  <span className="text-xs">{t("nodeIncompatibleFixLabel")}</span>
+                </div>
+                <code className="text-amber-300">nvm install 22 && nvm use 22</code>
+              </div>
+              <p className="text-xs text-red-300/50 mt-3 flex items-center gap-1.5">
+                <span className="material-symbols-outlined text-[14px]">info</span>
+                {t("nodeIncompatibleHint")}
+              </p>
+            </div>
           </div>
         </div>
       </div>
-    </div>
-  ) : null;
-
-  if (hasPassword === null || setupComplete === null) {
+    ) : null;
+  if (
+    hasPassword === null ||
+    setupComplete === null ||
+    oidcEnabled === null ||
+    (oidcEnabled && oidcDisablePasswordLogin === null)
+  ) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-bg p-6">
+      <div className="min-h-screen flex flex-col items-center justify-center p-6">
         {nodeWarningBanner}
         <div className="flex flex-col items-center gap-3">
           <div className="relative">
@@ -133,7 +146,7 @@ export default function LoginPage() {
 
   if (!hasPassword && !setupComplete) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-bg p-6">
+      <div className="min-h-screen flex flex-col items-center justify-center p-6">
         {nodeWarningBanner}
         <div
           className={`w-full max-w-md transition-all duration-700 ease-out ${mounted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"}`}
@@ -171,7 +184,7 @@ export default function LoginPage() {
 
   if (!hasPassword && setupComplete) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-bg p-6">
+      <div className="min-h-screen flex flex-col items-center justify-center p-6">
         {nodeWarningBanner}
         <div
           className={`w-full max-w-md transition-all duration-700 ease-out ${mounted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"}`}
@@ -194,7 +207,7 @@ export default function LoginPage() {
               <Button
                 variant="primary"
                 className="w-full h-11 text-sm font-medium"
-                onClick={() => router.push("/dashboard/settings?tab=security")}
+                onClick={() => router.push("/dashboard/onboarding")}
               >
                 {t("configurePassword")}
               </Button>
@@ -210,117 +223,153 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col bg-bg">
+    <div className="min-h-screen flex flex-col">
       {nodeWarningBanner && (
-        <div className="flex justify-center pt-6 px-6">
-          {nodeWarningBanner}
-        </div>
+        <div className="flex justify-center pt-6 px-6">{nodeWarningBanner}</div>
       )}
-      <div className="flex-1 flex bg-bg">
-      <div className="flex-1 flex items-center justify-center p-6">
-        <div
-          className={`w-full max-w-sm transition-all duration-700 ease-out ${mounted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"}`}
-        >
-          <div className="mb-10">
-            <div className="flex items-center gap-3 mb-8">
-              <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-primary-hover flex items-center justify-center">
-                <span className="material-symbols-outlined text-white text-[20px]">hub</span>
-              </div>
-              <span className="text-xl font-semibold text-text-main tracking-tight">OmniRoute</span>
-            </div>
-            <h1 className="text-2xl font-bold text-text-main tracking-tight">{t("signIn")}</h1>
-            <p className="text-text-muted mt-1.5">{t("enterPassword")}</p>
-          </div>
-
-          <form onSubmit={handleLogin} className="space-y-5">
-            <div className="space-y-2">
-              <label className="text-sm font-medium text-text-main">{t("password")}</label>
-              <Input
-                type="password"
-                placeholder={t("enterPassword")}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                required
-                autoFocus
-                className="h-11"
-              />
-              {error && (
-                <p className="text-sm text-red-500 flex items-center gap-1.5 pt-1">
-                  <span className="material-symbols-outlined text-base">error</span>
-                  {error}
-                </p>
-              )}
-              <p className="text-xs text-text-muted/60 pt-0.5">{t("defaultPasswordHint")}</p>
-            </div>
-
-            <Button
-              type="submit"
-              variant="primary"
-              className="w-full h-11 text-sm font-medium"
-              loading={loading}
-            >
-              {t("continue")}
-            </Button>
-          </form>
-
-          <div className="mt-6 pt-6 border-t border-border">
-            <a
-              href="/forgot-password"
-              className="text-sm text-text-muted hover:text-primary transition-colors"
-            >
-              {t("forgotPassword")}
-            </a>
-          </div>
-        </div>
-      </div>
-
-      <div className="hidden lg:flex lg:w-1/2 bg-gradient-to-br from-primary/5 via-primary/3 to-transparent items-center justify-center p-12">
-        <div
-          className={`max-w-md transition-all duration-700 delay-200 ease-out ${mounted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"}`}
-        >
-          <div className="space-y-8">
-            <div>
-              <h2 className="text-2xl font-bold text-text-main mb-3">{t("unifiedAiApiProxy")}</h2>
-              <p className="text-text-muted leading-relaxed">{t("unifiedAiApiProxyDesc")}</p>
-            </div>
-
-            <div className="space-y-4">
-              {[
-                {
-                  icon: "swap_horiz",
-                  title: t("featureMultiProviderTitle"),
-                  desc: t("featureMultiProviderDesc"),
-                },
-                {
-                  icon: "speed",
-                  title: t("featureLoadBalancingTitle"),
-                  desc: t("featureLoadBalancingDesc"),
-                },
-                {
-                  icon: "analytics",
-                  title: t("featureUsageTrackingTitle"),
-                  desc: t("featureUsageTrackingDesc"),
-                },
-              ].map((item) => (
-                <div
-                  key={item.icon}
-                  className="flex items-start gap-4 p-4 rounded-xl bg-surface/50 border border-border"
-                >
-                  <div className="w-10 h-10 rounded-lg bg-primary/10 flex items-center justify-center flex-shrink-0">
-                    <span className="material-symbols-outlined text-primary text-[20px]">
-                      {item.icon}
-                    </span>
-                  </div>
-                  <div>
-                    <h3 className="font-medium text-text-main">{item.title}</h3>
-                    <p className="text-sm text-text-muted">{item.desc}</p>
-                  </div>
+      <div className="flex-1 flex">
+        <div className="flex-1 flex items-center justify-center p-6">
+          <div
+            className={`w-full max-w-sm transition-all duration-700 ease-out ${mounted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"}`}
+          >
+            <div className="mb-10">
+              <div className="flex items-center gap-3 mb-8">
+                <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-primary-hover flex items-center justify-center">
+                  <span className="material-symbols-outlined text-white text-[20px]">hub</span>
                 </div>
-              ))}
+                <span className="text-xl font-semibold text-text-main tracking-tight">
+                  OmniRoute
+                </span>
+              </div>
+              <h1 className="text-2xl font-bold text-text-main tracking-tight">{t("signIn")}</h1>
+              <p className="text-text-muted mt-1.5">
+                {oidcEnabled && oidcDisablePasswordLogin
+                  ? t("continueWithOidc")
+                  : t("enterPassword")}
+              </p>
+            </div>
+
+            {oidcEnabled && oidcDisablePasswordLogin ? (
+              <div className="space-y-4">
+                <Button
+                  type="button"
+                  variant="primary"
+                  className="w-full h-11 text-sm font-medium flex items-center justify-center gap-2"
+                  onClick={() => (window.location.href = "/api/auth/oidc/login")}
+                >
+                  <span className="material-symbols-outlined text-lg">login</span>
+                  {t("continueWithOidc")}
+                </Button>
+              </div>
+            ) : (
+              <>
+                <form onSubmit={handleLogin} className="space-y-5 w-full">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium text-text-main">{t("password")}</label>
+                    <Input
+                      type="password"
+                      placeholder={t("enterPassword")}
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      required
+                      autoFocus
+                      className="h-11"
+                    />
+                    {error && (
+                      <p className="text-sm text-red-500 flex items-center gap-1.5 pt-1">
+                        <span className="material-symbols-outlined text-base">error</span>
+                        {error}
+                      </p>
+                    )}
+                    <p className="text-xs text-text-muted/60 pt-0.5">{t("defaultPasswordHint")}</p>
+                  </div>
+
+                  <Button
+                    type="submit"
+                    variant="primary"
+                    className="w-full h-11 text-sm font-medium"
+                    loading={loading}
+                  >
+                    {t("continue")}
+                  </Button>
+                </form>
+
+                {oidcEnabled && (
+                  <div className="mt-4">
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      className="w-full h-11 text-sm font-medium flex items-center justify-center gap-2"
+                      onClick={() => (window.location.href = "/api/auth/oidc/login")}
+                    >
+                      <span className="material-symbols-outlined text-lg">login</span>
+                      {t("continueWithOidc")}
+                    </Button>
+                  </div>
+                )}
+              </>
+            )}
+
+            {!oidcEnabled && (
+              <div className="mt-6 pt-6 border-t border-border">
+                <a
+                  href="/forgot-password"
+                  className="text-sm text-text-muted hover:text-primary transition-colors"
+                >
+                  {t("forgotPassword")}
+                </a>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <div className="hidden lg:flex lg:w-1/2 bg-gradient-to-br from-primary/5 via-primary/3 to-transparent items-center justify-center p-12">
+          <div
+            className={`max-w-md transition-all duration-700 delay-200 ease-out ${mounted ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4"}`}
+          >
+            <div className="space-y-8">
+              <div>
+                <h2 className="text-2xl font-bold text-text-main mb-3">{t("unifiedAiApiProxy")}</h2>
+                <p className="text-text-muted leading-relaxed">{t("unifiedAiApiProxyDesc")}</p>
+              </div>
+
+              <div className="space-y-4">
+                {[
+                  {
+                    icon: "swap_horiz",
+                    title: t("featureMultiProviderTitle"),
+                    desc: t("featureMultiProviderDesc"),
+                  },
+                  {
+                    icon: "speed",
+                    title: t("featureLoadBalancingTitle"),
+                    desc: t("featureLoadBalancingDesc"),
+                  },
+                  {
+                    icon: "analytics",
+                    title: t("featureUsageTrackingTitle"),
+                    desc: t("featureUsageTrackingDesc"),
+                  },
+                ].map((item) => (
+                  <div
+                    key={item.icon}
+                    className="flex items-start gap-4 p-4 rounded-xl bg-surface/50 border border-border"
+                  >
+                    <div className="w-10 h-10 rounded-lg bg-primary/10 flex items-center justify-center flex-shrink-0">
+                      <span className="material-symbols-outlined text-primary text-[20px]">
+                        {item.icon}
+                      </span>
+                    </div>
+                    <div>
+                      <h3 className="font-medium text-text-main">{item.title}</h3>
+                      <p className="text-sm text-text-muted">{item.desc}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         </div>
-      </div>
       </div>
     </div>
   );

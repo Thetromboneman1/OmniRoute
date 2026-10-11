@@ -5,7 +5,8 @@
  * Used by TokenHealthBadge in the Header.
  */
 
-import { getProviderConnections } from "@/lib/localDb";
+import { getProviderConnections } from "@/lib/db/providers";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 
 export async function GET() {
   try {
@@ -31,6 +32,9 @@ export async function GET() {
       status: errored > 0 ? "error" : healthy < total ? "warning" : "healthy",
     });
   } catch (err) {
-    return Response.json({ error: err.message, status: "unknown" }, { status: 500 });
+    return Response.json(
+      { error: sanitizeErrorMessage((err as Error)?.message), status: "unknown" },
+      { status: 500 }
+    );
   }
 }

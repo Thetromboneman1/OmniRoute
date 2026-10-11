@@ -8,11 +8,12 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { getSettings } from "@/lib/db/settings";
+import { getCachedSettings } from "@/lib/db/settings";
 import { handleMcpStreamableHTTP } from "../../../../../open-sse/mcp-server/httpTransport";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 
 async function guardEnabled(): Promise<NextResponse | null> {
-  const settings = await getSettings();
+  const settings = await getCachedSettings();
   if (!settings.mcpEnabled) {
     return NextResponse.json(
       { error: "MCP server is disabled. Enable it from the Endpoints page." },
@@ -32,18 +33,24 @@ async function guardEnabled(): Promise<NextResponse | null> {
 }
 
 export async function POST(request: NextRequest) {
+  const authError = await requireManagementAuth(request, { acceptMcpConnectScope: true });
+  if (authError) return authError;
   const blocked = await guardEnabled();
   if (blocked) return blocked;
   return handleMcpStreamableHTTP(request);
 }
 
 export async function GET(request: NextRequest) {
+  const authError = await requireManagementAuth(request, { acceptMcpConnectScope: true });
+  if (authError) return authError;
   const blocked = await guardEnabled();
   if (blocked) return blocked;
   return handleMcpStreamableHTTP(request);
 }
 
 export async function DELETE(request: NextRequest) {
+  const authError = await requireManagementAuth(request, { acceptMcpConnectScope: true });
+  if (authError) return authError;
   const blocked = await guardEnabled();
   if (blocked) return blocked;
   return handleMcpStreamableHTTP(request);

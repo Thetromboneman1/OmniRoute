@@ -1,54 +1,71 @@
 import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
-import { DEFAULT_THINKING_GEMINI_SIGNATURE } from "../../config/defaultThinkingSignature.ts";
 import { ANTIGRAVITY_DEFAULT_SYSTEM } from "../../config/constants.ts";
-import { resolveGeminiThoughtSignature } from "../../services/geminiThoughtSignatureStore.ts";
-import { openaiToClaudeRequestForAntigravity } from "./openai-to-claude.ts";
+import {
+  buildGeminiThoughtSignatureKey,
+  resolveGeminiThoughtSignature,
+} from "../../services/geminiThoughtSignatureStore.ts";
+import {
+  generateAntigravityRequestId,
+  getAntigravityEnvelopeUserAgent,
+  getAntigravitySessionId,
+} from "../../services/antigravityIdentity.ts";
+import { fixToolPairs } from "../../services/contextManager.ts";
 import {
   capMaxOutputTokens,
   capThinkingBudget,
   getDefaultThinkingBudget,
 } from "../../../src/lib/modelCapabilities.ts";
-
-import * as crypto from "crypto";
-
-function generateUUID() {
-  return crypto.randomUUID();
-}
+import { getModelSpec } from "../../../src/shared/constants/modelSpecs.ts";
 
 import {
   DEFAULT_SAFETY_SETTINGS,
   convertOpenAIContentToParts,
   extractTextContent,
   tryParseJSON,
-  generateRequestId,
-  generateSessionId,
   cleanJSONSchemaForAntigravity,
 } from "../helpers/geminiHelper.ts";
 import { buildGeminiTools, sanitizeGeminiToolName } from "../helpers/geminiToolsSanitizer.ts";
+import {
+  type GeminiGenerationConfig,
+  isVertexGeminiProvider,
+  buildChangedToolNameMap,
+  extractClientThoughtSignature,
+  deepCleanUndefined,
+  applyAntigravityGenerationDefaults,
+  stringifyHistoricalToolArguments,
+  buildInertHistoricalToolCallText,
+  buildInertHistoricalToolResponseText,
+  escapeHistoricalContextAttribute,
+  escapeHistoricalContextContent,
+  buildHistoricalToolResultContext,
+  type GeminiPart,
+  type GeminiContent,
+  mergeConsecutiveSameRoleContents,
+  ensureHistoryDoesNotOpenWithFunctionCall,
+} from "./openai-to-gemini/helpers.ts";
+
+export {
+  mergeConsecutiveSameRoleContents,
+  ensureHistoryDoesNotOpenWithFunctionCall,
+  type GeminiContent,
+  type GeminiPart,
+};
 
 // Observed Antigravity wrapper output cap, not an underlying model capability.
-// Keep this bridge-local: capMaxOutputTokens() falls back to OmniRoute's generic
-// 8192 default for unknown Claude-family IDs, while Antigravity currently caps
-// visible output around 16K. See: https://github.com/keisksw/antigravity-output-analysis
+// Keep this bridge-local: Antigravity currently caps visible output around 16K.
+// See: https://github.com/keisksw/antigravity-output-analysis
 const ANTIGRAVITY_CLAUDE_MAX_OUTPUT_TOKENS = 16_384;
 
-type GeminiPart = Record<string, unknown>;
-type GeminiContent = { role: string; parts: GeminiPart[] };
-
-type GeminiGenerationConfig = {
-  temperature?: unknown;
-  topP?: unknown;
-  topK?: unknown;
-  maxOutputTokens?: unknown;
-  thinkingConfig?: {
-    thinkingBudget: number;
-    includeThoughts: boolean;
-  };
-  responseMimeType?: string;
-  responseSchema?: unknown;
-  stopSequences?: string[] | unknown[];
-};
+// Gemini built-in tool names that Antigravity's v1internal endpoint rejects with a
+// 400 when they are mixed with functionDeclarations in the same request. These must
+// be stripped from the Cloud Code envelope's functionDeclarations.
+const GEMINI_BUILTIN_TOOL_NAMES = new Set<string>([
+  "google_search",
+  "web_search",
+  "search_web",
+  "googleSearch",
+]);
 
 type GeminiFunctionDeclaration = {
   name: string;
@@ -56,29 +73,72 @@ type GeminiFunctionDeclaration = {
   parameters: unknown;
 };
 
+type GeminiFunctionCallingConfig = {
+  mode: string;
+  allowedFunctionNames?: string[];
+};
+
 type GeminiRequest = {
   model: string;
-  contents: GeminiContent[];
+  contents?: GeminiContent[];
+  [key: string]: unknown;
   generationConfig: GeminiGenerationConfig;
-  safetySettings: unknown;
+  safetySettings?: unknown;
   systemInstruction?: GeminiContent;
   tools?: Array<{
     functionDeclarations?: GeminiFunctionDeclaration[];
     googleSearch?: Record<string, unknown>;
   }>;
+  toolConfig?: { functionCallingConfig: GeminiFunctionCallingConfig };
   cachedContent?: string;
   _toolNameMap?: Map<string, string>;
 };
 
+// Convert OpenAI tool_choice into Gemini's functionCallingConfig mode. Mirrors
+// convertOpenAIToolChoice in openai-to-claude.ts (same enum shapes from the client).
+// Gemini's modes: AUTO (model decides), ANY (must call a function — OpenAI's
+// "required"), NONE (never call), VALIDATED (may call a function OR respond with
+// plain text, but any call it makes is schema-validated — this was the unconditional
+// hardcoded default before tool_choice was wired up at all, so it stays the fallback
+// for "auto"/unset to avoid changing existing behavior for the common case).
+//
+// Live investigation: gemini-3.1-flash-lite frequently narrates an intended tool call
+// in plain text ("I'm running python3 now...") instead of actually emitting one
+// (dashboard log id 1784591483850-49c408) — VALIDATED mode never forces a call, so
+// the model is always free to just talk instead of act. tool_choice: "required" (->
+// ANY) is the lever a caller has to prevent that, but it was silently ignored until
+// this fix — body.tool_choice was never read anywhere in this file.
+function convertOpenAIToolChoiceToGemini(choice: unknown): GeminiFunctionCallingConfig {
+  if (!choice) return { mode: "VALIDATED" };
+  if (typeof choice === "string") {
+    if (choice === "none") return { mode: "NONE" };
+    if (choice === "required" || choice === "any") return { mode: "ANY" };
+    return { mode: "VALIDATED" }; // "auto" or unrecognized string
+  }
+  if (typeof choice === "object") {
+    const c = choice as { type?: string; function?: { name?: string } };
+    if (c.type === "function" && c.function?.name) {
+      return { mode: "ANY", allowedFunctionNames: [c.function.name] };
+    }
+    if (c.type === "none") return { mode: "NONE" };
+    if (c.type === "required" || c.type === "any") return { mode: "ANY" };
+  }
+  return { mode: "VALIDATED" };
+}
+
 type CloudCodeEnvelope = {
   project: string;
-  model: string;
-  userAgent: string;
-  requestId: string;
+  model?: string;
+  user_prompt_id?: string;
+  userAgent?: string;
+  requestId?: string;
   requestType?: string;
+  enabledCreditTypes?: string[];
   request: {
-    sessionId: string;
-    contents: GeminiContent[];
+    session_id?: string;
+    sessionId?: string;
+    contents?: GeminiContent[];
+    [key: string]: unknown;
     systemInstruction?: GeminiContent;
     generationConfig: GeminiGenerationConfig;
     tools?: Array<{
@@ -95,35 +155,60 @@ type CloudCodeEnvelope = {
 
 type GeminiToolNameOptions = {
   stripNamespace?: boolean;
+  signatureNamespace?: string | null;
+  signaturelessToolCallMode?: "native" | "text" | "context";
+  // Vertex AI's FunctionCall/FunctionResponse protos have no `id` field; emitting it
+  // makes Vertex reject the request with 400 "Unknown name id" (#3440). The public
+  // Gemini API DOES use `id` for Gemini 3+ signature matching, so this is scoped to
+  // the vertex provider only.
+  stripFunctionCallId?: boolean;
+  /** Antigravity supports the thoughtSignature field. Standard Gemini rejects it with 400. */
+  supportsSignatureBypass?: boolean;
 };
 
-function buildChangedToolNameMap(toolNameMap: Map<string, string>): Map<string, string> | null {
-  const changedEntries = [...toolNameMap.entries()].filter(
-    ([sanitizedName, originalName]) => sanitizedName !== originalName
-  );
-  return changedEntries.length > 0 ? new Map(changedEntries) : null;
-}
-
-function extractClientThoughtSignature(toolCall) {
-  if (!toolCall || typeof toolCall !== "object") return null;
-
-  return (
-    toolCall.thoughtSignature ||
-    toolCall.thought_signature ||
-    toolCall.function?.thoughtSignature ||
-    toolCall.function?.thought_signature ||
-    null
-  );
+// Gemini 3.x replaced the numeric `thinkingBudget` with the string enum
+// `thinkingConfig.thinkingLevel` (low|medium|high). Extract an explicit level
+// from the incoming OpenAI-format body, honoring both the camelCase and
+// snake_case spellings at the top level and nested under
+// generationConfig.thinkingConfig (the operator payload-override surface).
+// Returns the trimmed non-empty level, or null when no level was supplied — an
+// empty/whitespace string is treated as "no level" so it can never disagree
+// with the extraction that later writes the field onto the request.
+function extractExplicitThinkingLevel(body: Record<string, unknown>): string | null {
+  const gc = body.generationConfig as Record<string, unknown> | undefined;
+  const tc = gc?.thinkingConfig as Record<string, unknown> | undefined;
+  const tcSnake = gc?.thinking_config as Record<string, unknown> | undefined;
+  const candidates = [
+    tc?.thinkingLevel,
+    tcSnake?.thinkingLevel,
+    body.thinkingLevel,
+    body.thinking_level,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim() !== "") return candidate.trim();
+  }
+  return null;
 }
 
 // Core: Convert OpenAI request to Gemini format (base for all variants)
-function openaiToGeminiBase(model, body, stream, toolNameOptions: GeminiToolNameOptions = {}) {
+function openaiToGeminiBase(
+  model: string,
+  body: Record<string, unknown>,
+  stream: boolean,
+  toolNameOptions: GeminiToolNameOptions = {}
+) {
   const result: GeminiRequest = {
     model: model,
     contents: [],
     generationConfig: {},
     safetySettings: body.safetySettings || DEFAULT_SAFETY_SETTINGS,
   };
+  // Gemini 3.x: an explicit thinkingLevel (from an operator payload override
+  // targeting generationConfig.thinkingConfig.thinkingLevel, or supplied
+  // directly) makes the numeric budget injected below redundant — and Google's
+  // 3.x migration guidance documents `thinkingBudget` as deprecated — so the
+  // level wins and no budget is set. Only the string level is forwarded.
+  const explicitThinkingLevel = extractExplicitThinkingLevel(body);
   const toolNameMap = new Map<string, string>();
   const sanitizeToolName = (name: string) =>
     sanitizeGeminiToolName(name, {
@@ -133,7 +218,7 @@ function openaiToGeminiBase(model, body, stream, toolNameOptions: GeminiToolName
 
   // Preserve cachedContent if provided by client (for explicit Gemini caching)
   if (body.cachedContent) {
-    result.cachedContent = body.cachedContent;
+    result.cachedContent = body.cachedContent as string;
   }
 
   // Generation config
@@ -149,21 +234,161 @@ function openaiToGeminiBase(model, body, stream, toolNameOptions: GeminiToolName
   if (body.stop !== undefined) {
     result.generationConfig.stopSequences = Array.isArray(body.stop) ? body.stop : [body.stop];
   }
-  const requestedMaxOutputTokens = body.max_tokens ?? body.max_completion_tokens;
-  if (requestedMaxOutputTokens !== undefined) {
-    result.generationConfig.maxOutputTokens = capMaxOutputTokens(model, requestedMaxOutputTokens);
+  const maxOutputTokens = capMaxOutputTokens(
+    model,
+    (body.max_tokens ?? body.max_completion_tokens) as number | undefined
+  );
+  if (maxOutputTokens !== null) {
+    result.generationConfig.maxOutputTokens = maxOutputTokens;
+  }
+
+  // Thinking / Reasoning support (Google Gemini 2.0+ Thinking models)
+  // gemma-4 models return - 400: Thinking budget is not supported for this model.
+  // Mirrors the same guard in claude-to-gemini.ts. Port of the thinkingConfig
+  // guard half of decolua/9router#2480 (the signature-replay half of that PR
+  // is out of scope and not ported here).
+  if (model.startsWith("gemma-4")) {
+    // gemma-4 models returns - 400: Thinking budget is not supported for this model
   } else {
-    result.generationConfig.maxOutputTokens = capMaxOutputTokens(model);
+    // 1. OpenAI format: reasoning_effort (none/low/medium/high/auto/max/xhigh)
+    // "auto", "max", and "xhigh" are clamped to the high-tier budget because Gemini
+    // does not accept these strings directly. "auto" signals "use max reasonable effort"
+    // which maps to high. "max"/"xhigh" exceed Gemini's accepted range and are clamped.
+    // "none" maps to budget 0 — an explicit, documented off-switch (#6813 defect 2),
+    // distinct from the no-knob-at-all default-injection case below (#4170).
+    // Port of decolua/9router#2043 by @nguyenxvotanminh3.
+    if (body.reasoning_effort) {
+      const highBudget = capThinkingBudget(model, 32768);
+      const budgetMap: Record<string, number> = {
+        none: 0,
+        low: capThinkingBudget(model, 1024),
+        medium: capThinkingBudget(model, getDefaultThinkingBudget(model) || 8192),
+        high: highBudget,
+        auto: highBudget,
+        max: highBudget,
+        xhigh: highBudget,
+      };
+      const budget =
+        budgetMap[body.reasoning_effort as string] ??
+        capThinkingBudget(model, getDefaultThinkingBudget(model) ?? 8192);
+      // Always send thinkingConfig on this path — including for models with
+      // thinkingBudgetCap:0 (e.g. gemini-3-flash), where the cap collapses the
+      // requested budget down to 0. Omitting thinkingConfig entirely here regressed
+      // the pre-#6943 native-defaults contract (thinkingBudget 0 / includeThoughts
+      // false must still be present) and crashed callers that read
+      // .thinkingConfig.thinkingBudget unconditionally.
+      // Gemini 3.x exception: an explicit thinkingLevel makes the numeric budget
+      // redundant (the deprecated field is dropped when the level is forwarded), so
+      // only include thinkingBudget when no explicit level was supplied.
+      result.generationConfig.thinkingConfig = explicitThinkingLevel
+        ? { includeThoughts: budget !== 0 }
+        : { thinkingBudget: budget, includeThoughts: budget !== 0 };
+    }
+    // 2. Claude format: thinking (type: enabled, budget_tokens)
+    // Use an explicit numeric check (not truthy) so an explicit `budget_tokens: 0` — the
+    // natural way to disable thinking — is honored as thinkingBudget 0 instead of being
+    // dropped and falling through to the default injection below (#6813). A zero budget
+    // yields no thoughts, so includeThoughts is only set for a non-zero budget.
+    const thinking = body.thinking as { type?: string; budget_tokens?: number } | undefined;
+    if (thinking?.type === "enabled" && typeof thinking.budget_tokens === "number") {
+      // typeof check ensures only numeric budget_tokens triggers thinking path;
+      // non-numeric values (e.g. string "auto") fall through to the effort-based path.
+      const cappedBudget = capThinkingBudget(model, thinking.budget_tokens);
+      // Only send thinkingConfig if the model supports thinking via budget.
+      // Models with thinkingBudgetCap:0 (e.g. gemini-3-flash) reject
+      // thinkingConfig even when capped to 0. The supportsThinking flag
+      // tracks thinkingLevel support, not thinkingBudget; use thinkingBudgetCap
+      // as the reliable indicator (gemini-2.5-flash has supportsThinking:false
+      // but thinkingBudgetCap:24576, meaning it supports thinking via budget).
+      // Models not in MODEL_SPECS (thinkingBudgetCap=undefined) default to allowed.
+      if (cappedBudget > 0 || getModelSpec(model)?.thinkingBudgetCap !== 0) {
+        result.generationConfig.thinkingConfig = explicitThinkingLevel
+          ? { includeThoughts: cappedBudget !== 0 }
+          : { thinkingBudget: cappedBudget, includeThoughts: cappedBudget !== 0 };
+      }
+    }
+  }
+
+  // 3. Default: all modern Gemini models (2.5+) have thinking capability.
+  // If the client didn't explicitly request thinking (via reasoning_effort or
+  // thinking.type), still set includeThoughts so the upstream marks thought
+  // parts with thought:true. Without this, the model's reasoning leaks into
+  // visible content instead of being routed to reasoning_content by the
+  // response translator. (#4170) — this default-injection case is intentionally
+  // unconditional (no-knob-at-all still gets includeThoughts:true); the explicit
+  // "reasoning_effort: none" off-switch above (#6813) is the supported opt-out.
+  // Gemini 3.x: with an explicit thinkingLevel, only includeThoughts is injected —
+  // the deprecated numeric budget is omitted entirely.
+  if (!result.generationConfig.thinkingConfig) {
+    const modelLower = model.toLowerCase();
+    if (
+      modelLower.includes("gemini") &&
+      !modelLower.includes("gemini-1") &&
+      (!modelLower.includes("gemini-2.0") || modelLower.includes("thinking")) &&
+      // Skip thinkingConfig for models that don't support thinking via budget.
+      // Models with thinkingBudgetCap:0 (e.g. gemini-3-flash) reject
+      // thinkingConfig. Use thinkingBudgetCap (not supportsThinking) as the
+      // reliable indicator; gemini-2.5-flash has supportsThinking:false but
+      // thinkingBudgetCap:24576, meaning it supports thinking via budget.
+      // Models not in MODEL_SPECS (thinkingBudgetCap=undefined) default to allowed.
+      getModelSpec(model)?.thinkingBudgetCap !== 0
+    ) {
+      let defaultBudget = getDefaultThinkingBudget(model) || capThinkingBudget(model, 24576);
+      // Gemini counts thinking tokens against maxOutputTokens. This budget was not
+      // requested by the client, so it must not be allowed to swallow the whole output
+      // cap: with max_tokens 50 and an injected budget of 24576 the model can spend
+      // every token thinking and return an empty `content`. Keep at most half of the
+      // cap for thoughts. Explicit client budgets (paths 1 and 2) are left untouched.
+      // Google documents a minimum budget for some tiers (2.5 Pro 128, 2.5 Flash-Lite
+      // 512) and a value under it may be rejected, so never shrink below that minimum.
+      const outputCap = result.generationConfig.maxOutputTokens;
+      if (typeof outputCap === "number" && outputCap > 0 && defaultBudget >= outputCap) {
+        const tierMinimum = modelLower.includes("flash-lite")
+          ? 512
+          : modelLower.includes("pro")
+            ? 128
+            : 0;
+        defaultBudget = Math.min(defaultBudget, Math.max(Math.floor(outputCap / 2), tierMinimum));
+      }
+      result.generationConfig.thinkingConfig = explicitThinkingLevel
+        ? { includeThoughts: true }
+        : { thinkingBudget: defaultBudget, includeThoughts: true };
+    }
+  }
+
+  // 4. Forward an explicitly-supplied Gemini 3.x thinkingLevel into the request.
+  // extractExplicitThinkingLevel (above) already resolved every supported supply
+  // surface: camelCase and snake_case spellings, at both the top level and nested
+  // under generationConfig.thinkingConfig (the operator payload-override surface).
+  // The deprecated numeric thinkingBudget is never emitted alongside the level.
+  if (explicitThinkingLevel && !result.generationConfig.thinkingConfig?.thinkingLevel) {
+    result.generationConfig.thinkingConfig = {
+      ...result.generationConfig.thinkingConfig,
+      thinkingLevel: explicitThinkingLevel,
+    };
   }
 
   // Build tool_call_id -> name map
-  const tcID2Name = {};
-  if (body.messages && Array.isArray(body.messages)) {
-    for (const msg of body.messages) {
-      if (msg.role === "assistant" && msg.tool_calls) {
-        for (const tc of msg.tool_calls) {
-          if (tc.type === "function" && tc.id && tc.function?.name) {
-            tcID2Name[tc.id] = tc.function.name;
+  const tcID2Name: Record<string, string> = {};
+  // #7752: strip any non-trailing tool_call whose id has no matching tool_result
+  // anywhere in history — same guard `BaseExecutor.execute()` applies for the mainline
+  // Claude path (#2382/#4714) and `antigravityToOpenAIRequest` applies for the mirror
+  // incoming direction (#6026). Without this, an orphaned tool_call (e.g. left behind by
+  // OpenCode's known abort/cancel bug) reaches Google's Cloud Code envelope as an unpaired
+  // functionCall, which Vertex's Claude backend rejects with HTTP 400.
+  const rawMessages = body.messages as Array<Record<string, unknown>> | undefined;
+  const messages =
+    rawMessages && Array.isArray(rawMessages)
+      ? (fixToolPairs(rawMessages) as Array<Record<string, unknown>>)
+      : rawMessages;
+  if (messages && Array.isArray(messages)) {
+    for (const msg of messages) {
+      const toolCalls = msg.tool_calls as Array<Record<string, unknown>> | undefined;
+      if (msg.role === "assistant" && toolCalls) {
+        for (const tc of toolCalls) {
+          const fn = tc.function as { name?: string } | undefined;
+          if (tc.type === "function" && tc.id && fn?.name) {
+            tcID2Name[tc.id as string] = fn.name;
           }
         }
       }
@@ -171,23 +396,23 @@ function openaiToGeminiBase(model, body, stream, toolNameOptions: GeminiToolName
   }
 
   // Build tool responses cache
-  const toolResponses = {};
-  if (body.messages && Array.isArray(body.messages)) {
-    for (const msg of body.messages) {
+  const toolResponses: Record<string, unknown> = {};
+  if (messages && Array.isArray(messages)) {
+    for (const msg of messages) {
       if (msg.role === "tool" && msg.tool_call_id) {
-        toolResponses[msg.tool_call_id] = msg.content;
+        toolResponses[msg.tool_call_id as string] = msg.content;
       }
     }
   }
 
   // Convert messages
-  if (body.messages && Array.isArray(body.messages)) {
-    for (let i = 0; i < body.messages.length; i++) {
-      const msg = body.messages[i];
+  if (messages && Array.isArray(messages)) {
+    for (let msgIndex = 0; msgIndex < messages.length; msgIndex++) {
+      const msg = messages[msgIndex];
       const role = msg.role;
       const content = msg.content;
 
-      if (role === "system" && body.messages.length > 1) {
+      if (role === "system" && messages.length > 1) {
         const systemText = typeof content === "string" ? content : extractTextContent(content);
         if (systemText) {
           if (!result.systemInstruction) {
@@ -199,13 +424,13 @@ function openaiToGeminiBase(model, body, stream, toolNameOptions: GeminiToolName
             result.systemInstruction.parts.push({ text: systemText });
           }
         }
-      } else if (role === "user" || (role === "system" && body.messages.length === 1)) {
+      } else if (role === "user" || (role === "system" && messages.length === 1)) {
         const parts = convertOpenAIContentToParts(content);
         if (parts.length > 0) {
           result.contents.push({ role: "user", parts });
         }
       } else if (role === "assistant") {
-        const parts = [];
+        const parts: GeminiPart[] = [];
 
         // Thinking/reasoning → thought part with signature
         if (msg.reasoning_content) {
@@ -222,56 +447,152 @@ function openaiToGeminiBase(model, body, stream, toolNameOptions: GeminiToolName
           }
         }
 
-        if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
-          const toolCallIds = [];
-          const firstPersistedSignature = msg.tool_calls
-            .map((tc) => resolveGeminiThoughtSignature(tc.id, extractClientThoughtSignature(tc)))
-            .find((signature) => typeof signature === "string" && signature.length > 0);
-
-          let shouldUseEmbeddedSignature = !parts.some((p) => p.thoughtSignature);
-
-          for (const tc of msg.tool_calls) {
-            if (tc.type !== "function") continue;
-
-            const args = tryParseJSON(tc.function?.arguments || "{}");
-            const signatureForToolCall = resolveGeminiThoughtSignature(
-              tc.id,
+        const toolCalls = msg.tool_calls as Array<Record<string, unknown>> | undefined;
+        if (toolCalls && Array.isArray(toolCalls)) {
+          const toolCallIds: string[] = [];
+          const resolvedSignatures = new Map<string, string>();
+          for (const tc of toolCalls) {
+            const id = tc.id as string;
+            const resolved = resolveGeminiThoughtSignature(
+              buildGeminiThoughtSignatureKey(toolNameOptions.signatureNamespace, id),
               extractClientThoughtSignature(tc)
             );
-            const embeddedThoughtSignature = shouldUseEmbeddedSignature
-              ? firstPersistedSignature || signatureForToolCall
-              : undefined;
+            if (typeof resolved === "string" && resolved.length > 0) {
+              resolvedSignatures.set(id, resolved);
+            }
+          }
 
-            if (embeddedThoughtSignature) {
-              shouldUseEmbeddedSignature = false;
+          const signaturelessToolCallMode = toolNameOptions.signaturelessToolCallMode;
+          const stringifySignaturelessToolCalls = signaturelessToolCallMode === "text";
+          const contextualizeSignaturelessToolResponses =
+            signaturelessToolCallMode === "text" || signaturelessToolCallMode === "context";
+
+          for (const tc of toolCalls) {
+            if (tc.type !== "function") continue;
+
+            const id = tc.id as string;
+            const fn = tc.function as { name: string; arguments?: string } | undefined;
+            if (!fn) continue;
+
+            const signatureForToolCall = resolvedSignatures.get(id);
+
+            // Non-bypass paths (standard Gemini direct, mode "text"/"context")
+            // cannot send a thoughtSignature and reject signature-less native tool
+            // parts, so historical signature-less tool calls are represented as
+            // inert text/context (#3358). The Antigravity/CLI bypass path
+            // (supportsSignatureBypass) instead emits native parts carrying the
+            // skip_thought_signature_validator sentinel below.
+            if (!toolNameOptions.supportsSignatureBypass) {
+              if (!signatureForToolCall && contextualizeSignaturelessToolResponses) {
+                if (!toolCallIds.includes(id)) toolCallIds.push(id);
+              }
+              if (!signatureForToolCall && stringifySignaturelessToolCalls) {
+                parts.push({
+                  text: buildInertHistoricalToolCallText(fn.name, fn.arguments || "{}"),
+                });
+                continue;
+              }
+              if (!signatureForToolCall && signaturelessToolCallMode === "context") {
+                continue;
+              }
             }
 
+            const args = tryParseJSON(fn.arguments || "{}");
+            // #11510: each functionCall part carries its OWN resolved
+            // thoughtSignature — a parallel (multi tool_calls) turn can have a
+            // real, individually-valid signature per tool call, and Gemini 3.x
+            // rejects the request if any functionCall in the turn is missing
+            // one. Previously only the first functionCall of the message kept
+            // its signature; this dropped valid signatures for every
+            // subsequent parallel tool call in the same turn.
+            const embeddedThoughtSignature = signatureForToolCall;
+
             // Gemini expects the signature on the functionCall part itself.
+            // If we are in a mode where missing signatures cause 400s (and we couldn't find one),
+            // safely default to the bypass string to protect against 400s. The bypass sentinel is
+            // an audit-trail risk (a magic validator-bypass string upstream could log/flag), so
+            // operators can disable it via ANTIGRAVITY_ALLOW_SIGNATURE_BYPASS=0 — real signatures
+            // are always preferred; the sentinel only fills the gap when none is available.
+            const signatureBypassEnabled =
+              toolNameOptions.supportsSignatureBypass &&
+              signaturelessToolCallMode !== "text" &&
+              process.env.ANTIGRAVITY_ALLOW_SIGNATURE_BYPASS !== "0";
+            const finalSignature =
+              embeddedThoughtSignature ||
+              (signatureBypassEnabled ? "skip_thought_signature_validator" : undefined);
             parts.push({
-              ...(embeddedThoughtSignature ? { thoughtSignature: embeddedThoughtSignature } : {}),
+              ...(finalSignature ? { thoughtSignature: finalSignature } : {}),
               functionCall: {
-                id: tc.id,
-                name: sanitizeToolName(tc.function.name),
+                ...(toolNameOptions.stripFunctionCallId ? {} : { id: id }),
+                name: sanitizeToolName(fn.name),
                 args: args,
               },
             });
 
-            toolCallIds.push(tc.id);
+            // Bypass path always emits the native response; non-bypass keeps the
+            // contextualize-aware bookkeeping (signature-less ids handled as text).
+            if (
+              toolNameOptions.supportsSignatureBypass ||
+              !contextualizeSignaturelessToolResponses ||
+              signatureForToolCall
+            ) {
+              toolCallIds.push(id);
+            }
           }
 
           if (parts.length > 0) {
             result.contents.push({ role: "model", parts });
           }
 
+          // Collect turn-specific tool responses: in standard OpenAI chat format, tool responses
+          // immediately follow the assistant message that requested them.
+          const turnToolResponses: Record<string, unknown> = {};
+          for (let j = msgIndex + 1; j < messages.length; j++) {
+            const later = messages[j];
+            if (later.role === "assistant" || later.role === "user") break;
+            if (later.role === "tool" && later.tool_call_id) {
+              turnToolResponses[later.tool_call_id as string] = later.content;
+            }
+          }
+
+          // Build a turn-specific map of tool call IDs to function names from this assistant message's toolCalls.
+          // This prevents cross-turn ID collisions where an identical tool_call_id reused in a later turn
+          // would otherwise overwrite the function name and content of an earlier turn (#e59118).
+          const turnTcID2Name: Record<string, string> = {};
+          for (const tc of toolCalls) {
+            const fn = tc.function as { name?: string } | undefined;
+            if (tc.type === "function" && tc.id && fn?.name) {
+              turnTcID2Name[tc.id as string] = fn.name;
+            }
+          }
+
+          const resolveToolResponse = (id: string): unknown =>
+            turnToolResponses[id] !== undefined ? turnToolResponses[id] : toolResponses[id];
+          const hasToolResponse = (id: string): boolean => resolveToolResponse(id) !== undefined;
+
           // Check if there are actual tool responses in the next messages
-          const hasActualResponses = toolCallIds.some((fid) => toolResponses[fid]);
+          const hasSignaturelessTextResponses =
+            contextualizeSignaturelessToolResponses &&
+            toolCalls.some((tc) => {
+              const id = tc.id as string;
+              return tc.type === "function" && !resolvedSignatures.has(id) && hasToolResponse(id);
+            });
+          const hasActualResponses =
+            toolCallIds.some((fid) => hasToolResponse(fid)) || hasSignaturelessTextResponses;
 
           if (hasActualResponses) {
-            const toolParts = [];
+            const toolParts: GeminiPart[] = [];
             for (const fid of toolCallIds) {
-              if (!toolResponses[fid]) continue;
+              const resp = resolveToolResponse(fid);
+              if (resp === undefined) continue;
+              if (
+                !toolNameOptions.supportsSignatureBypass &&
+                contextualizeSignaturelessToolResponses &&
+                !resolvedSignatures.has(fid)
+              )
+                continue;
 
-              let name = tcID2Name[fid];
+              let name = turnTcID2Name[fid] || tcID2Name[fid];
               if (!name) {
                 const idParts = fid.split("-");
                 if (idParts.length > 2) {
@@ -282,22 +603,42 @@ function openaiToGeminiBase(model, body, stream, toolNameOptions: GeminiToolName
               }
               name = sanitizeToolName(name);
 
-              let resp = toolResponses[fid];
-              let parsedResp = tryParseJSON(resp);
-              if (parsedResp === null) {
-                parsedResp = { result: resp };
-              } else if (typeof parsedResp !== "object") {
-                parsedResp = { result: parsedResp };
-              }
-
               toolParts.push({
                 functionResponse: {
-                  id: fid,
+                  ...(toolNameOptions.stripFunctionCallId ? {} : { id: fid }),
                   name: name,
-                  response: { result: parsedResp },
+                  response: { result: resp },
                 },
               });
             }
+
+            if (
+              !toolNameOptions.supportsSignatureBypass &&
+              contextualizeSignaturelessToolResponses
+            ) {
+              // Signature-less historical tool responses are represented as text
+              // so strict standard-Gemini endpoints don't reject them as native
+              // functionResponse parts missing a matching thoughtSignature.
+              // In context mode the matching historical functionCall is omitted,
+              // avoiding pseudo tool-call records that Gemini Flash can repeat as
+              // the visible final answer.
+              for (const tc of toolCalls) {
+                const id = tc.id as string;
+                if (tc.type !== "function" || !id) continue;
+                const resp = resolveToolResponse(id);
+                if (!resolvedSignatures.has(id) && resp !== undefined) {
+                  const fn = tc.function as { name?: string } | undefined;
+                  const name = turnTcID2Name[id] || tcID2Name[id] || fn?.name || "unknown";
+                  toolParts.push({
+                    text:
+                      signaturelessToolCallMode === "text"
+                        ? buildInertHistoricalToolResponseText(name, resp)
+                        : buildHistoricalToolResultContext(name, resp),
+                  });
+                }
+              }
+            }
+
             if (toolParts.length > 0) {
               result.contents.push({ role: "user", parts: toolParts });
             }
@@ -309,27 +650,61 @@ function openaiToGeminiBase(model, body, stream, toolNameOptions: GeminiToolName
     }
   }
 
+  // Collapse any consecutive same-role contents Gemini would reject (9router#2191).
+  result.contents = mergeConsecutiveSameRoleContents(result.contents ?? []);
+  // Guard the one alternation violation the merge above cannot reach: history
+  // that opens with a functionCall-bearing turn instead of a user turn.
+  result.contents = ensureHistoryDoesNotOpenWithFunctionCall(result.contents);
+
   // Convert tools
-  const geminiTools = buildGeminiTools(body.tools, {
+  const bodyTools = body.tools as Array<Record<string, unknown>> | undefined;
+  const geminiTools = buildGeminiTools(bodyTools, {
     ...toolNameOptions,
     toolNameMap,
   });
-  if (geminiTools) {
+
+  // Support for Google Search grounding if requested via 'google_search' tool
+  const hasGoogleSearch = bodyTools?.some((t) => {
+    const fn = t.function as { name?: string } | undefined;
+    return t.type === "function" && (fn?.name === "google_search" || fn?.name === "googleSearch");
+  });
+
+  type ToolEntry = NonNullable<GeminiRequest["tools"]>[number];
+
+  if (geminiTools && geminiTools.length > 0) {
     result.tools = geminiTools;
+    if (hasGoogleSearch) {
+      result.tools.push({ googleSearch: {} });
+    }
+    result.toolConfig = {
+      functionCallingConfig: convertOpenAIToolChoiceToGemini(body.tool_choice),
+    };
+  } else if (hasGoogleSearch) {
+    result.tools = [{ googleSearch: {} }];
   }
 
   // Convert response_format to Gemini's responseMimeType/responseSchema
-  if (body.response_format) {
-    if (body.response_format.type === "json_schema" && body.response_format.json_schema) {
+  const responseFormat = body.response_format as
+    | {
+        type?: string;
+        json_schema?: { schema?: unknown; [key: string]: unknown };
+      }
+    | undefined;
+  if (responseFormat) {
+    if (responseFormat.type === "json_schema" && responseFormat.json_schema) {
       result.generationConfig.responseMimeType = "application/json";
       // Extract the schema (may be nested under .schema key)
-      const schema = body.response_format.json_schema.schema || body.response_format.json_schema;
+      const schema = responseFormat.json_schema.schema || responseFormat.json_schema;
       if (schema && typeof schema === "object") {
-        result.generationConfig.responseSchema = cleanJSONSchemaForAntigravity(schema);
+        // #12308: response schemas opt in to nullability preservation; tool
+        // parameters (geminiToolsSanitizer) keep the default flattening.
+        result.generationConfig.responseSchema = cleanJSONSchemaForAntigravity(schema, {
+          preserveNullable: true,
+        });
       }
-    } else if (body.response_format.type === "json_object") {
+    } else if (responseFormat.type === "json_object") {
       result.generationConfig.responseMimeType = "application/json";
-    } else if (body.response_format.type === "text") {
+    } else if (responseFormat.type === "text") {
       result.generationConfig.responseMimeType = "text/plain";
     }
   }
@@ -339,53 +714,76 @@ function openaiToGeminiBase(model, body, stream, toolNameOptions: GeminiToolName
     result._toolNameMap = changedToolNameMap;
   }
 
+  deepCleanUndefined(result);
+
   return result;
 }
 
 // OpenAI -> Gemini (standard API)
-export function openaiToGeminiRequest(model, body, stream) {
-  return openaiToGeminiBase(model, body, stream);
+export function openaiToGeminiRequest(
+  model: string,
+  body: Record<string, unknown>,
+  stream: boolean,
+  credentials: Record<string, unknown> | null = null,
+  options: {
+    signaturelessToolCallMode?: "native" | "text" | "context";
+  } = {}
+) {
+  // Thread the signature namespace so a thinking model's thoughtSignature (cached on the
+  // response turn under `<connectionId>:<toolCallId>`) is found and re-attached to the
+  // functionCall on the follow-up request. Without this the streaming lookup key didn't
+  // match and Gemini rejected tool calls with 400 "missing thought_signature" (#2504).
+  const signatureNamespace =
+    credentials && typeof credentials["_signatureNamespace"] === "string"
+      ? credentials["_signatureNamespace"]
+      : null;
+  return openaiToGeminiBase(model, body, stream, {
+    signatureNamespace,
+    signaturelessToolCallMode: options.signaturelessToolCallMode,
+    stripFunctionCallId: isVertexGeminiProvider(credentials?._provider),
+  });
 }
 
-// OpenAI -> Gemini CLI (Cloud Code Assist)
-export function openaiToGeminiCLIRequest(model, body, stream) {
-  const gemini = openaiToGeminiBase(model, body, stream, { stripNamespace: true });
+// OpenAI -> Cloud Code Gemini payload used by Antigravity.
+export function openaiToCloudCodeGeminiRequest(
+  model: string,
+  body: Record<string, unknown>,
+  stream: boolean,
+  options: {
+    signatureNamespace?: string | null;
+    signaturelessToolCallMode?: "native" | "text" | "context";
+  } = {}
+) {
+  const request = openaiToGeminiBase(model, body, stream, {
+    stripNamespace: true,
+    signatureNamespace: options.signatureNamespace,
+    signaturelessToolCallMode: options.signaturelessToolCallMode,
+    supportsSignatureBypass: true,
+  });
 
-  // Add thinking config for CLI
-  if (body.reasoning_effort) {
-    const budgetMap = {
-      low: 1024,
-      medium: getDefaultThinkingBudget(model) || 8192,
-      high: capThinkingBudget(model, 32768),
-    };
-    const budget = budgetMap[body.reasoning_effort] || getDefaultThinkingBudget(model) || 8192;
-    gemini.generationConfig.thinkingConfig = {
-      thinkingBudget: budget,
-      includeThoughts: true,
-    };
+  // Standard Gemini requests retain the historical all-OFF defaults, but Cloud Code
+  // must receive safety policy only when the caller explicitly supplied it.
+  if (!Object.prototype.hasOwnProperty.call(body, "safetySettings")) {
+    delete request.safetySettings;
   }
 
-  // Thinking config from Claude format
-  if (body.thinking?.type === "enabled" && body.thinking.budget_tokens) {
-    gemini.generationConfig.thinkingConfig = {
-      thinkingBudget: body.thinking.budget_tokens,
-      includeThoughts: true,
-    };
-  }
-
-  return gemini;
+  return request;
 }
 
-// Wrap Gemini CLI format in Cloud Code wrapper
-function wrapInCloudCodeEnvelope(model, geminiCLI, credentials = null, isAntigravity = false) {
-  // Both Antigravity and Gemini CLI need the project field for the Cloud Code API.
-  // For Gemini CLI, the stored projectId may be stale; the executor's transformRequest
-  // refreshes it via loadCodeAssist before the request is sent to the API.
-  let projectId = credentials?.projectId;
+function wrapInCloudCodeEnvelope(model, cloudCodeRequest, credentials = null) {
+  // Fall back to providerSpecificData.projectId — some connections (and post-refresh
+  // credentials) store it there rather than at the top level, which otherwise produced a
+  // spurious 422 "Missing Google projectId" on the Antigravity /v1beta path (#2480).
+  const providerSpecificProjectId = (
+    credentials?.providerSpecificData as { projectId?: unknown } | undefined
+  )?.projectId;
+  let projectId =
+    credentials?.projectId ||
+    (typeof providerSpecificProjectId === "string" ? providerSpecificProjectId : "");
 
   if (!projectId) {
     console.warn(
-      `[OmniRoute] ${isAntigravity ? "Antigravity" : "GeminiCLI"} account is missing projectId. ` +
+      `[OmniRoute] Antigravity account is missing projectId. ` +
         `Attempting request with empty project — reconnect OAuth to resolve.`
     );
     projectId = "";
@@ -395,42 +793,75 @@ function wrapInCloudCodeEnvelope(model, geminiCLI, credentials = null, isAntigra
 
   const envelope: CloudCodeEnvelope = {
     project: projectId,
-    model: cleanModel,
-    userAgent: isAntigravity ? "antigravity" : "gemini-cli",
-    requestId: isAntigravity ? `agent-${generateUUID()}` : generateRequestId(),
+    requestId: generateAntigravityRequestId(),
     request: {
-      sessionId: generateSessionId(),
-      contents: geminiCLI.contents,
-      systemInstruction: geminiCLI.systemInstruction,
-      generationConfig: geminiCLI.generationConfig,
-      tools: geminiCLI.tools,
+      sessionId: getAntigravitySessionId(credentials),
+      contents: cloudCodeRequest.contents,
+      systemInstruction: cloudCodeRequest.systemInstruction,
+      generationConfig: applyAntigravityGenerationDefaults(cloudCodeRequest.generationConfig),
+      tools: cloudCodeRequest.tools,
+      safetySettings: cloudCodeRequest.safetySettings,
     },
+    model: cleanModel,
+    userAgent: getAntigravityEnvelopeUserAgent(credentials),
+    requestType: "agent",
   };
-  if (geminiCLI._toolNameMap instanceof Map && geminiCLI._toolNameMap.size > 0) {
-    envelope._toolNameMap = geminiCLI._toolNameMap;
+  if (cloudCodeRequest._toolNameMap instanceof Map && cloudCodeRequest._toolNameMap.size > 0) {
+    envelope._toolNameMap = cloudCodeRequest._toolNameMap;
   }
 
-  // Antigravity specific fields
-  if (isAntigravity) {
-    envelope.requestType = "agent";
+  // #9030 — Client system content must NOT be combined with default in systemInstruction
+  //
+  // The upstream Antigravity / Cloud Code endpoint rejects oversized systemInstruction
+  // with 429 RESOURCE_EXHAUSTED. Keep only the lightweight ANTIGRAVITY_DEFAULT_SYSTEM
+  // in systemInstruction and relocate any client system content (which can be very
+  // large — Hermes ~125k tokens) to the first user message.
+  const defaultPart: GeminiPart = { text: ANTIGRAVITY_DEFAULT_SYSTEM };
+  const clientParts = envelope.request.systemInstruction?.parts?.slice() ?? [];
+  envelope.request.systemInstruction = { role: "system", parts: [defaultPart] };
 
-    // Inject required default system prompt for Antigravity
-    const defaultPart: GeminiPart = { text: ANTIGRAVITY_DEFAULT_SYSTEM };
-    if (envelope.request.systemInstruction?.parts) {
-      envelope.request.systemInstruction.parts.unshift(defaultPart);
+  if (clientParts.length > 0) {
+    // Prepend client system parts to the first user message so they still guide
+    // the model's behavior early in the conversation.
+    if (envelope.request.contents && envelope.request.contents.length > 0) {
+      envelope.request.contents[0].parts.unshift(...clientParts);
     } else {
-      envelope.request.systemInstruction = { role: "system", parts: [defaultPart] };
+      envelope.request.contents = [{ role: "user", parts: [...clientParts] }];
     }
+  }
 
-    // Add toolConfig for Antigravity
-    if (geminiCLI.tools?.some((tool) => Array.isArray(tool.functionDeclarations))) {
-      envelope.request.toolConfig = {
-        functionCallingConfig: { mode: "VALIDATED" },
-      };
-    }
-  } else {
-    // Keep safetySettings for Gemini CLI
-    envelope.request.safetySettings = geminiCLI.safetySettings;
+  // Strip Gemini built-in tool *names* out of functionDeclarations: Antigravity's
+  // v1internal endpoint returns 400 when a built-in tool (google_search etc.) is
+  // mixed with functionDeclarations in the same request. Native grounding entries
+  // (e.g. `{ googleSearch: {} }`) are left intact; only the functionDeclarations
+  // arrays are cleaned, and a declarations entry that becomes empty is dropped.
+  if (envelope.request.tools && envelope.request.tools.length > 0) {
+    const cleanedTools = envelope.request.tools
+      .map((tool) => {
+        if (!Array.isArray(tool.functionDeclarations)) {
+          return tool;
+        }
+        const customDecls = tool.functionDeclarations.filter(
+          (fn) => !GEMINI_BUILTIN_TOOL_NAMES.has(fn.name)
+        );
+        return { ...tool, functionDeclarations: customDecls };
+      })
+      .filter(
+        (tool) => !Array.isArray(tool.functionDeclarations) || tool.functionDeclarations.length > 0
+      );
+    envelope.request.tools = cleanedTools.length > 0 ? cleanedTools : undefined;
+  }
+
+  const hasCustomTools = envelope.request.tools?.some(
+    (tool) => (tool.functionDeclarations?.length ?? 0) > 0
+  );
+  if (hasCustomTools) {
+    // Reuse the toolConfig openaiToGeminiBase already computed from the caller's
+    // tool_choice (cloudCodeRequest is that function's return value) instead of
+    // re-deriving a hardcoded default here — see convertOpenAIToolChoiceToGemini.
+    envelope.request.toolConfig = cloudCodeRequest.toolConfig ?? {
+      functionCallingConfig: { mode: "VALIDATED" },
+    };
   }
 
   return envelope;
@@ -444,168 +875,74 @@ function getAntigravityClaudeOutputTokens(body: Record<string, unknown>): number
   return ANTIGRAVITY_CLAUDE_MAX_OUTPUT_TOKENS;
 }
 
-function wrapInCloudCodeEnvelopeForClaude(
-  model,
-  claudeRequest,
-  credentials = null,
-  sourceBody = {}
-) {
-  const toolNameMap = new Map<string, string>();
-  const sanitizeToolName = (name: string) =>
-    sanitizeGeminiToolName(name, {
-      stripNamespace: true,
-      toolNameMap,
-    });
-  let projectId = credentials?.projectId;
+// OpenAI -> Antigravity (Sandbox Cloud Code with wrapper)
+export function openaiToAntigravityRequest(model, body, stream, credentials = null) {
+  const isClaude = model.toLowerCase().includes("claude");
+  // All modern Gemini models (2.5+, 3.x, pro-agent, etc.) use thinking by default
+  // and require thought_signature for multi-turn tool calls.
+  // Safe default: all non-Claude models via Antigravity are thinking Gemini.
+  const modelLower = model.toLowerCase();
+  const isThinkingGemini =
+    !isClaude &&
+    (modelLower.includes("thinking") ||
+      modelLower.includes("gemini-3") ||
+      modelLower.includes("gemini-2.5") ||
+      modelLower.includes("gemini-pro"));
+  const signatureNamespace =
+    credentials &&
+    typeof credentials === "object" &&
+    typeof (credentials as Record<string, unknown>)._signatureNamespace === "string"
+      ? ((credentials as Record<string, unknown>)._signatureNamespace as string)
+      : null;
+  const cloudCodeRequest = openaiToCloudCodeGeminiRequest(model, body, stream, {
+    signatureNamespace,
+    signaturelessToolCallMode: isThinkingGemini ? "context" : "native",
+  });
 
-  if (!projectId) {
-    console.warn(
-      `[OmniRoute] Antigravity/Claude account is missing projectId. ` +
-        `Attempting request with empty project — reconnect OAuth to resolve.`
-    );
-    projectId = "";
+  if (isClaude) {
+    cloudCodeRequest.generationConfig.maxOutputTokens = getAntigravityClaudeOutputTokens(body);
   }
 
-  const cleanModel = model.includes("/") ? model.split("/").pop()! : model;
+  const envelope = wrapInCloudCodeEnvelope(model, cloudCodeRequest, credentials);
 
-  const generationConfig: GeminiGenerationConfig = {
-    temperature: claudeRequest.temperature || 1,
-    maxOutputTokens: getAntigravityClaudeOutputTokens(sourceBody),
-  };
-
-  const envelope: CloudCodeEnvelope = {
-    project: projectId,
-    model: cleanModel,
-    userAgent: "antigravity",
-    requestId: `agent-${generateUUID()}`,
-    requestType: "agent",
-    request: {
-      sessionId: generateSessionId(),
-      contents: [],
-      generationConfig,
-    },
-  };
-
-  const toolUseNames: Record<string, string> = {};
-  if (claudeRequest.messages && Array.isArray(claudeRequest.messages)) {
-    for (const msg of claudeRequest.messages) {
-      if (!Array.isArray(msg.content)) continue;
-      for (const block of msg.content) {
-        if (block.type === "tool_use" && block.id && typeof block.name === "string") {
-          toolUseNames[block.id] = sanitizeToolName(block.name);
-        }
-      }
-    }
+  // Match real Antigravity client: don't send maxOutputTokens when the user
+  // hasn't explicitly specified max_tokens / max_completion_tokens.
+  // The Cloud Code server decides the output limit on its own.
+  // Note: read hasThinking BEFORE stripping thinkingConfig below — for Claude
+  // models the Cloud Code envelope still carries a thinkingBudget set upstream
+  // by applyAntigravityGenerationDefaults, which we must consult here so we
+  // do not accidentally drop the maxOutputTokens it bumped for us.
+  const clientRequestedMaxTokens = body.max_tokens ?? body.max_completion_tokens;
+  const hasThinking = !!envelope.request?.generationConfig?.thinkingConfig?.thinkingBudget;
+  if (
+    clientRequestedMaxTokens === undefined &&
+    !(isClaude && hasThinking) &&
+    envelope.request?.generationConfig
+  ) {
+    delete envelope.request.generationConfig.maxOutputTokens;
   }
 
-  // Convert Claude messages to Gemini contents
-  if (claudeRequest.messages && Array.isArray(claudeRequest.messages)) {
-    for (const msg of claudeRequest.messages) {
-      const parts = [];
-
-      if (Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          if (block.type === "text") {
-            parts.push({ text: block.text });
-          } else if (block.type === "image" && block.source) {
-            parts.push({
-              inlineData: {
-                mimeType: block.source.media_type,
-                data: block.source.data,
-              },
-            });
-          } else if (block.type === "tool_use") {
-            parts.push({
-              functionCall: {
-                id: block.id,
-                name: sanitizeToolName(block.name),
-                args: block.input || {},
-              },
-            });
-          } else if (block.type === "tool_result") {
-            let content = block.content;
-            if (Array.isArray(content)) {
-              content = content
-                .map((c) => (c.type === "text" ? c.text : JSON.stringify(c)))
-                .join("\n");
-            }
-            parts.push({
-              functionResponse: {
-                id: block.tool_use_id,
-                name: toolUseNames[block.tool_use_id] || "unknown",
-                response: { result: tryParseJSON(content) || content },
-              },
-            });
-          }
-        }
-      } else if (typeof msg.content === "string") {
-        parts.push({ text: msg.content });
-      }
-
-      if (parts.length > 0) {
-        envelope.request.contents.push({
-          role: msg.role === "assistant" ? "model" : "user",
-          parts,
-        });
-      }
-    }
-  }
-
-  // Convert Claude tools to Gemini functionDeclarations
-  if (claudeRequest.tools && Array.isArray(claudeRequest.tools)) {
-    const geminiTools = buildGeminiTools(claudeRequest.tools, {
-      stripNamespace: true,
-      toolNameMap,
-    });
-    if (geminiTools) {
-      envelope.request.tools = geminiTools;
-    }
-  }
-
-  // Keep Antigravity's default and caller-provided system rules as distinct parts,
-  // matching the Gemini bridge and avoiding accidental prompt concatenation.
-  const systemParts: GeminiPart[] = [{ text: ANTIGRAVITY_DEFAULT_SYSTEM }];
-
-  if (claudeRequest.system) {
-    if (Array.isArray(claudeRequest.system)) {
-      for (const block of claudeRequest.system) {
-        if (block.text) systemParts.push({ text: block.text });
-      }
-    } else if (typeof claudeRequest.system === "string") {
-      systemParts.push({ text: claudeRequest.system });
-    }
-  }
-
-  envelope.request.systemInstruction = { role: "system", parts: systemParts };
-
-  const changedToolNameMap = buildChangedToolNameMap(toolNameMap);
-  if (changedToolNameMap) {
-    envelope._toolNameMap = changedToolNameMap;
+  // Claude models on Antigravity use their own native thinking — Gemini's thinkingConfig
+  // is not understood by the Cloud Code Claude endpoint and must be stripped.
+  // applyAntigravityGenerationDefaults (inside wrapInCloudCodeEnvelope) already bumped
+  // maxOutputTokens to thinkingBudget+1 before we get here, so the budget is preserved.
+  // Must run AFTER the hasThinking-derived maxOutputTokens decision above so the
+  // budget is accounted for before the field is removed.
+  if (isClaude && envelope.request?.generationConfig) {
+    delete envelope.request.generationConfig.thinkingConfig;
   }
 
   return envelope;
 }
 
-// OpenAI -> Antigravity (Sandbox Cloud Code with wrapper)
-export function openaiToAntigravityRequest(model, body, stream, credentials = null) {
-  const isClaude = model.toLowerCase().includes("claude");
-
-  if (isClaude) {
-    const claudeRequest = openaiToClaudeRequestForAntigravity(model, body, stream);
-    return wrapInCloudCodeEnvelopeForClaude(model, claudeRequest, credentials, body);
-  }
-
-  const geminiCLI = openaiToGeminiCLIRequest(model, body, stream);
-  return wrapInCloudCodeEnvelope(model, geminiCLI, credentials, true);
-}
-
 // Register
-register(FORMATS.OPENAI, FORMATS.GEMINI, openaiToGeminiRequest, null);
 register(
   FORMATS.OPENAI,
-  FORMATS.GEMINI_CLI,
-  (model, body, stream, credentials) =>
-    wrapInCloudCodeEnvelope(model, openaiToGeminiCLIRequest(model, body, stream), credentials),
+  FORMATS.GEMINI,
+  (model, body, stream = false, credentials = null) =>
+    openaiToGeminiRequest(model, body, stream, credentials, {
+      signaturelessToolCallMode: "context",
+    }),
   null
 );
 register(FORMATS.OPENAI, FORMATS.ANTIGRAVITY, openaiToAntigravityRequest, null);

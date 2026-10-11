@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 const { handleAudioSpeech } = await import("../../open-sse/handlers/audioSpeech.ts");
+const { AUDIO_SPEECH_PROVIDERS } = await import("../../open-sse/config/audioRegistry.ts");
 
 test("handleAudioSpeech requires model", async () => {
   const response = await handleAudioSpeech({
@@ -125,6 +126,119 @@ test("handleAudioSpeech rejects invalid ElevenLabs voice identifiers", async () 
 
     assert.equal(response.status, 400);
     assert.equal(payload.error.message, "Invalid voice ID");
+    assert.equal(called, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleAudioSpeech maps OpenAI stock voice name alloy to a real ElevenLabs voice_id", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedUrl;
+
+  globalThis.fetch = async (url) => {
+    capturedUrl = String(url);
+    return new Response(new Uint8Array([1, 2, 3]), {
+      status: 200,
+      headers: { "content-type": "audio/mpeg" },
+    });
+  };
+
+  try {
+    const response = await handleAudioSpeech({
+      body: {
+        model: "elevenlabs/eleven_multilingual_v2",
+        input: "hello",
+        voice: "alloy",
+      },
+      credentials: { apiKey: "xi-key" },
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(capturedUrl, "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleAudioSpeech resolves ElevenLabs display name 'rachel' case-insensitively", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedUrl;
+
+  globalThis.fetch = async (url) => {
+    capturedUrl = String(url);
+    return new Response(new Uint8Array([1, 2, 3]), {
+      status: 200,
+      headers: { "content-type": "audio/mpeg" },
+    });
+  };
+
+  try {
+    const response = await handleAudioSpeech({
+      body: {
+        model: "elevenlabs/eleven_multilingual_v2",
+        input: "hello",
+        voice: "rachel",
+      },
+      credentials: { apiKey: "xi-key" },
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(capturedUrl, "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleAudioSpeech defaults to Rachel's voice_id when voice is omitted", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedUrl;
+
+  globalThis.fetch = async (url) => {
+    capturedUrl = String(url);
+    return new Response(new Uint8Array([1, 2, 3]), {
+      status: 200,
+      headers: { "content-type": "audio/mpeg" },
+    });
+  };
+
+  try {
+    const response = await handleAudioSpeech({
+      body: {
+        model: "elevenlabs/eleven_multilingual_v2",
+        input: "hello",
+      },
+      credentials: { apiKey: "xi-key" },
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(capturedUrl, "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleAudioSpeech returns 400 for an unresolvable ElevenLabs voice name instead of forwarding upstream", async () => {
+  const originalFetch = globalThis.fetch;
+  let called = false;
+  globalThis.fetch = async () => {
+    called = true;
+    throw new Error("should not fetch");
+  };
+
+  try {
+    const response = await handleAudioSpeech({
+      body: {
+        model: "elevenlabs/eleven_turbo_v2_5",
+        input: "unknown voice",
+        voice: "totally-not-a-voice",
+      },
+      credentials: { apiKey: "xi-key" },
+    });
+    const payload = (await response.json()) as { error: { message: string } };
+
+    assert.equal(response.status, 400);
+    assert.match(payload.error.message, /Unknown ElevenLabs voice/);
     assert.equal(called, false);
   } finally {
     globalThis.fetch = originalFetch;
@@ -419,9 +533,25 @@ test("handleAudioSpeech routes Nvidia TTS providers with default voice", async (
 });
 
 test("handleAudioSpeech validates HuggingFace model identifiers", async () => {
-  const response = await handleAudioSpeech({
+  // #15067 moved dot-segment rejection into model parsing (hasUnsafeModelIdSyntax), so
+  // "huggingface/../escape" no longer resolves to a provider at all — still a 400.
+  const traversal = await handleAudioSpeech({
     body: {
       model: "huggingface/../escape",
+      input: "bad model",
+    },
+    credentials: { apiKey: "hf-key" },
+  });
+  const traversalPayload = (await traversal.json()) as { error: { message: string } };
+
+  assert.equal(traversal.status, 400);
+  assert.match(traversalPayload.error.message, /^No speech provider found for model/);
+
+  // Ids the parser accepts but the HuggingFace path guard still refuses keep the
+  // handler-level "Invalid model ID" answer (defense in depth).
+  const response = await handleAudioSpeech({
+    body: {
+      model: "huggingface/facebook//mms-tts-eng",
       input: "bad model",
     },
     credentials: { apiKey: "hf-key" },
@@ -486,7 +616,7 @@ test("handleAudioSpeech maps Inworld requests to basic auth and wav output", asy
   try {
     const response = await handleAudioSpeech({
       body: {
-        model: "inworld/inworld-tts-1.5-max",
+        model: "inworld/inworld-tts-2",
         input: "inworld text",
         voice: "voice-9",
         response_format: "wav",
@@ -498,11 +628,65 @@ test("handleAudioSpeech maps Inworld requests to basic auth and wav output", asy
     assert.deepEqual(captured.body, {
       text: "inworld text",
       voiceId: "voice-9",
-      modelId: "inworld-tts-1.5-max",
-      audioConfig: { audioEncoding: "LINEAR16" },
+      modelId: "inworld-tts-2",
+      audioConfig: { audioEncoding: "WAV" },
     });
     assert.equal(response.headers.get("content-type"), "audio/wav");
     assert.deepEqual(Array.from(new Uint8Array(await response.arrayBuffer())), [1, 2, 3, 4]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Inworld speech registry exposes supported formats without flac", () => {
+  assert.deepEqual(AUDIO_SPEECH_PROVIDERS.inworld.supportedFormats, ["mp3", "wav", "opus", "pcm"]);
+});
+
+test("handleAudioSpeech maps Inworld opus output and rejects flac", async () => {
+  const originalFetch = globalThis.fetch;
+  let captured;
+  let callCount = 0;
+
+  globalThis.fetch = async (_url, options = {}) => {
+    callCount += 1;
+    captured = JSON.parse(String(options.body || "{}"));
+
+    return new Response(JSON.stringify({ audioContent: "BQY=", contentType: "audio/opus" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    const opusResponse = await handleAudioSpeech({
+      body: {
+        model: "inworld/inworld-tts-2",
+        input: "inworld text",
+        response_format: "opus",
+      },
+      credentials: { apiKey: "encoded-basic-token" },
+    });
+
+    assert.deepEqual(captured.audioConfig, { audioEncoding: "OPUS" });
+    assert.equal(opusResponse.headers.get("content-type"), "audio/opus");
+    assert.deepEqual(Array.from(new Uint8Array(await opusResponse.arrayBuffer())), [5, 6]);
+
+    const flacResponse = await handleAudioSpeech({
+      body: {
+        model: "inworld/inworld-tts-2",
+        input: "inworld text",
+        response_format: "flac",
+      },
+      credentials: { apiKey: "encoded-basic-token" },
+    });
+    const payload = (await flacResponse.json()) as any;
+
+    assert.equal(flacResponse.status, 400);
+    assert.equal(
+      payload.error.message,
+      "Inworld TTS supports response_format mp3, wav, opus, or pcm only"
+    );
+    assert.equal(callCount, 1);
   } finally {
     globalThis.fetch = originalFetch;
   }

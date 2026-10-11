@@ -1,8 +1,25 @@
-import { getProviderConnections, updateProviderConnection } from "@/lib/localDb";
+import crypto from "crypto";
+import { getProviderConnections, updateProviderConnection } from "@/lib/db/providers";
 import { buildConfigSyncEnvelope, toLegacyCloudSyncPayload } from "@/lib/sync/bundle";
 
 const CLOUD_URL = process.env.CLOUD_URL || process.env.NEXT_PUBLIC_CLOUD_URL;
 const CLOUD_SYNC_TIMEOUT_MS = Number(process.env.CLOUD_SYNC_TIMEOUT_MS || 12000);
+const CLOUD_SYNC_SECRET = process.env.OMNIROUTE_CLOUD_SYNC_SECRET || "";
+
+// Opt-in: only when explicitly set to "true" will updateLocalTokens overwrite
+// accessToken/refreshToken/providerSpecificData from the Cloud response. Default
+// behaviour from v3.8.6 onward syncs only non-credential metadata (expiresAt,
+// status, lastError*, rateLimitedUntil, updatedAt) so a misconfigured or
+// hostile CLOUD_URL cannot silently swap user OAuth tokens.
+const CLOUD_SYNC_SECRETS_ENABLED = process.env.OMNIROUTE_CLOUD_SYNC_SECRETS === "true";
+
+// #13679 PR A — opt-in early enforcement of the "no secret configured" branch
+// below. Bringing the v3.9 enforce-by-default switch forward as an explicit
+// opt-out-safe flag: default OFF preserves v3.8.x back-compat for peers that
+// haven't rotated in a shared secret yet (an unsigned payload still passes).
+// Set to "true" to reject even an unsigned payload when no local secret is
+// configured — the default flips to enforced in v3.9.
+const CLOUD_SYNC_ENFORCE_SIGNATURE = process.env.OMNIROUTE_CLOUD_SYNC_ENFORCE_SIGNATURE === "true";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -20,6 +37,65 @@ function toDateMs(value: unknown): number {
     return Number.isFinite(parsed) ? parsed : 0;
   }
   return 0;
+}
+
+// SECURITY-AUDITOR-NOTE: HMAC signature verification of the Cloud response.
+// Closes the silent-credential-swap surface flagged by Socket.dev (finding for
+// `app/.next/server/app/api/keys/[id]/route.js`). Two-leg defence:
+//   1. The Cloud endpoint signs each response body with
+//      `HMAC-SHA256(OMNIROUTE_CLOUD_SYNC_SECRET, rawBody)` and returns the hex
+//      digest in `X-Cloud-Sig`.
+//   2. We verify the signature with `crypto.timingSafeEqual` before parsing the
+//      JSON, so a MITM on the CLOUD_URL channel — or a misconfigured CLOUD_URL
+//      pointing at an attacker — cannot inject providers/tokens.
+// If `OMNIROUTE_CLOUD_SYNC_SECRET` is unset, a PRESENT signature is always
+// rejected (#13679 PR A — we have no key to check it against, so a signature
+// we cannot verify is treated as invalid rather than blindly trusted) and an
+// ABSENT signature falls through in legacy unverified mode by default
+// (back-compat for users on v3.8.x who haven't issued a shared secret yet;
+// opt in early via `OMNIROUTE_CLOUD_SYNC_ENFORCE_SIGNATURE=true`). The
+// enforce-by-default switch for the absent-signature case will flip in v3.9.
+export function verifyCloudSignature(rawBody: string, sigHeader: string | null): boolean {
+  if (!CLOUD_SYNC_SECRET) {
+    if (sigHeader) {
+      // We have no secret to verify against, so a signature we can't check is
+      // treated as invalid rather than passed through (#13679 PR A item (b) —
+      // closes the "forge any X-Cloud-Sig and it's accepted" fail-open case).
+      console.warn(
+        "[cloudSync] OMNIROUTE_CLOUD_SYNC_SECRET is not set but the Cloud response carries an " +
+          "X-Cloud-Sig header — rejecting an unverifiable signature. Set the secret to enable " +
+          "verification."
+      );
+      return false;
+    }
+    if (CLOUD_SYNC_ENFORCE_SIGNATURE) {
+      console.warn(
+        "[cloudSync] OMNIROUTE_CLOUD_SYNC_SECRET is not set and the Cloud response carries no " +
+          "X-Cloud-Sig, and OMNIROUTE_CLOUD_SYNC_ENFORCE_SIGNATURE=true — rejecting unsigned payload."
+      );
+      return false;
+    }
+    console.warn(
+      "[cloudSync] OMNIROUTE_CLOUD_SYNC_SECRET is not set and the Cloud response carries no X-Cloud-Sig. " +
+        "Token sync runs in legacy unverified mode — set the secret (or " +
+        "OMNIROUTE_CLOUD_SYNC_ENFORCE_SIGNATURE=true) to enforce HMAC verification. This legacy " +
+        "pass-through default will flip to enforced in v3.9."
+    );
+    return true;
+  }
+  if (!sigHeader) {
+    console.warn("[cloudSync] Cloud response missing X-Cloud-Sig — rejecting payload.");
+    return false;
+  }
+  const expected = crypto.createHmac("sha256", CLOUD_SYNC_SECRET).update(rawBody).digest("hex");
+  try {
+    const expectedBuf = Buffer.from(expected, "hex");
+    const actualBuf = Buffer.from(sigHeader, "hex");
+    if (expectedBuf.length !== actualBuf.length) return false;
+    return crypto.timingSafeEqual(expectedBuf, actualBuf);
+  } catch {
+    return false;
+  }
 }
 
 export async function fetchWithTimeout(url, options = {}, timeoutMs = CLOUD_SYNC_TIMEOUT_MS) {
@@ -66,14 +142,27 @@ export async function syncToCloud(machineId, createdKey = null) {
   if (!response.ok) {
     const errorText = await response.text();
     const truncated = errorText.length > 200 ? errorText.slice(0, 200) + "…" : errorText;
-    console.log(`Cloud sync failed (${response.status}):`, truncated);
+    console.log("Cloud sync failed", { status: response.status, body: truncated });
     return { error: "Cloud sync failed" };
   }
 
-  const result = await response.json();
+  // Read the raw body so we can verify the signature before trusting any
+  // JSON-parsed field. Order matters: parse only after verification passes.
+  const rawBody = await response.text();
+  const sigHeader = response.headers.get("X-Cloud-Sig");
+  if (!verifyCloudSignature(rawBody, sigHeader)) {
+    return { error: "Cloud sync signature verification failed" };
+  }
+
+  let result: any;
+  try {
+    result = JSON.parse(rawBody);
+  } catch {
+    return { error: "Cloud sync response is not valid JSON" };
+  }
 
   // Update local db with tokens from Cloud (providers stored by ID)
-  if (result.data && result.data.providers) {
+  if (result?.data?.providers) {
     await updateLocalTokens(result.data.providers);
   }
 
@@ -95,6 +184,13 @@ export async function syncToCloud(machineId, createdKey = null) {
  * Update local db with data from Cloud
  * Simple logic: if Cloud is newer, sync entire provider
  * cloudProviders is object keyed by provider ID
+ *
+ * SECURITY-AUDITOR-NOTE: This function appears in Socket.dev finding for
+ * `app/.next/server/app/api/keys/[id]/route.js`. From v3.8.6 onward,
+ * `accessToken` / `refreshToken` / `providerSpecificData` are only synced when
+ * `OMNIROUTE_CLOUD_SYNC_SECRETS=true`. The default mode syncs non-credential
+ * metadata only. Combined with `verifyCloudSignature()` above, this closes the
+ * silent-credential-overwrite path. See docs/security/SOCKET_DEV_FINDINGS.md §5.
  */
 async function updateLocalTokens(cloudProviders: unknown) {
   const cloudProvidersMap = asRecord(cloudProviders);
@@ -111,33 +207,37 @@ async function updateLocalTokens(cloudProviders: unknown) {
     const cloudUpdatedAt = toDateMs(cloudProvider.updatedAt);
     const localUpdatedAt = toDateMs(localProvider.updatedAt);
 
-    // Simple logic: if Cloud is newer, sync entire provider
     if (cloudUpdatedAt > localUpdatedAt) {
-      const updates = {
-        // Tokens
-        accessToken: cloudProvider.accessToken,
-        refreshToken: cloudProvider.refreshToken,
+      const updates: Record<string, unknown> = {
+        // Non-credential metadata — always synced.
         expiresAt: cloudProvider.expiresAt,
         expiresIn: cloudProvider.expiresIn,
-
-        // Provider specific data
-        providerSpecificData:
-          cloudProvider.providerSpecificData || localProvider.providerSpecificData,
-
-        // Status fields
         testStatus: cloudProvider.status || "active",
         lastError: cloudProvider.lastError,
         lastErrorAt: cloudProvider.lastErrorAt,
         errorCode: cloudProvider.errorCode,
         rateLimitedUntil: cloudProvider.rateLimitedUntil,
-
-        // Metadata
         updatedAt: cloudProvider.updatedAt,
       };
+
+      // Credentials and providerSpecificData are only overwritten when the
+      // operator has explicitly opted in to remote credential sync. Default
+      // OFF closes the silent-swap surface.
+      if (CLOUD_SYNC_SECRETS_ENABLED) {
+        updates.accessToken = cloudProvider.accessToken;
+        updates.refreshToken = cloudProvider.refreshToken;
+        updates.providerSpecificData =
+          cloudProvider.providerSpecificData || localProvider.providerSpecificData;
+      }
 
       await updateProviderConnection(localProviderId, updates);
     }
   }
 }
 
-export { CLOUD_URL, CLOUD_SYNC_TIMEOUT_MS };
+export {
+  CLOUD_URL,
+  CLOUD_SYNC_TIMEOUT_MS,
+  CLOUD_SYNC_SECRETS_ENABLED,
+  CLOUD_SYNC_ENFORCE_SIGNATURE,
+};

@@ -19,6 +19,8 @@
  * All features are opt-in per combo and backward compatible with existing setups.
  */
 
+import { isFingerprintProvider } from "./combo/fingerprintExpansion.ts";
+
 interface ComboConfig {
   system_message?: string | null;
   tool_filter_regex?: string | null;
@@ -34,11 +36,25 @@ interface Message {
 
 // ── Context Caching Tag ─────────────────────────────────────────────────────
 
-// Handles both actual newlines (U+000A) and literal \n sequences injected
-// by combo.ts streaming around the <omniModel> tag (#531). Non-global so that
-// .exec() and .test() stay stateless; callers that need full replacement use
-// String.prototype.replace() which replaces all non-overlapping matches.
-const CACHE_TAG_PATTERN = /(?:\\n|\n|\r)*<omniModel>([^<]+)<\/omniModel>(?:\\n|\n|\r)*/;
+// Detection / extraction pattern. The newline runs combo.ts streaming wraps the
+// tag with (#531) are irrelevant to *finding* the tag or capturing the model id,
+// so they are intentionally NOT matched here: an unbounded `(?:\\n|\n|\r)*` prefix
+// on this unanchored regex made `.test()` / `.exec()` run in O(n²) on inputs with
+// many newlines (polynomial ReDoS — CodeQL js/polynomial-redos, #3870). Non-global
+// so `.exec()` / `.test()` stay stateless (a global regex carries lastIndex between
+// calls and would skip matches).
+const CACHE_TAG_PATTERN = /<omniModel>([^<]+)<\/omniModel>/;
+
+// Global variant for `.replace()` callers that must strip EVERY tag (a non-global
+// regex only removes the first match, so a message carrying more than one
+// <omniModel> tag — e.g. an Open WebUI follow-up/title request that inlines the
+// whole chat history — leaked the remaining tags to the provider, defeating the
+// cache-session protection stripModelTags enforces, #454). This variant still
+// consumes the newline run wrapping the tag (combo.ts streaming, #531) so removal
+// leaves no blank line, but the runs are BOUNDED ({0,16}) to keep the regex linear
+// (no polynomial backtracking, #3870); 16 is far beyond any real streaming wrap.
+const CACHE_TAG_PATTERN_GLOBAL =
+  /(?:\\n|\n|\r){0,16}<omniModel>([^<]+)<\/omniModel>(?:\\n|\n|\r){0,16}/g;
 
 /**
  * Inject the model tag into the last assistant message (or append a new one).
@@ -46,10 +62,10 @@ const CACHE_TAG_PATTERN = /(?:\\n|\n|\r)*<omniModel>([^<]+)<\/omniModel>(?:\\n|\
  * Claude/Gemini multi-part message formats.
  */
 export function injectModelTag(messages: Message[], providerModel: string): Message[] {
-  // Remove any existing tag first to avoid duplication on context compaction
+  // Remove any existing tags first to avoid duplication on context compaction
   const cleaned = messages.map((msg) => {
     if (msg.role === "assistant" && typeof msg.content === "string") {
-      return { ...msg, content: msg.content.replace(CACHE_TAG_PATTERN, "").trimEnd() };
+      return { ...msg, content: msg.content.replace(CACHE_TAG_PATTERN_GLOBAL, "").trimEnd() };
     }
     return msg;
   });
@@ -147,7 +163,7 @@ export function applyToolFilter(
 export function stripModelTags(messages: Message[]): Message[] {
   return messages.map((msg) => {
     if (typeof msg.content === "string" && CACHE_TAG_PATTERN.test(msg.content)) {
-      return { ...msg, content: msg.content.replace(CACHE_TAG_PATTERN, "").trimEnd() };
+      return { ...msg, content: msg.content.replace(CACHE_TAG_PATTERN_GLOBAL, "").trimEnd() };
     }
     return msg;
   });
@@ -166,24 +182,24 @@ export function applyComboAgentMiddleware(
 ): { body: Record<string, unknown>; pinnedModel: string | null } {
   if (!comboConfig) return { body, pinnedModel: null };
 
-  let messages: Message[] = Array.isArray(body.messages) ? [...body.messages] : [];
+  const hasMessages = Array.isArray(body.messages);
+  const isResponsesRequest =
+    Object.prototype.hasOwnProperty.call(body, "input") ||
+    Object.prototype.hasOwnProperty.call(body, "instructions");
+  const systemMessage =
+    typeof comboConfig.system_message === "string" && comboConfig.system_message.trim()
+      ? comboConfig.system_message
+      : null;
+  let messages: Message[] = hasMessages ? [...(body.messages as Message[])] : [];
   let pinnedModel: string | null = null;
 
-  // 1. Context caching: check for pinned model in history
-  if (comboConfig.context_cache_protection) {
-    pinnedModel = extractPinnedModel(messages);
-    if (pinnedModel) {
-      // (#535) Model is pinned via <omniModel> tag — override body.model so the combo
-      // router uses exactly this model instead of picking a different one. Without this,
-      // the extracted pinnedModel is returned but body.model is unchanged, breaking
-      // context cache sessions by sending subsequent turns to a different model.
-      body = { ...body, model: pinnedModel };
-    }
-  }
+  // Context cache pinning is handled server-side in combo.ts via
+  // session_model_history. No client-side <omniModel> tag extraction needed.
+  pinnedModel = null;
 
-  // 2. System message override
-  if (comboConfig.system_message && comboConfig.system_message.trim()) {
-    messages = applySystemMessageOverride(messages, comboConfig.system_message);
+  // 2. System message override. Responses API uses top-level instructions instead of messages.
+  if (systemMessage && !isResponsesRequest) {
+    messages = applySystemMessageOverride(messages, systemMessage);
   }
 
   // 3. Tool filter
@@ -200,9 +216,129 @@ export function applyComboAgentMiddleware(
   return {
     body: {
       ...body,
-      messages,
+      ...(isResponsesRequest && systemMessage ? { instructions: systemMessage } : {}),
+      ...(hasMessages ? { messages } : {}),
       ...(filteredTools !== body.tools && { tools: filteredTools }),
     },
     pinnedModel,
   };
+}
+
+// ── System Prompt Template Expansion (#5501) ─────────────────────────────────
+
+export interface ComboSystemPromptTemplateContext {
+  modelId: string;
+  providerId: string;
+  account: string;
+  fingerprint: string;
+}
+
+/**
+ * Replace allowlisted `{{TOKEN}}` placeholders in a single left-to-right scan.
+ * No regex (ReDoS-averse, cf. #3870) and no recursion: an expanded value is
+ * appended to the output and never re-scanned. Unknown tokens ({{FOO}}) and
+ * dangling "{{" stay literal.
+ */
+function expandStringTemplates(value: string, values: Record<string, string>): string {
+  let out = "";
+  let rest = value;
+  while (rest.length > 0) {
+    const start = rest.indexOf("{{");
+    if (start === -1) {
+      out += rest;
+      break;
+    }
+    const end = rest.indexOf("}}", start + 2);
+    if (end === -1) {
+      out += rest;
+      break;
+    }
+    const token = rest.slice(start, end + 2);
+    out += rest.slice(0, start);
+    out += token in values ? values[token] : token;
+    rest = rest.slice(end + 2);
+  }
+  return out;
+}
+
+/**
+ * Expand allowlisted placeholders in the combo-injected system prompt (#5501).
+ *
+ * Strictly scoped to the content the combo override produced — never
+ * client-owned system content:
+ *   - Responses API body (has `instructions`) → expand `body.instructions`.
+ *   - messages body → expand `body.messages[0]` when it is the injected combo
+ *     system message (the override filters all system messages and injects its
+ *     own at index 0 with string content).
+ *   - otherwise → body unchanged.
+ */
+export function expandComboSystemPromptTemplates(
+  body: Record<string, unknown>,
+  ctx: ComboSystemPromptTemplateContext
+): Record<string, unknown> {
+  const values: Record<string, string> = {
+    "{{MODEL_ID}}": ctx.modelId,
+    "{{PROVIDER_ID}}": ctx.providerId,
+    "{{ACCOUNT}}": ctx.account,
+    "{{FINGERPRINT}}": ctx.fingerprint,
+  };
+  const result = { ...body };
+  if (typeof result.instructions === "string") {
+    result.instructions = expandStringTemplates(result.instructions, values);
+    return result;
+  }
+  const messages = result.messages;
+  if (Array.isArray(messages)) {
+    const first = messages[0] as Record<string, unknown> | undefined;
+    if (
+      first &&
+      (first.role === "system" || first.role === "developer") &&
+      typeof first.content === "string"
+    ) {
+      const next = [...messages];
+      next[0] = { ...first, content: expandStringTemplates(first.content, values) };
+      result.messages = next;
+    }
+  }
+  return result;
+}
+
+/**
+ * Gate + expand: expand the combo `system_message` template placeholders only
+ * when the combo actually defines a non-empty `system_message`. Client-owned
+ * content passes through untouched (single gate shared by every dispatch path).
+ */
+export function expandComboSystemPromptIfPresent(
+  body: Record<string, unknown>,
+  combo: { system_message?: string | null },
+  ctx: ComboSystemPromptTemplateContext
+): Record<string, unknown> {
+  if (typeof combo.system_message === "string" && combo.system_message.trim()) {
+    return expandComboSystemPromptTemplates(body, ctx);
+  }
+  return body;
+}
+
+/**
+ * Resolve the device fingerprint for a combo target (#5501, #6087).
+ * Only fingerprint-based providers carry fingerprints (see isFingerprintProvider).
+ * Priority: explicit pin (`pinnedFingerprint`, combo builder) → the `@fp:`
+ * suffix in `executionKey` (auto-rotation).
+ * Returns null when none is knowable (the first fingerprint of an auto-rotated
+ * set keeps the bare execution key — documented limitation).
+ */
+export function resolveTargetFingerprint(target: {
+  provider: string;
+  pinnedFingerprint?: string;
+  executionKey?: string;
+}): string | null {
+  if (!isFingerprintProvider(target.provider)) return null;
+  if (target.pinnedFingerprint) return target.pinnedFingerprint;
+  const key = target.executionKey;
+  if (key) {
+    const marker = "@fp:";
+    const idx = key.lastIndexOf(marker);
+    if (idx !== -1) return key.slice(idx + marker.length);
+  }
+  return null;
 }

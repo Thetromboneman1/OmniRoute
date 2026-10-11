@@ -1,10 +1,16 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 import { useTranslations } from "next-intl";
 import Link from "next/link";
 import { IMAGE_PROVIDERS } from "@omniroute/open-sse/config/imageRegistry.ts";
-import { AI_PROVIDERS } from "@/shared/constants/providers";
+import { VIDEO_PROVIDERS } from "@omniroute/open-sse/config/videoRegistry.ts";
+import { MUSIC_PROVIDERS } from "@omniroute/open-sse/config/musicRegistry.ts";
+import {
+  AUDIO_SPEECH_PROVIDERS,
+  AUDIO_TRANSCRIPTION_PROVIDERS,
+} from "@omniroute/open-sse/config/audioRegistry.ts";
+import { toProviderModels, type ProviderModelGroup } from "./mediaProviderModels";
 
 type Modality = "image" | "video" | "music" | "speech" | "transcription";
 type GenerationResult = {
@@ -13,235 +19,69 @@ type GenerationResult = {
   timestamp: number;
   audioUrl?: string;
 };
-
-const PROVIDER_METADATA = AI_PROVIDERS as Record<string, { name?: string }>;
-const IMAGE_PROVIDER_MODELS = Object.entries(IMAGE_PROVIDERS).map(([providerId, config]) => ({
-  id: providerId,
-  name: PROVIDER_METADATA[providerId]?.name || providerId,
-  models: config.models.map((model) => ({
-    id: `${providerId}/${model.id}`,
-    name: model.name,
-  })),
-}));
-const IMAGE_PROVIDERS_REQUIRING_CREDENTIALS = Object.entries(IMAGE_PROVIDERS)
-  .filter(([, config]) => config.authType !== "none")
-  .map(([providerId]) => providerId);
+const IMAGE_PROVIDER_MODELS = toProviderModels(IMAGE_PROVIDERS);
+const VIDEO_PROVIDER_MODELS = toProviderModels(VIDEO_PROVIDERS);
+const MUSIC_PROVIDER_MODELS = toProviderModels(MUSIC_PROVIDERS);
+const SPEECH_PROVIDER_MODELS = toProviderModels(AUDIO_SPEECH_PROVIDERS);
+const TRANSCRIPTION_PROVIDER_MODELS = toProviderModels(AUDIO_TRANSCRIPTION_PROVIDERS);
 
 const MODALITY_CONFIG: Record<
   Modality,
   {
     icon: string;
     endpoint: string;
-    label: string;
-    placeholder?: string;
+    labelKey: string;
+    placeholderKey?: string;
     color: string;
-    textLabel?: string;
-    needsCredentials: string[];
   }
 > = {
   image: {
     icon: "image",
     endpoint: "/api/v1/images/generations",
-    label: "Image Generation",
-    placeholder: "A serene landscape with mountains at sunset...",
+    labelKey: "imageGeneration",
+    placeholderKey: "imagePromptPlaceholder",
     color: "from-purple-500 to-pink-500",
-    needsCredentials: IMAGE_PROVIDERS_REQUIRING_CREDENTIALS,
   },
   video: {
     icon: "videocam",
     endpoint: "/api/v1/videos/generations",
-    label: "Video Generation",
-    placeholder: "A timelapse of a flower blooming...",
+    labelKey: "videoGeneration",
+    placeholderKey: "videoPromptPlaceholder",
     color: "from-blue-500 to-cyan-500",
-    needsCredentials: [],
   },
   music: {
     icon: "music_note",
     endpoint: "/api/v1/music/generations",
-    label: "Music Generation",
-    placeholder: "Upbeat electronic music with synth pads...",
+    labelKey: "musicGeneration",
+    placeholderKey: "musicPromptPlaceholder",
     color: "from-orange-500 to-yellow-500",
-    needsCredentials: [],
   },
   speech: {
     icon: "record_voice_over",
     endpoint: "/api/v1/audio/speech",
-    label: "Text to Speech",
-    placeholder: "Hello! Welcome to OmniRoute, your intelligent AI gateway...",
+    labelKey: "textToSpeech",
+    placeholderKey: "speechTextPlaceholder",
     color: "from-green-500 to-teal-500",
-    textLabel: "Text",
-    needsCredentials: ["openai", "elevenlabs", "deepgram", "xiaomi-mimo"],
   },
   transcription: {
     icon: "mic",
     endpoint: "/api/v1/audio/transcriptions",
-    label: "Transcription",
-    placeholder: "Upload an audio file to transcribe...",
+    labelKey: "transcription",
+    placeholderKey: "transcriptionPlaceholder",
     color: "from-indigo-500 to-blue-500",
-    needsCredentials: ["deepgram", "groq", "openai"],
   },
 };
 
-// Provider+model registry (image is derived from the runtime image registry to avoid drift)
-const PROVIDER_MODELS: Record<
-  Modality,
-  { id: string; name: string; models: { id: string; name: string }[] }[]
-> = {
+// Provider+model registry derived from runtime registries to avoid dashboard drift
+const PROVIDER_MODELS: Record<Modality, ProviderModelGroup[]> = {
   image: IMAGE_PROVIDER_MODELS,
-  video: [
-    {
-      id: "comfyui",
-      name: "ComfyUI",
-      models: [
-        { id: "comfyui/animatediff", name: "AnimateDiff" },
-        { id: "comfyui/svd", name: "Stable Video Diffusion" },
-      ],
-    },
-    {
-      id: "sdwebui",
-      name: "SD WebUI",
-      models: [{ id: "sdwebui/animatediff", name: "AnimateDiff (Local)" }],
-    },
-  ],
-  music: [
-    {
-      id: "comfyui",
-      name: "ComfyUI",
-      models: [
-        { id: "comfyui/stable-audio", name: "Stable Audio Open" },
-        { id: "comfyui/musicgen", name: "MusicGen" },
-      ],
-    },
-  ],
-  speech: [
-    {
-      id: "openai",
-      name: "OpenAI",
-      models: [
-        { id: "openai/tts-1", name: "TTS-1" },
-        { id: "openai/tts-1-hd", name: "TTS-1 HD" },
-        { id: "openai/gpt-4o-mini-tts", name: "GPT-4o Mini TTS" },
-      ],
-    },
-    {
-      id: "elevenlabs",
-      name: "ElevenLabs",
-      models: [
-        { id: "elevenlabs/eleven_multilingual_v2", name: "Eleven Multilingual v2" },
-        { id: "elevenlabs/eleven_turbo_v2_5", name: "Eleven Turbo v2.5" },
-      ],
-    },
-    {
-      id: "deepgram",
-      name: "Deepgram",
-      models: [
-        { id: "deepgram/aura-asteria-en", name: "Aura Asteria (EN)" },
-        { id: "deepgram/aura-luna-en", name: "Aura Luna (EN)" },
-        { id: "deepgram/aura-stella-en", name: "Aura Stella (EN)" },
-      ],
-    },
-    {
-      id: "hyperbolic",
-      name: "Hyperbolic",
-      models: [{ id: "hyperbolic/melo-tts", name: "Melo TTS" }],
-    },
-    {
-      id: "nvidia",
-      name: "NVIDIA NIM",
-      models: [
-        { id: "nvidia/fastpitch", name: "FastPitch" },
-        { id: "nvidia/tacotron2", name: "Tacotron2" },
-      ],
-    },
-    {
-      id: "inworld",
-      name: "Inworld",
-      models: [
-        { id: "inworld/inworld-tts-1.5-max", name: "Inworld TTS Max" },
-        { id: "inworld/inworld-tts-1.5-mini", name: "Inworld TTS Mini" },
-      ],
-    },
-    {
-      id: "cartesia",
-      name: "Cartesia",
-      models: [
-        { id: "cartesia/sonic-2", name: "Sonic 2" },
-        { id: "cartesia/sonic-3", name: "Sonic 3" },
-      ],
-    },
-    {
-      id: "playht",
-      name: "PlayHT",
-      models: [
-        { id: "playht/PlayDialog", name: "PlayDialog" },
-        { id: "playht/Play3.0-mini", name: "Play3.0 Mini" },
-      ],
-    },
-    {
-      id: "huggingface",
-      name: "HuggingFace",
-      models: [{ id: "huggingface/espnet/kan-bayashi_ljspeech_vits", name: "VITS LJSpeech" }],
-    },
-    { id: "qwen", name: "Qwen", models: [{ id: "qwen/qwen3-tts", name: "Qwen3 TTS" }] },
-    {
-      id: "xiaomi-mimo",
-      name: "Xiaomi MiMo",
-      models: [
-        { id: "xiaomi-mimo/mimo-v2.5-tts", name: "MiMo V2.5 TTS" },
-        { id: "xiaomi-mimo/mimo-v2.5-tts-voicedesign", name: "MiMo V2.5 Voice Design" },
-        { id: "xiaomi-mimo/mimo-v2.5-tts-voiceclone", name: "MiMo V2.5 Voice Clone" },
-      ],
-    },
-  ],
-  transcription: [
-    {
-      id: "deepgram",
-      name: "Deepgram ($200 free)",
-      models: [
-        { id: "deepgram/nova-3", name: "Nova 3 (Best)" },
-        { id: "deepgram/nova-2", name: "Nova 2" },
-        { id: "deepgram/enhanced", name: "Enhanced" },
-        { id: "deepgram/base", name: "Base" },
-      ],
-    },
-    {
-      id: "assemblyai",
-      name: "AssemblyAI ($50 free)",
-      models: [
-        { id: "assemblyai/universal-3-pro", name: "Universal 3 Pro (Best)" },
-        { id: "assemblyai/universal-2", name: "Universal 2" },
-        { id: "assemblyai/nano", name: "Nano (Fast)" },
-      ],
-    },
-    {
-      id: "groq",
-      name: "Groq (Free — Whisper)",
-      models: [
-        { id: "groq/whisper-large-v3", name: "Whisper Large v3 (Free)" },
-        { id: "groq/whisper-large-v3-turbo", name: "Whisper Turbo (Free)" },
-      ],
-    },
-    {
-      id: "openai",
-      name: "OpenAI",
-      models: [
-        { id: "openai/whisper-1", name: "Whisper 1" },
-        { id: "openai/gpt-4o-transcription", name: "GPT-4o Transcription" },
-      ],
-    },
-    {
-      id: "nvidia",
-      name: "NVIDIA NIM",
-      models: [{ id: "nvidia/nvidia/parakeet-ctc-1.1b-asr", name: "Parakeet CTC 1.1B" }],
-    },
-    {
-      id: "huggingface",
-      name: "HuggingFace",
-      models: [{ id: "huggingface/openai/whisper-large-v3", name: "Whisper Large v3 (HF)" }],
-    },
-    { id: "qwen", name: "Qwen", models: [{ id: "qwen/qwen3-asr", name: "Qwen3 ASR" }] },
-  ],
+  video: VIDEO_PROVIDER_MODELS,
+  music: MUSIC_PROVIDER_MODELS,
+  speech: SPEECH_PROVIDER_MODELS,
+  transcription: TRANSCRIPTION_PROVIDER_MODELS,
 };
+const INITIAL_IMAGE_PROVIDER = PROVIDER_MODELS.image[0];
+const INITIAL_IMAGE_MODEL = INITIAL_IMAGE_PROVIDER?.models[0];
 
 // Voice presets per TTS provider
 const VOICE_PRESETS: Record<string, { id: string; label: string }[]> = {
@@ -264,6 +104,13 @@ const VOICE_PRESETS: Record<string, { id: string; label: string }[]> = {
     { id: "pNInz6obpgDQGcFmaJgB", label: "Adam (EN)" },
     { id: "yoZ06aMxZJJ28mfd3POQ", label: "Sam (EN)" },
   ],
+  kie: [
+    { id: "Rachel", label: "Rachel (EN)" },
+    { id: "Adam", label: "Adam (EN)" },
+    { id: "Brian", label: "Brian (EN)" },
+    { id: "Roger", label: "Roger (EN)" },
+    { id: "Bella", label: "Bella (EN)" },
+  ],
   cartesia: [
     { id: "a0e99841-438c-4a64-b679-ae501e7d6091", label: "Barbershop Man" },
     { id: "694f9389-aac1-45b6-b726-9d9369183238", label: "Friendly Reading Man" },
@@ -277,8 +124,147 @@ const VOICE_PRESETS: Record<string, { id: string; label: string }[]> = {
     { id: "aura-orion-en", label: "Orion (EN)" },
   ],
   inworld: [
-    { id: "Eva", label: "Eva (EN)" },
+    { id: "Abby", label: "Abby (EN)" },
+    { id: "Alex", label: "Alex (EN)" },
+    { id: "Amina", label: "Amina (EN)" },
+    { id: "Anjali", label: "Anjali (EN)" },
+    { id: "Arjun", label: "Arjun (EN)" },
+    { id: "Ashley", label: "Ashley (EN)" },
+    { id: "Avery", label: "Avery (EN)" },
+    { id: "Bianca", label: "Bianca (EN)" },
+    { id: "Blake", label: "Blake (EN)" },
+    { id: "Brandon", label: "Brandon (EN)" },
+    { id: "Brian", label: "Brian (EN)" },
+    { id: "Callum", label: "Callum (EN)" },
+    { id: "Carter", label: "Carter (EN)" },
+    { id: "Cedric", label: "Cedric (EN)" },
+    { id: "Celeste", label: "Celeste (EN)" },
+    { id: "Chloe", label: "Chloe (EN)" },
+    { id: "Claire", label: "Claire (EN)" },
+    { id: "Clive", label: "Clive (EN)" },
+    { id: "Conrad", label: "Conrad (EN)" },
+    { id: "Craig", label: "Craig (EN)" },
+    { id: "Damon", label: "Damon (EN)" },
+    { id: "Darlene", label: "Darlene (EN)" },
+    { id: "Deborah", label: "Deborah (EN)" },
+    { id: "Dennis", label: "Dennis (EN)" },
+    { id: "Derek", label: "Derek (EN)" },
+    { id: "Dominus", label: "Dominus (EN)" },
+    { id: "Duncan", label: "Duncan (EN)" },
+    { id: "Edward", label: "Edward (EN)" },
+    { id: "Eleanor", label: "Eleanor (EN)" },
+    { id: "Elliot", label: "Elliot (EN)" },
+    { id: "Ethan", label: "Ethan (EN)" },
+    { id: "Evan", label: "Evan (EN)" },
+    { id: "Evelyn", label: "Evelyn (EN)" },
+    { id: "Felix", label: "Felix (EN)" },
+    { id: "Gareth", label: "Gareth (EN)" },
+    { id: "Graham", label: "Graham (EN)" },
+    { id: "Hades", label: "Hades (EN)" },
+    { id: "Hamish", label: "Hamish (EN)" },
+    { id: "Hana", label: "Hana (EN)" },
+    { id: "Hank", label: "Hank (EN)" },
+    { id: "James", label: "James (EN)" },
+    { id: "Jason", label: "Jason (EN)" },
+    { id: "Jessica", label: "Jessica (EN)" },
+    { id: "Jonah", label: "Jonah (EN)" },
+    { id: "Kelsey", label: "Kelsey (EN)" },
+    { id: "Lauren", label: "Lauren (EN)" },
+    { id: "Levi", label: "Levi (EN)" },
+    { id: "Liam", label: "Liam (EN)" },
+    { id: "Loretta", label: "Loretta (EN)" },
+    { id: "Lucian", label: "Lucian (EN)" },
+    { id: "Luna", label: "Luna (EN)" },
+    { id: "Malcolm", label: "Malcolm (EN)" },
     { id: "Marcus", label: "Marcus (EN)" },
+    { id: "Mark", label: "Mark (EN)" },
+    { id: "Marlene", label: "Marlene (EN)" },
+    { id: "Mia", label: "Mia (EN)" },
+    { id: "Miranda", label: "Miranda (EN)" },
+    { id: "Mortimer", label: "Mortimer (EN)" },
+    { id: "Nadia", label: "Nadia (EN)" },
+    { id: "Naomi", label: "Naomi (EN)" },
+    { id: "Nate", label: "Nate (EN)" },
+    { id: "Oliver", label: "Oliver (EN)" },
+    { id: "Olivia", label: "Olivia (EN)" },
+    { id: "Pippa", label: "Pippa (EN)" },
+    { id: "Pixie", label: "Pixie (EN)" },
+    { id: "Reed", label: "Reed (EN)" },
+    { id: "Riley", label: "Riley (EN)" },
+    { id: "Ronald", label: "Ronald (EN)" },
+    { id: "Rupert", label: "Rupert (EN)" },
+    { id: "Saanvi", label: "Saanvi (EN)" },
+    { id: "Sarah", label: "Sarah (EN)" },
+    { id: "Sebastian", label: "Sebastian (EN)" },
+    { id: "Selene", label: "Selene (EN)" },
+    { id: "Serena", label: "Serena (EN)" },
+    { id: "Simon", label: "Simon (EN)" },
+    { id: "Snik", label: "Snik (EN)" },
+    { id: "Sophie", label: "Sophie (EN)" },
+    { id: "Tessa", label: "Tessa (EN)" },
+    { id: "Theodore", label: "Theodore (EN)" },
+    { id: "Timothy", label: "Timothy (EN)" },
+    { id: "Trevor", label: "Trevor (EN)" },
+    { id: "Tristan", label: "Tristan (EN)" },
+    { id: "Tyler", label: "Tyler (EN)" },
+    { id: "Veronica", label: "Veronica (EN)" },
+    { id: "Victor", label: "Victor (EN)" },
+    { id: "Victoria", label: "Victoria (EN)" },
+    { id: "Vinny", label: "Vinny (EN)" },
+    { id: "Wendy", label: "Wendy (EN)" },
+    { id: "Aanya", label: "Aanya (HI)" },
+    { id: "Aarav", label: "Aarav (HI)" },
+    { id: "Manoj", label: "Manoj (HI)" },
+    { id: "Riya", label: "Riya (HI)" },
+    { id: "Alain", label: "Alain (FR)" },
+    { id: "Étienne", label: "Étienne (FR)" },
+    { id: "Hélène", label: "Hélène (FR)" },
+    { id: "Mathieu", label: "Mathieu (FR)" },
+    { id: "Asuka", label: "Asuka (JP)" },
+    { id: "Haruto", label: "Haruto (JP)" },
+    { id: "Hina", label: "Hina (JP)" },
+    { id: "Satoshi", label: "Satoshi (JP)" },
+    { id: "Beatriz", label: "Beatriz (PT)" },
+    { id: "Heitor", label: "Heitor (PT)" },
+    { id: "Maitê", label: "Maitê (PT)" },
+    { id: "Mariana", label: "Mariana (PT)" },
+    { id: "Murilo", label: "Murilo (PT)" },
+    { id: "Camila", label: "Camila (ES)" },
+    { id: "Diego", label: "Diego (ES)" },
+    { id: "Lupita", label: "Lupita (ES)" },
+    { id: "Mateo", label: "Mateo (ES)" },
+    { id: "Mauricio", label: "Mauricio (ES)" },
+    { id: "Miguel", label: "Miguel (ES)" },
+    { id: "Rafael", label: "Rafael (ES)" },
+    { id: "Sofia", label: "Sofia (ES)" },
+    { id: "Dmitry", label: "Dmitry (RU)" },
+    { id: "Elena", label: "Elena (RU)" },
+    { id: "Nikolai", label: "Nikolai (RU)" },
+    { id: "Svetlana", label: "Svetlana (RU)" },
+    { id: "Erik", label: "Erik (NL)" },
+    { id: "Katrien", label: "Katrien (NL)" },
+    { id: "Lennart", label: "Lennart (NL)" },
+    { id: "Lore", label: "Lore (NL)" },
+    { id: "Gianni", label: "Gianni (IT)" },
+    { id: "Orietta", label: "Orietta (IT)" },
+    { id: "Hyunwoo", label: "Hyunwoo (KO)" },
+    { id: "Minji", label: "Minji (KO)" },
+    { id: "Seojun", label: "Seojun (KO)" },
+    { id: "Yoona", label: "Yoona (KO)" },
+    { id: "Jing", label: "Jing (ZH)" },
+    { id: "Mei", label: "Mei (ZH)" },
+    { id: "Ming", label: "Ming (ZH)" },
+    { id: "Xiaoyin", label: "Xiaoyin (ZH)" },
+    { id: "Xinyi", label: "Xinyi (ZH)" },
+    { id: "Yichen", label: "Yichen (ZH)" },
+    { id: "Johanna", label: "Johanna (DE)" },
+    { id: "Josef", label: "Josef (DE)" },
+    { id: "Nour", label: "Nour (AR)" },
+    { id: "Omar", label: "Omar (AR)" },
+    { id: "Oren", label: "Oren (HE)" },
+    { id: "Yael", label: "Yael (HE)" },
+    { id: "Szymon", label: "Szymon (PL)" },
+    { id: "Wojciech", label: "Wojciech (PL)" },
   ],
   "xiaomi-mimo": [
     { id: "冰糖", label: "冰糖 (Chinese Female)" },
@@ -293,12 +279,10 @@ const VOICE_PRESETS: Record<string, { id: string; label: string }[]> = {
 };
 
 const SPEECH_FORMATS = ["mp3", "wav", "opus", "flac", "pcm"];
-const SPEECH_FORMATS_BY_PROVIDER: Record<string, string[]> = {
-  "xiaomi-mimo": ["mp3", "wav"],
-};
 
 function getSpeechFormats(providerId: string): string[] {
-  return SPEECH_FORMATS_BY_PROVIDER[providerId] || SPEECH_FORMATS;
+  const providerFormats = AUDIO_SPEECH_PROVIDERS[providerId]?.supportedFormats;
+  return providerFormats?.length ? providerFormats : SPEECH_FORMATS;
 }
 
 function getVoiceList(providerId: string) {
@@ -306,7 +290,11 @@ function getVoiceList(providerId: string) {
 }
 
 /** Parse a human-readable error from the API error response */
-function parseApiError(raw: any, statusCode: number): { message: string; isCredentials: boolean } {
+function parseApiError(
+  raw: any,
+  statusCode: number,
+  fallbackMessage: string
+): { message: string; isCredentials: boolean } {
   const readErrorMessage = (value: any): string | null => {
     if (!value) return null;
     if (typeof value === "string") return value;
@@ -339,14 +327,19 @@ function parseApiError(raw: any, statusCode: number): { message: string; isCrede
     raw?.message ||
     raw?.detail ||
     (typeof raw === "string" ? raw : null) ||
-    `Request failed (${statusCode})`;
+    fallbackMessage;
 
   const isCredentials =
     typeof msg === "string" &&
+    // eslint-disable-next-line no-restricted-syntax -- teknik string kontrolü, kullanıcı metni araması değil
     (msg.toLowerCase().includes("no credentials") ||
+      // eslint-disable-next-line no-restricted-syntax -- teknik string kontrolü, kullanıcı metni araması değil
       msg.toLowerCase().includes("invalid api key") ||
+      // eslint-disable-next-line no-restricted-syntax -- teknik string kontrolü, kullanıcı metni araması değil
       msg.toLowerCase().includes("unauthorized") ||
+      // eslint-disable-next-line no-restricted-syntax -- teknik string kontrolü, kullanıcı metni araması değil
       msg.toLowerCase().includes("authentication") ||
+      // eslint-disable-next-line no-restricted-syntax -- teknik string kontrolü, kullanıcı metni araması değil
       msg.toLowerCase().includes("api key") ||
       statusCode === 401 ||
       statusCode === 403);
@@ -362,7 +355,7 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-function fileToDataUrl(file: File): Promise<string> {
+function fileToDataUrl(file: File, errorMessage: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
@@ -370,23 +363,20 @@ function fileToDataUrl(file: File): Promise<string> {
         resolve(reader.result);
         return;
       }
-      reject(new Error("Failed to read file"));
+      reject(new Error(errorMessage));
     };
-    reader.onerror = () => reject(reader.error || new Error("Failed to read file"));
+    reader.onerror = () => reject(reader.error || new Error(errorMessage));
     reader.readAsDataURL(file);
   });
 }
 
 /** Render image result thumbnails */
 function ImageResults({ data }: { data: any }) {
+  const t = useTranslations("media");
   const images: Array<{ url?: string; b64_json?: string; revised_prompt?: string }> =
     data?.data || [];
   if (images.length === 0) {
-    return (
-      <p className="text-sm text-text-muted italic">
-        No images returned. The provider might have accepted the request but returned empty data.
-      </p>
-    );
+    return <p className="text-sm text-text-muted italic">{t("noImagesReturned")}</p>;
   }
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -401,7 +391,7 @@ function ImageResults({ data }: { data: any }) {
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
               src={src}
-              alt={img.revised_prompt || `Generated image ${i + 1}`}
+              alt={img.revised_prompt || t("generatedImageAlt", { index: i + 1 })}
               className="w-full"
             />
             <a
@@ -410,7 +400,7 @@ function ImageResults({ data }: { data: any }) {
               className="absolute bottom-2 right-2 bg-black/60 text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1"
             >
               <span className="material-symbols-outlined text-[13px]">download</span>
-              Save
+              {t("save")}
             </a>
             {img.revised_prompt && (
               <p
@@ -433,8 +423,10 @@ export default function MediaPageClient() {
   const [prompt, setPrompt] = useState("");
 
   // Selected provider and model per modality
-  const [selectedProvider, setSelectedProvider] = useState<string>("");
-  const [selectedModel, setSelectedModel] = useState<string>("");
+  const [selectedProvider, setSelectedProvider] = useState<string>(
+    INITIAL_IMAGE_PROVIDER?.id ?? ""
+  );
+  const [selectedModel, setSelectedModel] = useState<string>(INITIAL_IMAGE_MODEL?.id ?? "");
 
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<GenerationResult | null>(null);
@@ -458,6 +450,15 @@ export default function MediaPageClient() {
   const [configuredLocalProviders, setConfiguredLocalProviders] = useState<Set<string>>(
     new Set(LOCAL_PROVIDERS) // Optimistic: show all until we know otherwise
   );
+
+  useEffect(() => {
+    const audioUrl = result?.audioUrl;
+    return () => {
+      if (audioUrl) {
+        URL.revokeObjectURL(audioUrl);
+      }
+    };
+  }, [result?.audioUrl]);
 
   useEffect(() => {
     // Fetch configured provider connections to determine which local providers are set up
@@ -527,16 +528,6 @@ export default function MediaPageClient() {
     }
   };
 
-  // Initialize on mount — pick first provider/model for image tab
-  const initialized = useRef(false);
-  if (!initialized.current) {
-    initialized.current = true;
-    const providers = PROVIDER_MODELS["image"] ?? [];
-    const firstProvider = providers[0];
-    setSelectedProvider(firstProvider?.id ?? "");
-    setSelectedModel(firstProvider?.models[0]?.id ?? "");
-  }
-
   const handleGenerate = async () => {
     setLoading(true);
     setError(null);
@@ -550,7 +541,7 @@ export default function MediaPageClient() {
 
       if (activeTab === "speech") {
         if (!promptValue) {
-          setError("Please enter text to synthesize.");
+          setError(t("enterTextToSynthesize"));
           setLoading(false);
           return;
         }
@@ -566,7 +557,11 @@ export default function MediaPageClient() {
         });
         if (!res.ok) {
           const raw = await res.json().catch(() => ({}));
-          const { message, isCredentials } = parseApiError(raw, res.status);
+          const { message, isCredentials } = parseApiError(
+            raw,
+            res.status,
+            t("requestFailed", { status: res.status })
+          );
           setIsCredentialsError(isCredentials);
           throw new Error(message);
         }
@@ -584,7 +579,7 @@ export default function MediaPageClient() {
 
       if (activeTab === "transcription") {
         if (!audioFile) {
-          setError("Please select an audio file to transcribe.");
+          setError(t("selectAudioToTranscribe"));
           setLoading(false);
           return;
         }
@@ -594,25 +589,25 @@ export default function MediaPageClient() {
         const res = await fetch(config.endpoint, { method: "POST", body: form });
         if (!res.ok) {
           const raw = await res.json().catch(() => ({}));
-          const { message, isCredentials } = parseApiError(raw, res.status);
+          const { message, isCredentials } = parseApiError(
+            raw,
+            res.status,
+            t("requestFailed", { status: res.status })
+          );
           setIsCredentialsError(isCredentials);
           throw new Error(message);
         }
         const data = await res.json();
         // Check for noSpeechDetected flag (music, silence, etc.) — NOT a credential error
         if (data?.noSpeechDetected) {
-          setError(
-            `No speech detected in the audio file. If you uploaded music or a silent file, try an audio file with spoken words. Provider: "${selectedProvider}".`
-          );
+          setError(t("noSpeechDetected", { provider: selectedProvider }));
           setIsCredentialsError(false);
           setLoading(false);
           return;
         }
         // Warn if text is empty without the noSpeechDetected flag (unexpected)
         if (data && typeof data.text === "string" && data.text.trim() === "") {
-          setError(
-            `Transcription returned empty text. The audio may contain no recognizable speech, or the "${selectedProvider}" API key may be invalid. Check Dashboard → Logs → Proxy for details.`
-          );
+          setError(t("emptyTranscription", { provider: selectedProvider }));
           // Only mark as credential error if we can confirm it from context
           setIsCredentialsError(false);
           setLoading(false);
@@ -624,14 +619,14 @@ export default function MediaPageClient() {
       }
 
       if (activeTab === "image" && selectedProvider === "topaz" && !imageInputFile) {
-        setError("Topaz requires an input image.");
+        setError(t("topazRequiresImage"));
         setLoading(false);
         return;
       }
 
       if (!prompt.trim()) {
         if (activeTab !== "image" || selectedProvider !== "topaz") {
-          setError("Please enter a prompt.");
+          setError(t("enterPrompt"));
           setLoading(false);
           return;
         }
@@ -641,18 +636,18 @@ export default function MediaPageClient() {
         model: modelId,
         prompt:
           promptValue ||
-          (activeTab === "image" && selectedProvider === "topaz" ? "Enhance this image" : ""),
+          (activeTab === "image" && selectedProvider === "topaz" ? t("enhanceThisImage") : ""),
         ...(activeTab === "image" ? { size: "1024x1024", n: 1 } : {}),
       };
 
       if (activeTab === "image" && imageInputFile) {
-        const imageDataUrl = await fileToDataUrl(imageInputFile);
+        const imageDataUrl = await fileToDataUrl(imageInputFile, t("failedToReadFile"));
         payload.image_url = imageDataUrl;
         payload.imageUrls = [imageDataUrl];
       }
 
       if (activeTab === "image" && imageMaskFile) {
-        const maskDataUrl = await fileToDataUrl(imageMaskFile);
+        const maskDataUrl = await fileToDataUrl(imageMaskFile, t("failedToReadFile"));
         payload.mask = maskDataUrl;
         payload.mask_url = maskDataUrl;
       }
@@ -664,14 +659,18 @@ export default function MediaPageClient() {
       });
       if (!res.ok) {
         const raw = await res.json().catch(() => ({}));
-        const { message, isCredentials } = parseApiError(raw, res.status);
+        const { message, isCredentials } = parseApiError(
+          raw,
+          res.status,
+          t("requestFailed", { status: res.status })
+        );
         setIsCredentialsError(isCredentials);
         throw new Error(message);
       }
       const data = await res.json();
       setResult({ type: activeTab, data, timestamp: Date.now() });
     } catch (err: any) {
-      setError(err.message || "Generation failed");
+      setError(err.message || t("generationFailed"));
     }
     setLoading(false);
   };
@@ -692,12 +691,6 @@ export default function MediaPageClient() {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div>
-        <h1 className="text-2xl font-bold text-text-main">{t("title")}</h1>
-        <p className="text-text-muted text-sm mt-1">{t("subtitle")}</p>
-      </div>
-
       {/* Modality Tabs */}
       <div className="flex flex-wrap gap-2 p-1 bg-surface/50 rounded-xl border border-black/5 dark:border-white/5">
         {(Object.keys(MODALITY_CONFIG) as Modality[]).map((key) => {
@@ -714,7 +707,7 @@ export default function MediaPageClient() {
               }`}
             >
               <span className="material-symbols-outlined text-[18px]">{cfg.icon}</span>
-              {cfg.label}
+              {t(cfg.labelKey)}
             </button>
           );
         })}
@@ -726,7 +719,7 @@ export default function MediaPageClient() {
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           {/* Provider dropdown */}
           <div>
-            <label className="block text-sm font-medium text-text-main mb-2">Provider</label>
+            <label className="block text-sm font-medium text-text-main mb-2">{t("provider")}</label>
             <select
               value={selectedProvider}
               onChange={(e) => handleProviderChange(e.target.value)}
@@ -761,13 +754,17 @@ export default function MediaPageClient() {
         {selectedProvider && !["sdwebui", "comfyui", "qwen"].includes(selectedProvider) && (
           <p className="text-xs text-text-muted flex items-center gap-1.5">
             <span className="material-symbols-outlined text-[14px] text-amber-500">info</span>
-            Requires <strong className="capitalize">{selectedProvider}</strong> API key in{" "}
-            <Link
-              href="/dashboard/providers"
-              className="text-primary underline underline-offset-2 hover:text-primary/80"
-            >
-              Providers
-            </Link>
+            {t.rich("credentialsRequired", {
+              provider: () => <strong className="capitalize">{selectedProvider}</strong>,
+              providers: (chunks) => (
+                <Link
+                  href="/dashboard/providers"
+                  className="text-primary underline underline-offset-2 hover:text-primary/80"
+                >
+                  {chunks}
+                </Link>
+              ),
+            })}
           </p>
         )}
 
@@ -775,7 +772,7 @@ export default function MediaPageClient() {
         {activeTab === "speech" && (
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-text-main mb-2">Voice</label>
+              <label className="block text-sm font-medium text-text-main mb-2">{t("voice")}</label>
               <select
                 value={speechVoice}
                 onChange={(e) => setSpeechVoice(e.target.value)}
@@ -789,7 +786,7 @@ export default function MediaPageClient() {
               </select>
             </div>
             <div>
-              <label className="block text-sm font-medium text-text-main mb-2">Format</label>
+              <label className="block text-sm font-medium text-text-main mb-2">{t("format")}</label>
               <select
                 value={speechFormat}
                 onChange={(e) => setSpeechFormat(e.target.value)}
@@ -809,7 +806,7 @@ export default function MediaPageClient() {
         {activeTab === "transcription" ? (
           <div>
             <label className="block text-sm font-medium text-text-main mb-2">
-              Audio / Video File
+              {t("audioVideoFile")}
             </label>
             <input
               type="file"
@@ -819,7 +816,7 @@ export default function MediaPageClient() {
                 setFileSizeError(null);
                 if (file && file.size > MAX_TRANSCRIPTION_FILE_SIZE) {
                   setFileSizeError(
-                    `File too large (${formatFileSize(file.size)}). Maximum allowed: 4 GB.`
+                    t("fileTooLarge", { size: formatFileSize(file.size), max: "4 GB" })
                   );
                   setAudioFile(null);
                   e.target.value = "";
@@ -840,9 +837,7 @@ export default function MediaPageClient() {
                 {audioFile.name} ({formatFileSize(audioFile.size)})
               </p>
             )}
-            <p className="text-[10px] text-text-muted/60 mt-1">
-              Supports audio and video files up to 4 GB
-            </p>
+            <p className="text-[10px] text-text-muted/60 mt-1">{t("audioVideoFileHint")}</p>
           </div>
         ) : (
           <>
@@ -850,7 +845,7 @@ export default function MediaPageClient() {
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium text-text-main mb-2">
-                    Source Image
+                    {t("sourceImage")}
                   </label>
                   <input
                     type="file"
@@ -863,13 +858,11 @@ export default function MediaPageClient() {
                       {imageInputFile.name} ({formatFileSize(imageInputFile.size)})
                     </p>
                   )}
-                  <p className="text-[10px] text-text-muted/60 mt-1">
-                    Optional for image-to-image, editing and upscale workflows.
-                  </p>
+                  <p className="text-[10px] text-text-muted/60 mt-1">{t("sourceImageHint")}</p>
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-text-main mb-2">
-                    Mask Image
+                    {t("maskImage")}
                   </label>
                   <input
                     type="file"
@@ -882,9 +875,7 @@ export default function MediaPageClient() {
                       {imageMaskFile.name} ({formatFileSize(imageMaskFile.size)})
                     </p>
                   )}
-                  <p className="text-[10px] text-text-muted/60 mt-1">
-                    Optional. Used by inpaint-style models that support masks.
-                  </p>
+                  <p className="text-[10px] text-text-muted/60 mt-1">{t("maskImageHint")}</p>
                 </div>
               </div>
             )}
@@ -893,9 +884,9 @@ export default function MediaPageClient() {
             <div>
               <label className="block text-sm font-medium text-text-main mb-2">
                 {activeTab === "speech"
-                  ? "Text"
+                  ? t("text")
                   : activeTab === "image" && selectedProvider === "topaz"
-                    ? "Prompt (optional)"
+                    ? t("promptOptional")
                     : t("prompt")}
               </label>
               <textarea
@@ -904,8 +895,10 @@ export default function MediaPageClient() {
                 onChange={(e) => setPrompt(e.target.value)}
                 placeholder={
                   activeTab === "image" && selectedProvider === "topaz"
-                    ? "Optional enhancement instructions..."
-                    : config.placeholder
+                    ? t("enhancementInstructionsPlaceholder")
+                    : config.placeholderKey
+                      ? t(config.placeholderKey)
+                      : undefined
                 }
                 className="w-full px-3 py-2 rounded-lg bg-surface border border-black/10 dark:border-white/10 text-text-main text-sm placeholder:text-text-muted/50 focus:outline-none focus:ring-2 focus:ring-primary/30 resize-none"
               />
@@ -929,9 +922,9 @@ export default function MediaPageClient() {
                 progress_activity
               </span>
               {activeTab === "speech"
-                ? "Synthesizing..."
+                ? t("synthesizing")
                 : activeTab === "transcription"
-                  ? "Transcribing..."
+                  ? t("transcribing")
                   : t("generating")}
             </>
           ) : (
@@ -944,10 +937,10 @@ export default function MediaPageClient() {
                     : "auto_awesome"}
               </span>
               {activeTab === "speech"
-                ? "Synthesize Speech"
+                ? t("synthesizeSpeech")
                 : activeTab === "transcription"
-                  ? "Transcribe Audio"
-                  : `${t("generate")} ${config.label}`}
+                  ? t("transcribeAudio")
+                  : t("generateModality", { modality: t(config.labelKey) })}
             </>
           )}
         </button>
@@ -967,7 +960,7 @@ export default function MediaPageClient() {
             <p
               className={`text-sm font-medium ${isCredentialsError ? "text-amber-500" : "text-red-500"}`}
             >
-              {isCredentialsError ? "API Key Required" : t("error")}
+              {isCredentialsError ? t("apiKeyRequired") : t("error")}
             </p>
             <p className="text-sm text-text-muted mt-1 break-words">{error}</p>
             {isCredentialsError && (
@@ -976,7 +969,7 @@ export default function MediaPageClient() {
                 className="inline-flex items-center gap-1 mt-2 text-xs text-primary hover:underline"
               >
                 <span className="material-symbols-outlined text-[13px]">open_in_new</span>
-                Configure API keys in Providers →
+                {t("configureApiKeys")} →
               </Link>
             )}
           </div>
@@ -1007,7 +1000,7 @@ export default function MediaPageClient() {
                 className="inline-flex items-center gap-2 text-sm text-primary hover:underline"
               >
                 <span className="material-symbols-outlined text-[16px]">download</span>
-                Download {result.data?.format?.toUpperCase() || "MP3"}
+                {t("downloadFormat", { format: result.data?.format?.toUpperCase() || "MP3" })}
               </a>
             </div>
           ) : result.type === "image" ? (
@@ -1016,13 +1009,13 @@ export default function MediaPageClient() {
             <div className="space-y-3">
               <div className="bg-surface rounded-lg p-4 text-sm text-text-main leading-relaxed whitespace-pre-wrap">
                 {result.data?.text || (
-                  <span className="text-text-muted italic">No text returned</span>
+                  <span className="text-text-muted italic">{t("noTextReturned")}</span>
                 )}
               </div>
               {result.data?.words && (
                 <details className="mt-2">
                   <summary className="text-xs text-text-muted cursor-pointer hover:text-text-main">
-                    Word-level timestamps ({result.data.words.length} words)
+                    {t("wordTimestamps", { count: result.data.words.length })}
                   </summary>
                   <pre className="bg-surface rounded mt-2 p-3 text-xs text-text-muted overflow-auto max-h-48 custom-scrollbar">
                     {JSON.stringify(result.data.words, null, 2)}
@@ -1056,9 +1049,11 @@ export default function MediaPageClient() {
                     {cfg.icon}
                   </span>
                 </div>
-                <span className="text-sm font-medium text-text-main">{cfg.label}</span>
+                <span className="text-sm font-medium text-text-main">{t(cfg.labelKey)}</span>
               </div>
-              <p className="text-xs text-text-muted">{providerCount} providers</p>
+              <p className="text-xs text-text-muted">
+                {t("providerCount", { count: providerCount })}
+              </p>
               <code className="block mt-2 text-xs text-primary/70 bg-primary/5 rounded px-2 py-1">
                 POST {cfg.endpoint}
               </code>

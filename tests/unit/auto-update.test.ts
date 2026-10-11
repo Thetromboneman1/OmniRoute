@@ -248,13 +248,18 @@ test("ensureGitTagExists verifies refs/tags paths and throws a clear error when 
 test("auto update script builders generate npm, source, and docker-compose scripts with quoting and patch commits", () => {
   const npmScript = autoUpdate.buildNpmUpdateScript("3.6.0");
   assert.match(npmScript, /npm install -g omniroute@3.6.0/);
+  // Optional deps (better-sqlite3, keytar, tls-client, and the llmlingua SLM stack)
+  // must survive an update — install them explicitly so an `omit=optional` config
+  // cannot silently drop them.
+  assert.match(npmScript, /--include=optional/);
   assert.match(npmScript, /pm2 restart omniroute \|\| true/);
   assert.match(npmScript, /Successfully updated to v3.6.0/);
 
   const sourceScript = autoUpdate.buildSourceUpdateScript("3.6.0", "upstream");
   assert.match(sourceScript, /git fetch --tags 'upstream'/);
   assert.match(sourceScript, /git stash --include-untracked/);
-  assert.match(sourceScript, /node scripts\/sync-env\.mjs 2>\/dev\/null \|\| true/);
+  assert.match(sourceScript, /npm install --include=optional --legacy-peer-deps/);
+  assert.match(sourceScript, /node scripts\/dev\/sync-env\.mjs 2>\/dev\/null \|\| true/);
   assert.match(sourceScript, /Successfully updated to v3\.6\.0/);
 
   const dockerScript = autoUpdate.buildDockerComposeUpdateScript({
@@ -279,96 +284,104 @@ test("auto update script builders generate npm, source, and docker-compose scrip
 });
 
 test("launchAutoUpdate returns validation failures and starts detached update scripts when runtime is supported", async () => {
-  const unsupported = await autoUpdate.launchAutoUpdate({
-    latest: "3.6.0",
-    env: {
-      AUTO_UPDATE_MODE: "source",
-      AUTO_UPDATE_LOG_PATH: "/tmp/auto-update-source.log",
-    },
-    existsImpl: async () => false,
-  });
-
-  assert.equal(unsupported.started, false);
-  assert.equal(unsupported.channel, "source");
-  assert.match(unsupported.error, /Not a git repository/);
-
-  const sourceSpawnCalls = [];
-  const sourceStarted = await autoUpdate.launchAutoUpdate({
-    latest: "3.6.0",
-    env: {
-      AUTO_UPDATE_MODE: "source",
-      AUTO_UPDATE_GIT_REMOTE: "upstream",
-      AUTO_UPDATE_LOG_PATH: "/tmp/auto-update-source.log",
-    },
-    execFileImpl: async (command, args) => {
-      if (command === "git" && args[0] === "--version") {
-        return { stdout: "git version 2.0", stderr: "" };
-      }
-      throw new Error(`unexpected exec: ${command}`);
-    },
-    existsImpl: async () => true,
-    spawnImpl: (command, args, options) => {
-      sourceSpawnCalls.push({ command, args, options, unrefCalled: false });
-      return {
-        unref() {
-          sourceSpawnCalls[0].unrefCalled = true;
-        },
-      };
-    },
-  });
-
-  assert.equal(sourceStarted.started, true);
-  assert.equal(sourceStarted.channel, "source");
-  assert.equal(sourceStarted.composeCommand, null);
-  assert.equal(sourceSpawnCalls.length, 1);
-  assert.match(sourceSpawnCalls[0].args[1], /git fetch --tags 'upstream'/);
-  assert.match(sourceSpawnCalls[0].args[1], /npm run build/);
-  assert.equal(sourceSpawnCalls[0].unrefCalled, true);
-
+  // Never point AUTO_UPDATE_LOG_PATH at a fixed, world-shared /tmp file: on a
+  // multi-user runner (.113 runs the suite as `root` AND as `runner`) the file
+  // outlives the run owned by whoever created it first and the next
+  // `openSync(logPath, "a")` fails with EACCES for the other user.
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-autoupdate-"));
-  const repoDir = path.join(tempRoot, "repo");
-  const composeFile = path.join(repoDir, "docker-compose.yml");
-  const logPath = path.join(tempRoot, "logs", "auto-update.log");
-  fs.mkdirSync(repoDir, { recursive: true });
-  fs.writeFileSync(composeFile, "services: {}\n");
-
-  const execCalls = [];
-  const spawnCalls = [];
-  const started = await autoUpdate.launchAutoUpdate({
-    latest: "3.6.0",
-    env: {
-      AUTO_UPDATE_MODE: "docker-compose",
-      AUTO_UPDATE_REPO_DIR: repoDir,
-      AUTO_UPDATE_COMPOSE_FILE: composeFile,
-      AUTO_UPDATE_COMPOSE_PROFILE: "cli",
-      AUTO_UPDATE_SERVICE: "omniroute-cli",
-      AUTO_UPDATE_GIT_REMOTE: "origin",
-      AUTO_UPDATE_PATCH_COMMITS: "abc123",
-      AUTO_UPDATE_LOG_PATH: logPath,
-    },
-    execFileImpl: async (command, args) => {
-      execCalls.push([command, args]);
-      if (command === "git" && args[0] === "--version") {
-        return { stdout: "git version 2.0", stderr: "" };
-      }
-      if (command === "docker" && args[0] === "compose") {
-        return { stdout: "Docker Compose version v2", stderr: "" };
-      }
-      throw new Error(`unexpected exec: ${command}`);
-    },
-    spawnImpl: (command, args, options) => {
-      spawnCalls.push({ command, args, options, unrefCalled: false });
-      return {
-        unref() {
-          spawnCalls[0].unrefCalled = true;
-        },
-      };
-    },
-    existsImpl: async (targetPath) =>
-      targetPath === repoDir || targetPath === composeFile || targetPath === "/var/run/docker.sock",
-  });
+  const sourceLogPath = path.join(tempRoot, "auto-update-source.log");
 
   try {
+    const unsupported = await autoUpdate.launchAutoUpdate({
+      latest: "3.6.0",
+      env: {
+        AUTO_UPDATE_MODE: "source",
+        AUTO_UPDATE_LOG_PATH: sourceLogPath,
+      },
+      existsImpl: async () => false,
+    });
+
+    assert.equal(unsupported.started, false);
+    assert.equal(unsupported.channel, "source");
+    assert.match(unsupported.error, /Not a git repository/);
+
+    const sourceSpawnCalls = [];
+    const sourceStarted = await autoUpdate.launchAutoUpdate({
+      latest: "3.6.0",
+      env: {
+        AUTO_UPDATE_MODE: "source",
+        AUTO_UPDATE_GIT_REMOTE: "upstream",
+        AUTO_UPDATE_LOG_PATH: sourceLogPath,
+      },
+      execFileImpl: async (command, args) => {
+        if (command === "git" && args[0] === "--version") {
+          return { stdout: "git version 2.0", stderr: "" };
+        }
+        throw new Error(`unexpected exec: ${command}`);
+      },
+      existsImpl: async () => true,
+      spawnImpl: (command, args, options) => {
+        sourceSpawnCalls.push({ command, args, options, unrefCalled: false });
+        return {
+          unref() {
+            sourceSpawnCalls[0].unrefCalled = true;
+          },
+        };
+      },
+    });
+
+    assert.equal(sourceStarted.started, true);
+    assert.equal(sourceStarted.channel, "source");
+    assert.equal(sourceStarted.composeCommand, null);
+    assert.equal(sourceSpawnCalls.length, 1);
+    assert.match(sourceSpawnCalls[0].args[1], /git fetch --tags 'upstream'/);
+    assert.match(sourceSpawnCalls[0].args[1], /npm run build/);
+    assert.equal(sourceSpawnCalls[0].unrefCalled, true);
+
+    const repoDir = path.join(tempRoot, "repo");
+    const composeFile = path.join(repoDir, "docker-compose.yml");
+    const logPath = path.join(tempRoot, "logs", "auto-update.log");
+    fs.mkdirSync(repoDir, { recursive: true });
+    fs.writeFileSync(composeFile, "services: {}\n");
+
+    const execCalls = [];
+    const spawnCalls = [];
+    const started = await autoUpdate.launchAutoUpdate({
+      latest: "3.6.0",
+      env: {
+        AUTO_UPDATE_MODE: "docker-compose",
+        AUTO_UPDATE_REPO_DIR: repoDir,
+        AUTO_UPDATE_COMPOSE_FILE: composeFile,
+        AUTO_UPDATE_COMPOSE_PROFILE: "cli",
+        AUTO_UPDATE_SERVICE: "omniroute-cli",
+        AUTO_UPDATE_GIT_REMOTE: "origin",
+        AUTO_UPDATE_PATCH_COMMITS: "abc123",
+        AUTO_UPDATE_LOG_PATH: logPath,
+      },
+      execFileImpl: async (command, args) => {
+        execCalls.push([command, args]);
+        if (command === "git" && args[0] === "--version") {
+          return { stdout: "git version 2.0", stderr: "" };
+        }
+        if (command === "docker" && args[0] === "compose") {
+          return { stdout: "Docker Compose version v2", stderr: "" };
+        }
+        throw new Error(`unexpected exec: ${command}`);
+      },
+      spawnImpl: (command, args, options) => {
+        spawnCalls.push({ command, args, options, unrefCalled: false });
+        return {
+          unref() {
+            spawnCalls[0].unrefCalled = true;
+          },
+        };
+      },
+      existsImpl: async (targetPath) =>
+        targetPath === repoDir ||
+        targetPath === composeFile ||
+        targetPath === "/var/run/docker.sock",
+    });
+
     assert.equal(started.started, true);
     assert.equal(started.channel, "docker-compose");
     assert.equal(started.composeCommand, "docker compose");
@@ -391,6 +404,29 @@ test("launchAutoUpdate returns validation failures and starts detached update sc
     assert.equal(spawnCalls[0].unrefCalled, true);
     assert.match(spawnCalls[0].args[1], /git cherry-pick --keep-redundant-commits 'abc123'/);
   } finally {
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test("resolveProjectRoot walks up from start dir to nearest package.json or .git", () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-root-"));
+  const subDir = path.join(tempRoot, "sub", "deep");
+  fs.mkdirSync(subDir, { recursive: true });
+  fs.writeFileSync(path.join(tempRoot, "package.json"), JSON.stringify({ name: "omniroute" }));
+
+  try {
+    // Walking up from a deep subdir that does not have markers must find the real root.
+    assert.equal(autoUpdate.resolveProjectRoot("/fallback", subDir), tempRoot);
+
+    // Walking up from a directory that DOES have package.json returns that directory.
+    assert.equal(autoUpdate.resolveProjectRoot("/fallback", tempRoot), tempRoot);
+
+    // Walking up from /proc/1 — a directory with no parent markers — must return
+    // a real path (either found via walking or the fallback).
+    const lonely = "/proc/1";
+    const lonelyResult = autoUpdate.resolveProjectRoot("/my-fallback", lonely);
+    assert.equal(lonelyResult, "/my-fallback");
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });

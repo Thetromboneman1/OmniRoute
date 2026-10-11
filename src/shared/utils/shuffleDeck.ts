@@ -6,6 +6,8 @@
  * race conditions when concurrent requests hit the same deck simultaneously.
  */
 
+import { secureRandomInt } from "./secureRandom";
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 interface ShuffleDeck {
@@ -28,7 +30,7 @@ const mutexes = new Map<string, Promise<void>>();
 export function fisherYatesShuffle<T>(arr: readonly T[]): T[] {
   const result = [...arr];
   for (let i = result.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = secureRandomInt(i + 1);
     const tmp = result[i];
     result[i] = result[j];
     result[j] = tmp;
@@ -86,7 +88,7 @@ export async function getNextFromDeck(
     const newOrder = fisherYatesShuffle(itemIds);
 
     if (lastUsedId !== undefined && newOrder[0] === lastUsedId && newOrder.length > 1) {
-      const swapIdx = 1 + Math.floor(Math.random() * (newOrder.length - 1));
+      const swapIdx = 1 + secureRandomInt(newOrder.length - 1);
       const tmp = newOrder[0];
       newOrder[0] = newOrder[swapIdx];
       newOrder[swapIdx] = tmp;
@@ -126,7 +128,7 @@ export function getNextFromDeckSync(namespace: string, itemIds: readonly string[
   const newOrder = fisherYatesShuffle(itemIds);
 
   if (lastUsedId !== undefined && newOrder[0] === lastUsedId && newOrder.length > 1) {
-    const swapIdx = 1 + Math.floor(Math.random() * (newOrder.length - 1));
+    const swapIdx = 1 + secureRandomInt(newOrder.length - 1);
     const tmp = newOrder[0];
     newOrder[0] = newOrder[swapIdx];
     newOrder[swapIdx] = tmp;
@@ -134,6 +136,33 @@ export function getNextFromDeckSync(namespace: string, itemIds: readonly string[
 
   decks.set(namespace, { order: newOrder, index: 1, idsKey });
   return newOrder[0];
+}
+
+/** Plan a deck selection without advancing shared state until commit. */
+export function planNextFromDeckSync(namespace: string, itemIds: readonly string[]) {
+  if (itemIds.length === 0) return { selectedId: "", commit: () => {} };
+  if (itemIds.length === 1) return { selectedId: itemIds[0], commit: () => {} };
+
+  const idsKey = [...itemIds].sort().join(",");
+  const existing = decks.get(namespace);
+  if (existing && existing.idsKey === idsKey && existing.index < existing.order.length) {
+    const selectedId = existing.order[existing.index];
+    return {
+      selectedId,
+      commit: () => decks.set(namespace, { ...existing, index: existing.index + 1 }),
+    };
+  }
+
+  const lastUsedId =
+    existing && existing.idsKey === idsKey && existing.order.length > 0
+      ? existing.order[existing.order.length - 1]
+      : undefined;
+  const order = fisherYatesShuffle(itemIds);
+  if (lastUsedId !== undefined && order[0] === lastUsedId && order.length > 1) {
+    const swapIdx = 1 + secureRandomInt(order.length - 1);
+    [order[0], order[swapIdx]] = [order[swapIdx], order[0]];
+  }
+  return { selectedId: order[0], commit: () => decks.set(namespace, { order, index: 1, idsKey }) };
 }
 
 // ─── Test helpers ───────────────────────────────────────────────────────────

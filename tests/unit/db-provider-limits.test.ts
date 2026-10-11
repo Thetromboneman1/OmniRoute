@@ -12,7 +12,7 @@ const providerLimitsDb = await import("../../src/lib/db/providerLimits.ts");
 
 async function resetStorage() {
   coreDb.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -22,13 +22,28 @@ test.beforeEach(async () => {
 
 test.after(() => {
   coreDb.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("providerLimits cache returns empty defaults before any writes", () => {
   assert.equal(providerLimitsDb.getProviderLimitsCache("conn-1"), null);
   assert.deepEqual(providerLimitsDb.getAllProviderLimitsCache(), {});
   assert.equal(providerLimitsDb.setProviderLimitsCacheBatch([]), 0);
+});
+
+test("providerLimits cache preserves Codex banked reset credits", () => {
+  const entry = providerLimitsDb.setProviderLimitsCache("codex-conn", {
+    quotas: { session: { remainingPercentage: 90 } },
+    plan: null,
+    message: null,
+    fetchedAt: "2026-01-01T00:00:00.000Z",
+    source: "sync",
+    bankedResetCredits: 3,
+  });
+
+  assert.equal(entry.bankedResetCredits, 3);
+  assert.equal(providerLimitsDb.getProviderLimitsCache("codex-conn")?.bankedResetCredits, 3);
+  assert.equal(providerLimitsDb.getAllProviderLimitsCache()["codex-conn"]?.bankedResetCredits, 3);
 });
 
 test("providerLimits cache supports single writes, batch writes and deletions", () => {

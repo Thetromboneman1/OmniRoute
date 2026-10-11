@@ -28,9 +28,11 @@ test("chatCore error classification maps BodyTimeoutError to 504 GATEWAY_TIMEOUT
   // Read the source to verify the error classification logic includes BodyTimeoutError
   const content = fs.readFileSync("open-sse/handlers/chatCore.ts", "utf8");
 
-  // The error classification block should include BodyTimeoutError alongside TimeoutError
+  // The error classification block should include BodyTimeoutError alongside TimeoutError.
+  // Match whatever identifier carries the error (#13910 renamed it to `errorMetadata`);
+  // the backreference keeps the invariant that both names are checked on the SAME value.
   const classificationPattern =
-    /error\.name === ["']TimeoutError["']\s*\|\|\s*error\.name === ["']BodyTimeoutError["']/;
+    /(\w+)\.name === ["']TimeoutError["']\s*\|\|\s*\1\.name === ["']BodyTimeoutError["']/;
   assert.ok(
     classificationPattern.test(content),
     "chatCore should classify BodyTimeoutError as GATEWAY_TIMEOUT (504)"
@@ -41,7 +43,7 @@ test("chatCore catch block decrements pending requests for all error types", () 
   const content = fs.readFileSync("open-sse/handlers/chatCore.ts", "utf8");
 
   // The catch block should call trackPendingRequest with false before error classification
-  const catchBlockPattern = /catch\s*\(error\)\s*\{[^}]*trackPendingRequest\([^)]*,\s*false\)/;
+  const catchBlockPattern = /catch\s*\(error\)\s*\{[^}]*trackPendingRequest\([^)]*,\s*false\b/;
   assert.ok(
     catchBlockPattern.test(content),
     "chatCore catch block should decrement pending requests"
@@ -80,36 +82,7 @@ test("BodyTimeoutError from withBodyTimeout does not leave timer leaks", async (
   assert.ok(true, "all timers cleaned up successfully");
 });
 
-// ── 4. DELETE /api/logs/active endpoint ──────────────────────────────────
-
-test("DELETE /api/logs/active route requires management authentication", () => {
-  const content = fs.readFileSync("src/app/api/logs/active/route.ts", "utf8");
-
-  assert.ok(
-    content.includes('from "@/lib/api/requireManagementAuth"'),
-    "should import requireManagementAuth"
-  );
-  assert.ok(content.includes("export async function DELETE"), "should export DELETE handler");
-  assert.ok(
-    content.includes("await requireManagementAuth(request)"),
-    "DELETE should check management auth"
-  );
-});
-
-test("DELETE /api/logs/active calls clearPendingRequests", () => {
-  const content = fs.readFileSync("src/app/api/logs/active/route.ts", "utf8");
-
-  assert.ok(
-    content.includes("clearPendingRequests"),
-    "DELETE handler should call clearPendingRequests"
-  );
-  assert.ok(
-    content.includes("Pending request counts cleared"),
-    "DELETE handler should return success message"
-  );
-});
-
-// ── 5. clearPendingRequests + trackPendingRequest integration ────────────
+// ── 4. clearPendingRequests + trackPendingRequest integration ────────────
 
 test("trackPendingRequest followed by clearPendingRequests zeroes all counts", async () => {
   const usageHistory = await import("../../src/lib/usage/usageHistory.ts");

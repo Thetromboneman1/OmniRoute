@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import {
   Card,
@@ -13,6 +13,7 @@ import {
   Select,
 } from "@/shared/components";
 import { useNotificationStore } from "@/store/notificationStore";
+import { matchesSearch } from "@/shared/utils/turkishText";
 
 type EvalTargetType = "suite-default" | "model" | "combo";
 
@@ -489,27 +490,26 @@ export default function EvalsTab() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    if (targetOptions.length === 0) return;
-    if (targetOptions.some((option) => option.key === selectedTargetKey)) return;
+  // Adjust-during-render (React docs pattern): keep the selected target inside
+  // the current option set, and never compare a target against itself. Both
+  // guards self-extinguish after their setState, so the re-render settles.
+  if (
+    targetOptions.length > 0 &&
+    !targetOptions.some((option) => option.key === selectedTargetKey)
+  ) {
     setSelectedTargetKey(targetOptions[0]?.key || "suite-default:__default__");
-  }, [selectedTargetKey, targetOptions]);
-
-  useEffect(() => {
-    if (!compareTargetKey) return;
-    if (compareTargetKey === selectedTargetKey) {
-      setCompareTargetKey("");
-    }
-  }, [compareTargetKey, selectedTargetKey]);
+  }
+  if (compareTargetKey && compareTargetKey === selectedTargetKey) {
+    setCompareTargetKey("");
+  }
 
   const filteredSuites = !search.trim()
     ? suites
     : suites.filter((suite) => {
-        const term = search.toLowerCase();
         return (
-          suite.name?.toLowerCase().includes(term) ||
-          suite.id?.toLowerCase().includes(term) ||
-          suite.description?.toLowerCase().includes(term)
+          matchesSearch(suite.name ?? "", search) ||
+          matchesSearch(suite.id ?? "", search) ||
+          matchesSearch(suite.description ?? "", search)
         );
       });
 
@@ -1846,7 +1846,11 @@ export default function EvalsTab() {
   );
 }
 
-function HeroSection({ t }: { t: (key: string, values?: Record<string, unknown>) => string }) {
+const HeroSection = memo(function HeroSection({
+  t,
+}: {
+  t: (key: string, values?: Record<string, unknown>) => string;
+}) {
   return (
     <Card className="p-0 overflow-hidden">
       <div
@@ -1892,7 +1896,7 @@ function HeroSection({ t }: { t: (key: string, values?: Record<string, unknown>)
       </div>
     </Card>
   );
-}
+});
 
 function SuiteBuilderModal({
   draft,

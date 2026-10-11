@@ -1,6 +1,6 @@
 /**
  * db/jsonMigration.ts — Shared helper to hydrate an SQLite database from a
- * legacy 9router / OmniRoute JSON backup object.
+ * legacy OmniRoute JSON backup object.
  *
  * Used by:
  *  - db/core.ts  (auto-migration at startup when db.json is found)
@@ -11,9 +11,19 @@
  * here, so this function never touches authentication configuration.
  */
 
-import type Database from "better-sqlite3";
+import type { SqliteAdapter } from "./adapters/types";
+import { normalizeRoutingStrategy } from "@/shared/constants/routingStrategies";
+import { normalizeComboRecord } from "@/lib/combos/steps";
+import { validateComboInvariant } from "@/lib/combos/invariants";
+import { parseModelAccessMode } from "./apiKeys/modelAccessMode";
+import { serializeJsonField } from "./providers/columns";
+import {
+  resolveImportedUsageAccountIdentity,
+  resolveOrphanedUsageAccountIdentity,
+  resolveUsageAccountIdentity,
+} from "@/lib/usage/accountIdentity";
 
-type SqliteDatabase = InstanceType<typeof Database>;
+type SqliteDatabase = SqliteAdapter;
 
 export interface LegacyJsonData {
   providerConnections?: Record<string, unknown>[];
@@ -31,6 +41,9 @@ export interface LegacyJsonData {
     combos?: unknown;
     keys?: unknown;
   };
+  usageHistory?: Record<string, unknown>[];
+  domainCostHistory?: Record<string, unknown>[];
+  domainBudgets?: Record<string, unknown>[];
 }
 
 /**
@@ -42,7 +55,15 @@ export interface LegacyJsonData {
 export function runJsonMigration(
   db: SqliteDatabase,
   data: LegacyJsonData
-): { connections: number; nodes: number; combos: number; apiKeys: number } {
+): {
+  connections: number;
+  nodes: number;
+  combos: number;
+  apiKeys: number;
+  usageHistory: number;
+  domainCostHistory: number;
+  domainBudgets: number;
+} {
   const insertConn = db.prepare(`
     INSERT OR REPLACE INTO provider_connections (
       id, provider, auth_type, name, email, priority, is_active,
@@ -52,7 +73,8 @@ export function runJsonMigration(
       rate_limited_until, health_check_interval, last_health_check_at,
       last_tested, api_key, id_token, provider_specific_data,
       expires_in, display_name, global_priority, default_model,
-      token_type, consecutive_use_count, rate_limit_protection, last_used_at, created_at, updated_at
+      token_type, consecutive_use_count, rate_limit_protection, last_used_at,
+      rate_limit_overrides_json, created_at, updated_at
     ) VALUES (
       @id, @provider, @authType, @name, @email, @priority, @isActive,
       @accessToken, @refreshToken, @expiresAt, @tokenExpiresAt,
@@ -61,7 +83,8 @@ export function runJsonMigration(
       @rateLimitedUntil, @healthCheckInterval, @lastHealthCheckAt,
       @lastTested, @apiKey, @idToken, @providerSpecificData,
       @expiresIn, @displayName, @globalPriority, @defaultModel,
-      @tokenType, @consecutiveUseCount, @rateLimitProtection, @lastUsedAt, @createdAt, @updatedAt
+      @tokenType, @consecutiveUseCount, @rateLimitProtection, @lastUsedAt,
+      @rateLimitOverridesJson, @createdAt, @updatedAt
     )
   `);
 
@@ -80,13 +103,31 @@ export function runJsonMigration(
   `);
 
   const insertKey = db.prepare(`
-    INSERT OR REPLACE INTO api_keys (id, name, key, machine_id, allowed_models, no_log, created_at)
-    VALUES (@id, @name, @key, @machineId, @allowedModels, @noLog, @createdAt)
+    INSERT OR REPLACE INTO api_keys (
+      id, name, key, machine_id, model_access_mode, allowed_models, no_log, created_at
+    ) VALUES (
+      @id, @name, @key, @machineId, @modelAccessMode, @allowedModels, @noLog, @createdAt
+    )
   `);
+
+  const selectExistingOverrides = db.prepare(
+    "SELECT rate_limit_overrides_json FROM provider_connections WHERE id = ?"
+  );
 
   const migrate = db.transaction(() => {
     // 1. Provider Connections
     for (const conn of data.providerConnections ?? []) {
+      // Preserve operator overrides when the backup carries none: INSERT OR
+      // REPLACE would otherwise reset the column to NULL. Executed inside
+      // the transaction and reinjected into the INSERT - never a 2nd UPDATE.
+      const hasOverrides = conn.rateLimitOverrides != null;
+      let rateLimitOverridesJson = serializeJsonField(conn.rateLimitOverrides);
+      if (!hasOverrides && typeof conn.id === "string") {
+        const existing = selectExistingOverrides.get(conn.id) as
+          | { rate_limit_overrides_json: string | null }
+          | undefined;
+        if (existing) rateLimitOverridesJson = existing.rate_limit_overrides_json;
+      }
       insertConn.run({
         id: conn.id,
         provider: conn.provider,
@@ -126,6 +167,7 @@ export function runJsonMigration(
         lastUsedAt: conn.lastUsedAt ?? null,
         rateLimitProtection:
           conn.rateLimitProtection === true || conn.rateLimitProtection === 1 ? 1 : 0,
+        rateLimitOverridesJson,
         createdAt: conn.createdAt ?? new Date().toISOString(),
         updatedAt: conn.updatedAt ?? new Date().toISOString(),
       });
@@ -172,10 +214,22 @@ export function runJsonMigration(
 
     // 5. Combos
     for (const [index, combo] of (data.combos ?? []).entries()) {
-      const normalizedCombo = {
+      const config =
+        combo.config && typeof combo.config === "object" && !Array.isArray(combo.config)
+          ? { ...(combo.config as Record<string, unknown>) }
+          : combo.config;
+      if (config && typeof config === "object" && !Array.isArray(config) && "strategy" in config) {
+        (config as Record<string, unknown>).strategy = normalizeRoutingStrategy(
+          (config as Record<string, unknown>).strategy
+        );
+      }
+      const normalizedCombo: Record<string, unknown> = normalizeComboRecord({
         ...combo,
+        strategy: normalizeRoutingStrategy(combo.strategy),
+        config,
         sortOrder: typeof combo.sortOrder === "number" ? combo.sortOrder : index + 1,
-      };
+      });
+      validateComboInvariant(normalizedCombo);
       insertCombo.run({
         id: normalizedCombo.id,
         name: normalizedCombo.name,
@@ -188,15 +242,115 @@ export function runJsonMigration(
 
     // 6. API Keys
     for (const apiKey of data.apiKeys ?? []) {
+      const allowedModels = Array.isArray(apiKey.allowedModels) ? apiKey.allowedModels : [];
       insertKey.run({
         id: apiKey.id,
         name: apiKey.name,
         key: apiKey.key,
         machineId: apiKey.machineId ?? null,
-        allowedModels: JSON.stringify(apiKey.allowedModels ?? []),
+        modelAccessMode: parseModelAccessMode(apiKey.modelAccessMode, allowedModels),
+        allowedModels: JSON.stringify(allowedModels),
         noLog: apiKey.noLog ? 1 : 0,
         createdAt: apiKey.createdAt ?? new Date().toISOString(),
       });
+    }
+    // 7. Usage History
+    if (data.usageHistory && data.usageHistory.length > 0) {
+      const importedConnections = new Map(
+        (data.providerConnections ?? []).map((connection) => [connection.id, connection])
+      );
+      const insertUsageHistory = db.prepare(`
+        INSERT OR REPLACE INTO usage_history (
+          id, provider, model, connection_id, account_key, account_label, account_label_priority,
+          api_key_id, api_key_name, tokens_input, tokens_output, tokens_cache_read,
+          tokens_cache_creation, tokens_reasoning, status, success, latency_ms, ttft_ms,
+          error_code, combo_strategy, timestamp
+        ) VALUES (
+          @id, @provider, @model, @connection_id, @account_key, @account_label,
+          @account_label_priority, @api_key_id, @api_key_name, @tokens_input, @tokens_output,
+          @tokens_cache_read, @tokens_cache_creation, @tokens_reasoning, @status, @success,
+          @latency_ms, @ttft_ms, @error_code, @combo_strategy, @timestamp
+        )
+      `);
+      for (const row of data.usageHistory) {
+        const connectionId = row.connection_id ?? row.connectionId ?? null;
+        const connection = connectionId ? importedConnections.get(connectionId) : undefined;
+        const fallbackIdentity = connection
+          ? resolveUsageAccountIdentity(connection)
+          : resolveOrphanedUsageAccountIdentity(row.provider, connectionId);
+        const identity = resolveImportedUsageAccountIdentity(row, fallbackIdentity);
+        insertUsageHistory.run({
+          id: row.id,
+          provider: row.provider ?? null,
+          model: row.model ?? null,
+          connection_id: connectionId,
+          account_key: identity.accountKey,
+          account_label: identity.accountLabel,
+          account_label_priority: identity.accountLabelPriority,
+          api_key_id: row.api_key_id ?? null,
+          api_key_name: row.api_key_name ?? null,
+          tokens_input: row.tokens_input ?? 0,
+          tokens_output: row.tokens_output ?? 0,
+          tokens_cache_read: row.tokens_cache_read ?? 0,
+          tokens_cache_creation: row.tokens_cache_creation ?? 0,
+          tokens_reasoning: row.tokens_reasoning ?? 0,
+          status: row.status ?? null,
+          success: row.success ?? 1,
+          latency_ms: row.latency_ms ?? 0,
+          ttft_ms: row.ttft_ms ?? 0,
+          error_code: row.error_code ?? null,
+          combo_strategy: row.combo_strategy ?? "direct",
+          timestamp: row.timestamp,
+        });
+      }
+    }
+
+    // 8. Domain Cost History
+    if (data.domainCostHistory && data.domainCostHistory.length > 0) {
+      const insertCostHistory = db.prepare(`
+        INSERT OR REPLACE INTO domain_cost_history (
+          id, api_key_id, cost, timestamp
+        ) VALUES (
+          @id, @api_key_id, @cost, @timestamp
+        )
+      `);
+      for (const row of data.domainCostHistory) {
+        insertCostHistory.run({
+          id: row.id,
+          api_key_id: row.api_key_id,
+          cost: row.cost,
+          timestamp: row.timestamp,
+        });
+      }
+    }
+    // 9. Domain Budgets
+    if (data.domainBudgets && data.domainBudgets.length > 0) {
+      const insertBudgets = db.prepare(`
+        INSERT OR REPLACE INTO domain_budgets (
+          api_key_id, daily_limit_usd, weekly_limit_usd, monthly_limit_usd,
+          warning_threshold, reset_interval, reset_time, budget_reset_at,
+          last_budget_reset_at, warning_emitted_at, warning_period_start
+        ) VALUES (
+          @api_key_id, @daily_limit_usd, @weekly_limit_usd, @monthly_limit_usd,
+          @warning_threshold, @reset_interval, @reset_time, @budget_reset_at,
+          @last_budget_reset_at, @warning_emitted_at, @warning_period_start
+        )
+      `);
+      for (const row of data.domainBudgets) {
+        insertBudgets.run({
+          api_key_id: row.api_key_id,
+          daily_limit_usd: row.daily_limit_usd,
+          weekly_limit_usd: row.weekly_limit_usd ?? 0,
+          monthly_limit_usd: row.monthly_limit_usd ?? 0,
+          warning_threshold: row.warning_threshold ?? 0.8,
+          reset_interval: row.reset_interval ?? "daily",
+          reset_time: row.reset_time ?? "00:00",
+          budget_reset_at: row.budget_reset_at ?? null,
+          last_budget_reset_at: row.last_budget_reset_at ?? null,
+          warning_emitted_at: row.warning_emitted_at ?? null,
+          warning_period_start: row.warning_period_start ?? null,
+        });
+      }
     }
   });
 
@@ -207,5 +361,8 @@ export function runJsonMigration(
     nodes: (data.providerNodes ?? []).length,
     combos: (data.combos ?? []).length,
     apiKeys: (data.apiKeys ?? []).length,
+    usageHistory: (data.usageHistory ?? []).length,
+    domainCostHistory: (data.domainCostHistory ?? []).length,
+    domainBudgets: (data.domainBudgets ?? []).length,
   };
 }

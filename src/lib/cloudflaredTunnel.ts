@@ -1,4 +1,5 @@
 import { spawn, execFile } from "child_process";
+import { createHash } from "crypto";
 import { promisify } from "util";
 import fs from "fs/promises";
 import fsSync from "fs";
@@ -9,8 +10,8 @@ import { getRuntimePorts } from "@/lib/runtime/ports";
 
 const execFileAsync = promisify(execFile);
 
-const CLOUDFLARED_RELEASE_BASE =
-  "https://github.com/cloudflare/cloudflared/releases/latest/download";
+const CLOUDFLARED_RELEASE_API_URL =
+  "https://api.github.com/repos/cloudflare/cloudflared/releases/latest";
 const START_TIMEOUT_MS = 30000;
 const STOP_TIMEOUT_MS = 5000;
 const GENERIC_EXIT_ERROR_PREFIX = "cloudflared exited";
@@ -33,7 +34,11 @@ type AssetSpec = {
   assetName: string;
   binaryName: string;
   archive: "none" | "tgz";
+};
+
+type ResolvedAssetSpec = AssetSpec & {
   downloadUrl: string;
+  expectedSha256: string;
 };
 
 type CloudflaredRuntimeDirs = {
@@ -66,6 +71,11 @@ type PersistedTunnelState = {
   lastError?: string | null;
   startedAt?: string | null;
   installedAt?: string | null;
+};
+
+export type CloudflaredNamedTunnelConfig = {
+  configPath: string;
+  hostname: string | null;
 };
 
 export type CloudflaredTunnelStatus = {
@@ -129,6 +139,7 @@ let tunnelProcess: ReturnType<typeof spawn> | null = null;
 let tunnelPid: number | null = null;
 let installPromise: Promise<string> | null = null;
 let startPromise: Promise<CloudflaredTunnelStatus> | null = null;
+let stateFileQueue: Promise<void> = Promise.resolve();
 const NON_ACTIONABLE_CLOUDFLARED_WARNING_PATTERNS = [
   /failed to sufficiently increase receive buffer size/i,
 ] as const;
@@ -199,15 +210,36 @@ async function readStateFile(): Promise<PersistedTunnelState> {
     return {};
   }
 }
+async function writeStateFileNow(state: PersistedTunnelState) {
+  const stateFilePath = getStateFilePath();
+  await fs.mkdir(path.dirname(stateFilePath), { recursive: true });
+  await fs.writeFile(stateFilePath, JSON.stringify(state, null, 2) + "\n", "utf8");
+}
+
+async function withStateFileLock<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = stateFileQueue;
+  let release!: () => void;
+  stateFileQueue = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
 
 async function writeStateFile(state: PersistedTunnelState) {
-  await ensureTunnelDir();
-  await fs.writeFile(getStateFilePath(), JSON.stringify(state, null, 2) + "\n", "utf8");
+  await withStateFileLock(() => writeStateFileNow(state));
 }
 
 async function updateStateFile(patch: PersistedTunnelState) {
-  const current = await readStateFile();
-  await writeStateFile({ ...current, ...patch });
+  await withStateFileLock(async () => {
+    const current = await readStateFile();
+    await writeStateFileNow({ ...current, ...patch });
+  });
 }
 
 async function clearPidFile() {
@@ -261,6 +293,79 @@ export function extractTryCloudflareUrl(text: string) {
   }
 
   return match[0];
+}
+
+/**
+ * Normalize an operator-supplied public hostname into an `https://host[:port]`
+ * origin. Accepts a bare host (`omniroute.example.com`) or a full URL and
+ * returns `null` for empty/invalid input.
+ */
+export function normalizeCloudflaredHostname(
+  rawHostname: string | null | undefined
+): string | null {
+  const value = String(rawHostname || "").trim();
+  if (!value) return null;
+
+  const candidate = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+  try {
+    const url = new URL(candidate);
+    if (!url.hostname) return null;
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve named/persistent tunnel configuration from the environment. Presence
+ * of `CLOUDFLARED_CONFIG` (a path to a locally-managed cloudflared `config.yml`
+ * with `tunnel:`, `credentials-file:`, and `ingress:` entries) is what switches
+ * the tunnel out of ephemeral quick-tunnel mode. `CLOUDFLARED_HOSTNAME` is an
+ * optional override for the public hostname OmniRoute reports as the tunnel's
+ * `publicUrl`/`apiUrl`; when unset it is read from the config's first `ingress`
+ * hostname (a named tunnel emits no `*.trycloudflare.com` URL to scrape).
+ * Returns `null` when no config is set (quick-tunnel mode).
+ */
+export function getCloudflaredNamedTunnelConfig(
+  sourceEnv: NodeJS.ProcessEnv = process.env
+): CloudflaredNamedTunnelConfig | null {
+  const configPath = String(sourceEnv.CLOUDFLARED_CONFIG || "").trim();
+  if (!configPath) return null;
+
+  return {
+    configPath,
+    hostname: normalizeCloudflaredHostname(sourceEnv.CLOUDFLARED_HOSTNAME),
+  };
+}
+
+/**
+ * Extract the first `ingress` hostname from a cloudflared `config.yml` body, so
+ * OmniRoute can report a named tunnel's public URL without the operator having
+ * to repeat the hostname in `CLOUDFLARED_HOSTNAME`. Skips comments and the
+ * catch-all rule; returns `null` when no routable hostname is present.
+ */
+export function extractCloudflaredHostnameFromConfig(configText: string): string | null {
+  for (const rawLine of String(configText || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const match = line.match(/^-?\s*hostname:\s*["']?([^"'#\s]+)/i);
+    if (match && match[1]) {
+      return normalizeCloudflaredHostname(match[1]);
+    }
+  }
+  return null;
+}
+
+/**
+ * Detect the stable cloudflared log line emitted once a named tunnel has an
+ * active edge connection. Used as the readiness signal for named tunnels, which
+ * (unlike quick tunnels) never print a public URL to stdout/stderr.
+ */
+export function extractCloudflaredConnectionReady(text: string): boolean {
+  const value = String(text || "");
+  return (
+    /Registered tunnel connection/i.test(value) || /Connection [0-9a-f-]+ registered/i.test(value)
+  );
 }
 
 function normalizeCloudflaredLogLine(line: string) {
@@ -358,7 +463,18 @@ export function buildCloudflaredChildEnv(
   return childEnv;
 }
 
-export function getCloudflaredStartArgs(targetUrl: string) {
+export function getCloudflaredStartArgs(
+  targetUrl: string,
+  namedTunnel: CloudflaredNamedTunnelConfig | null = null
+) {
+  if (namedTunnel) {
+    // Named/persistent tunnel (locally-managed): run the tunnel defined by the
+    // operator's cloudflared config.yml. The config supplies the tunnel UUID,
+    // credentials-file, and ingress routing (which host maps to which local
+    // service), so no `--url` target is passed here. `run` reads credentials
+    // from the config's absolute `credentials-file` path — no `cert.pem` needed.
+    return ["tunnel", "--no-autoupdate", "--config", namedTunnel.configPath, "run"];
+  }
   return ["tunnel", "--url", targetUrl, "--no-autoupdate"];
 }
 
@@ -401,7 +517,7 @@ export function getCloudflaredAssetSpec(
   platform = process.platform,
   arch = process.arch
 ): AssetSpec | null {
-  const matrix: Record<string, Record<string, Omit<AssetSpec, "downloadUrl">>> = {
+  const matrix: Record<string, Record<string, AssetSpec>> = {
     linux: {
       x64: {
         assetName: "cloudflared-linux-amd64",
@@ -443,9 +559,75 @@ export function getCloudflaredAssetSpec(
   const spec = matrix[platform]?.[arch];
   if (!spec) return null;
 
+  return spec;
+}
+
+export function getSha256FromGitHubDigest(digest: string): string | null {
+  const prefix = "sha256:";
+  if (!digest.toLowerCase().startsWith(prefix)) return null;
+
+  const value = digest.slice(prefix.length);
+  if (value.length !== 64) return null;
+  for (const char of value) {
+    const code = char.charCodeAt(0);
+    const digit = code >= 48 && code <= 57;
+    const lowerHex = code >= 97 && code <= 102;
+    const upperHex = code >= 65 && code <= 70;
+    if (!digit && !lowerHex && !upperHex) return null;
+  }
+
+  return value.toLowerCase();
+}
+
+export function verifyCloudflaredDownloadDigest(
+  buffer: Buffer,
+  expectedSha256: string,
+  assetName = "cloudflared"
+): void {
+  const actualSha256 = createHash("sha256").update(buffer).digest("hex");
+  if (actualSha256 !== expectedSha256.toLowerCase()) {
+    throw new Error(
+      `cloudflared download checksum mismatch for ${assetName}: expected ${expectedSha256}, got ${actualSha256}`
+    );
+  }
+}
+
+async function resolveCloudflaredDownloadSpec(spec: AssetSpec): Promise<ResolvedAssetSpec> {
+  const response = await proxyFetch(CLOUDFLARED_RELEASE_API_URL, {
+    headers: { Accept: "application/vnd.github+json" },
+    redirect: "follow",
+  });
+  if (!response.ok) {
+    throw new Error(
+      `Failed to resolve cloudflared release metadata with status ${response.status}`
+    );
+  }
+
+  const release = (await response.json()) as { assets?: unknown };
+  const assets = Array.isArray(release.assets) ? release.assets : [];
+  const asset = assets
+    .map((entry) =>
+      entry && typeof entry === "object" ? (entry as Record<string, unknown>) : null
+    )
+    .find((entry) => entry?.name === spec.assetName);
+
+  if (!asset) {
+    throw new Error(`cloudflared release asset not found: ${spec.assetName}`);
+  }
+
+  const downloadUrl =
+    typeof asset.browser_download_url === "string" ? asset.browser_download_url : "";
+  const digest = typeof asset.digest === "string" ? asset.digest : "";
+  const expectedSha256 = getSha256FromGitHubDigest(digest);
+
+  if (!downloadUrl || !expectedSha256) {
+    throw new Error(`cloudflared release asset ${spec.assetName} is missing a sha256 digest`);
+  }
+
   return {
     ...spec,
-    downloadUrl: `${CLOUDFLARED_RELEASE_BASE}/${spec.assetName}`,
+    downloadUrl,
+    expectedSha256,
   };
 }
 
@@ -488,13 +670,19 @@ async function extractArchive(archivePath: string, destinationDir: string) {
   await execFileAsync("tar", ["-xzf", archivePath, "-C", destinationDir], { timeout: 15000 });
 }
 
-async function downloadToFile(url: string, destinationPath: string) {
+async function downloadToFile(
+  url: string,
+  destinationPath: string,
+  expectedSha256: string,
+  assetName: string
+) {
   const response = await proxyFetch(url, { redirect: "follow" });
   if (!response.ok) {
     throw new Error(`Download failed with status ${response.status}`);
   }
 
   const buffer = Buffer.from(await response.arrayBuffer());
+  verifyCloudflaredDownloadDigest(buffer, expectedSha256, assetName);
   await fs.writeFile(destinationPath, buffer);
 }
 
@@ -525,7 +713,13 @@ async function installManagedBinary() {
     });
 
     try {
-      await downloadToFile(spec.downloadUrl, tempDownloadPath);
+      const downloadSpec = await resolveCloudflaredDownloadSpec(spec);
+      await downloadToFile(
+        downloadSpec.downloadUrl,
+        tempDownloadPath,
+        downloadSpec.expectedSha256,
+        downloadSpec.assetName
+      );
 
       if (spec.archive === "tgz") {
         await extractArchive(tempDownloadPath, path.dirname(managedBinaryPath));
@@ -690,6 +884,27 @@ export async function startCloudflaredTunnel(): Promise<CloudflaredTunnelStatus>
 
     const binary = await ensureBinary();
     const targetUrl = getLocalTargetUrl();
+    const namedTunnel = getCloudflaredNamedTunnelConfig();
+
+    if (namedTunnel) {
+      // Fail fast with a clear message instead of a 30s readiness timeout when
+      // CLOUDFLARED_CONFIG points at a missing/unreadable file.
+      try {
+        await fs.access(namedTunnel.configPath);
+      } catch {
+        throw new Error(`cloudflared config file not found: ${namedTunnel.configPath}`);
+      }
+      // If the operator didn't set CLOUDFLARED_HOSTNAME, read the public hostname
+      // from the config's first ingress rule so we can still report publicUrl.
+      if (!namedTunnel.hostname) {
+        try {
+          const configText = await fs.readFile(namedTunnel.configPath, "utf8");
+          namedTunnel.hostname = extractCloudflaredHostnameFromConfig(configText);
+        } catch {
+          // Non-fatal: the tunnel can still run, we just can't report its URL.
+        }
+      }
+    }
 
     await stopExistingTunnel();
     await ensureTunnelDir();
@@ -709,10 +924,15 @@ export async function startCloudflaredTunnel(): Promise<CloudflaredTunnelStatus>
       startedAt: new Date().toISOString(),
     });
 
-    const child = spawn(binary.binaryPath as string, getCloudflaredStartArgs(targetUrl), {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: buildCloudflaredChildEnv(),
-    });
+    const child = spawn(
+      binary.binaryPath as string,
+      getCloudflaredStartArgs(targetUrl, namedTunnel),
+      {
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: buildCloudflaredChildEnv(),
+      }
+    );
 
     tunnelProcess = child;
     tunnelPid = child.pid ?? null;
@@ -749,6 +969,28 @@ export async function startCloudflaredTunnel(): Promise<CloudflaredTunnelStatus>
             lastError: errorMessage,
           });
         }
+
+        if (namedTunnel) {
+          // Named tunnels never print a public URL; treat the first registered
+          // edge connection as ready and report the operator-configured hostname
+          // (if any) as the public URL.
+          if (!extractCloudflaredConnectionReady(text)) return;
+
+          const publicUrl = namedTunnel.hostname;
+          await updateStateFile({
+            ownerPid: process.pid,
+            pid: child.pid,
+            publicUrl,
+            apiUrl: getTunnelApiUrl(publicUrl),
+            status: "running",
+            lastError: null,
+          });
+
+          const namedStatus = await getCloudflaredTunnelStatus();
+          settle(() => resolve(namedStatus));
+          return;
+        }
+
         const url = extractTryCloudflareUrl(text);
         if (!url) return;
 
@@ -773,12 +1015,14 @@ export async function startCloudflaredTunnel(): Promise<CloudflaredTunnelStatus>
         void handleOutput("stderr", chunk);
       });
 
+      const readySubject = namedTunnel ? "connection" : "URL";
+
       child.once("exit", (code, signal) => {
         void finalizeProcessExit(code, signal);
         settle(() =>
           reject(
             new Error(
-              `cloudflared exited before tunnel URL was ready (${code ?? "signal"}${signal ? `/${signal}` : ""})`
+              `cloudflared exited before tunnel ${readySubject} was ready (${code ?? "signal"}${signal ? `/${signal}` : ""})`
             )
           )
         );
@@ -786,7 +1030,9 @@ export async function startCloudflaredTunnel(): Promise<CloudflaredTunnelStatus>
 
       timeout = setTimeout(async () => {
         await stopExistingTunnel();
-        settle(() => reject(new Error("Timed out while waiting for Cloudflare tunnel URL")));
+        settle(() =>
+          reject(new Error(`Timed out while waiting for Cloudflare tunnel ${readySubject}`))
+        );
       }, START_TIMEOUT_MS);
     });
 

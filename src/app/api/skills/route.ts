@@ -3,6 +3,8 @@ import { skillRegistry } from "@/lib/skills/registry";
 import { parsePaginationParams, buildPaginatedResponse } from "@/shared/types/pagination";
 import { getSkillsProviderSetting } from "@/lib/skills/providerSettings";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { matchesSearch } from "@/shared/utils/turkishText";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 const POPULAR_BY_PROVIDER = {
   skillsmp: ["web-search", "file-reader", "sql-assistant", "devops-helper", "docs-assistant"],
@@ -18,7 +20,7 @@ export async function GET(request?: Request) {
     const provider = await getSkillsProviderSetting();
     const url = request?.url || "http://localhost/api/skills";
     const parsedUrl = new URL(url);
-    const query = parsedUrl.searchParams.get("q")?.trim().toLowerCase() || "";
+    const query = parsedUrl.searchParams.get("q")?.trim() || "";
     const modeFilter = parsedUrl.searchParams.get("mode");
     const sourceFilter = parsedUrl.searchParams.get("source");
 
@@ -26,11 +28,11 @@ export async function GET(request?: Request) {
 
     if (query) {
       allSkills = allSkills.filter((skill) => {
-        const tags = Array.isArray(skill.tags) ? skill.tags.join(" ").toLowerCase() : "";
+        const tagsText = Array.isArray(skill.tags) ? skill.tags.join(" ") : "";
         return (
-          skill.name.toLowerCase().includes(query) ||
-          skill.description.toLowerCase().includes(query) ||
-          tags.includes(query)
+          matchesSearch(skill.name, query) ||
+          matchesSearch(skill.description, query) ||
+          matchesSearch(tagsText, query)
         );
       });
     }
@@ -55,7 +57,7 @@ export async function GET(request?: Request) {
       popularDefaults: POPULAR_BY_PROVIDER[provider],
     });
   } catch (err: unknown) {
-    const error = err instanceof Error ? err.message : String(err);
+    const error = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));
     return NextResponse.json({ error }, { status: 500 });
   }
 }

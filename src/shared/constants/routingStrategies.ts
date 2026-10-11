@@ -1,17 +1,84 @@
-export type RoutingStrategyValue =
-  | "priority"
-  | "weighted"
-  | "round-robin"
-  | "context-relay"
-  | "fill-first"
-  | "p2c"
-  | "random"
-  | "least-used"
-  | "cost-optimized"
-  | "strict-random"
-  | "auto"
-  | "context-optimized"
-  | "lkgp";
+export const ROUTING_STRATEGY_VALUES = [
+  "priority",
+  "weighted",
+  "round-robin",
+  "context-relay",
+  "fill-first",
+  "p2c",
+  "random",
+  "least-used",
+  "cost-optimized",
+  "reset-aware",
+  "reset-window",
+  "headroom",
+  "quota-weighted",
+  "strict-random",
+  "auto",
+  "lkgp",
+  "context-optimized",
+  "cache-optimized",
+  "fusion",
+  "pipeline",
+] as const;
+
+export type RoutingStrategyValue = (typeof ROUTING_STRATEGY_VALUES)[number];
+
+/**
+ * Internal-only routing strategy values. These are used by system-generated
+ * combos (e.g. the auto-minted quota-share `qtSd/` combos) and are NEVER exposed
+ * in the UI or user-facing API — deliberately kept OUT of ROUTING_STRATEGY_VALUES
+ * and ROUTING_STRATEGIES so they never appear as a selectable option.
+ */
+export const INTERNAL_ROUTING_STRATEGY_VALUES = ["quota-share"] as const;
+
+export type InternalRoutingStrategyValue = (typeof INTERNAL_ROUTING_STRATEGY_VALUES)[number];
+
+/** Any routing strategy value, including internal ones. Used for combo dispatch. */
+export type AnyRoutingStrategyValue = RoutingStrategyValue | InternalRoutingStrategyValue;
+
+export const AUTO_ROUTING_STRATEGY_VALUES = [
+  "rules",
+  "score",
+  "cost",
+  "eco",
+  "latency",
+  "fast",
+  "sla-aware",
+  "sla",
+  "lkgp",
+] as const;
+
+export type AutoRoutingStrategyValue = (typeof AUTO_ROUTING_STRATEGY_VALUES)[number];
+
+export const ACCOUNT_FALLBACK_STRATEGY_VALUES = [
+  "priority",
+  "weighted",
+  "fill-first",
+  "round-robin",
+  "p2c",
+  "random",
+  "least-used",
+  "cost-optimized",
+  "expiry-first",
+  "strict-random",
+] as const;
+
+export type AccountFallbackStrategyValue = (typeof ACCOUNT_FALLBACK_STRATEGY_VALUES)[number];
+
+export function normalizeRoutingStrategy(value: unknown): AnyRoutingStrategyValue {
+  if (typeof value !== "string") return "priority";
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "usage") return "least-used";
+  if (normalized === "context") return "context-optimized";
+  if (normalized === "weekly-reset" || normalized === "reset-window-order") return "reset-window";
+  // Internal strategies (e.g. quota-share) are preserved verbatim, never stripped
+  // to "priority", so system-minted combos resolve to their dedicated dispatch.
+  if ((INTERNAL_ROUTING_STRATEGY_VALUES as readonly string[]).includes(normalized))
+    return normalized as InternalRoutingStrategyValue;
+  return (ROUTING_STRATEGY_VALUES as readonly string[]).includes(normalized)
+    ? (normalized as RoutingStrategyValue)
+    : "priority";
+}
 
 type RoutingStrategyOption = {
   value: RoutingStrategyValue;
@@ -86,6 +153,34 @@ export const ROUTING_STRATEGIES: RoutingStrategyOption[] = [
     icon: "savings",
   },
   {
+    value: "reset-aware",
+    labelKey: "resetAware",
+    combosDescKey: "resetAwareDesc",
+    settingsDescKey: "resetAwareDesc",
+    icon: "event_repeat",
+  },
+  {
+    value: "reset-window",
+    labelKey: "resetWindow",
+    combosDescKey: "resetWindowDesc",
+    settingsDescKey: "resetWindowDesc",
+    icon: "schedule",
+  },
+  {
+    value: "headroom",
+    labelKey: "headroom",
+    combosDescKey: "headroomDesc",
+    settingsDescKey: "headroomDesc",
+    icon: "battery_charging_full",
+  },
+  {
+    value: "quota-weighted",
+    labelKey: "quotaWeighted",
+    combosDescKey: "quotaWeightedDesc",
+    settingsDescKey: "quotaWeightedDesc",
+    icon: "pie_chart",
+  },
+  {
     value: "strict-random",
     labelKey: "strictRandom",
     combosDescKey: "strictRandomDesc",
@@ -113,19 +208,27 @@ export const ROUTING_STRATEGIES: RoutingStrategyOption[] = [
     settingsDescKey: "contextOptDesc",
     icon: "text_snippet",
   },
+  {
+    value: "cache-optimized",
+    labelKey: "cacheOpt",
+    combosDescKey: "cacheOptimizedDesc",
+    settingsDescKey: "cacheOptDesc",
+    icon: "cached",
+  },
+  {
+    value: "fusion",
+    labelKey: "fusion",
+    combosDescKey: "fusionDesc",
+    settingsDescKey: "fusionDesc",
+    icon: "hub",
+  },
+  {
+    value: "pipeline",
+    labelKey: "pipeline",
+    combosDescKey: "pipelineDesc",
+    settingsDescKey: "pipelineDesc",
+    icon: "linear_scale",
+  },
 ];
 
-export const SETTINGS_FALLBACK_STRATEGY_VALUES: RoutingStrategyValue[] = [
-  "priority",
-  "weighted",
-  "fill-first",
-  "round-robin",
-  "p2c",
-  "random",
-  "least-used",
-  "cost-optimized",
-  "strict-random",
-  "auto",
-  "context-optimized",
-  "lkgp",
-];
+export const SETTINGS_FALLBACK_STRATEGY_VALUES = ACCOUNT_FALLBACK_STRATEGY_VALUES;

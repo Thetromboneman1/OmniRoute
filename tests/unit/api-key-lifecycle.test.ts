@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { cleanupTempDataDir } from "../_setup/tempDataDir.ts";
 
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omr-apikey-lifecycle-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
@@ -17,7 +18,7 @@ const ORIGINAL_ROUTER_API_KEY = process.env.ROUTER_API_KEY;
 function reset() {
   core.resetDbInstance();
   apiKeysDb.resetApiKeyState();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
   delete process.env.OMNIROUTE_API_KEY;
   delete process.env.ROUTER_API_KEY;
@@ -27,8 +28,8 @@ test.beforeEach(() => {
   reset();
 });
 
-test.after(() => {
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+test.after(async () => {
+  await cleanupTempDataDir(TEST_DATA_DIR);
   if (ORIGINAL_OMNIROUTE_API_KEY === undefined) delete process.env.OMNIROUTE_API_KEY;
   else process.env.OMNIROUTE_API_KEY = ORIGINAL_OMNIROUTE_API_KEY;
   if (ORIGINAL_ROUTER_API_KEY === undefined) delete process.env.ROUTER_API_KEY;
@@ -116,4 +117,23 @@ test("validateApiKey updates last_used_at for persisted keys", async () => {
 
   assert.ok(row?.last_used_at, "last_used_at should be set on successful validation");
   assert.ok(Date.parse(row.last_used_at) > 0, "last_used_at should be an ISO timestamp");
+});
+
+test("getApiKeyMetadata returns proxyId for a key with proxy_id set", async () => {
+  const created = await makeKey("proxy-test", "machine-proxy");
+
+  const ok = await apiKeysDb.updateApiKeyPermissions(created.id, { proxyId: "test-proxy-id" });
+  assert.equal(ok, true);
+
+  const metadata = await apiKeysDb.getApiKeyMetadata(created.key);
+  assert.ok(metadata);
+  assert.equal(metadata!.proxyId, "test-proxy-id");
+});
+
+test("getApiKeyMetadata returns proxyId null for a key without proxy_id", async () => {
+  const created = await makeKey("no-proxy-test", "machine-no-proxy");
+
+  const metadata = await apiKeysDb.getApiKeyMetadata(created.key);
+  assert.ok(metadata);
+  assert.equal(metadata!.proxyId, null);
 });

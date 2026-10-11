@@ -4,10 +4,13 @@ import assert from "node:assert/strict";
 import { createChatPipelineHarness } from "../integration/_chatPipelineHarness.ts";
 
 process.env.STREAM_IDLE_TIMEOUT_MS = "50";
+process.env.STREAM_READINESS_TIMEOUT_MS = "50";
 
 const harness = await createChatPipelineHarness("chat-cooldown-aware-retry");
 const auth = await import("../../src/sse/services/auth.ts");
 const { getProviderConnectionById } = await import("../../src/lib/db/providers.ts");
+const { __setTlsFetchOverrideForTesting } =
+  await import("../../open-sse/services/claudeTlsClient.ts");
 const {
   BaseExecutor,
   buildOpenAIResponse,
@@ -56,6 +59,7 @@ test.beforeEach(async () => {
 });
 
 test.afterEach(async () => {
+  __setTlsFetchOverrideForTesting(null);
   BaseExecutor.RETRY_CONFIG.maxAttempts = originalRetryConfig.maxAttempts;
   BaseExecutor.RETRY_CONFIG.delayMs = originalRetryConfig.delayMs;
   await resetStorage();
@@ -63,6 +67,49 @@ test.afterEach(async () => {
 
 test.after(async () => {
   await harness.cleanup();
+});
+
+test("handleChat does not probe Claude Web repeatedly after an upstream 429", async () => {
+  await seedConnection("claude-web", {
+    apiKey: "sessionKey=fake-session",
+  });
+  await settingsDb.updateSettings({
+    requestRetry: 3,
+    maxRetryIntervalSec: 3,
+  });
+
+  let completionCalls = 0;
+  __setTlsFetchOverrideForTesting(async (url) => {
+    if (url.endsWith("/organizations")) {
+      return {
+        status: 200,
+        headers: new Headers({ "Content-Type": "application/json" }),
+        text: JSON.stringify([{ uuid: "org-test" }]),
+        body: null,
+      };
+    }
+
+    completionCalls += 1;
+    return {
+      status: 429,
+      headers: new Headers({ "Content-Type": "application/json" }),
+      text: JSON.stringify({ error: { message: "Rate limited." } }),
+      body: null,
+    };
+  });
+
+  const response = await handleChat(
+    buildRequest({
+      body: {
+        model: "claude-web/claude-opus-5",
+        stream: false,
+        messages: [{ role: "user", content: "do not retry a Claude Web 429" }],
+      },
+    })
+  );
+
+  assert.equal(response.status, 429);
+  assert.equal(completionCalls, 1);
 });
 
 test("handleChat waits for a short cooldown and retries once within the configured budget", async () => {
@@ -87,7 +134,7 @@ test("handleChat waits for a short cooldown and retries once within the configur
   const response = await handleChat(
     buildRequest({
       body: {
-        model: "openai/gpt-4o-mini",
+        model: "openai/gpt-4.1",
         stream: false,
         messages: [{ role: "user", content: "retry after short cooldown" }],
       },
@@ -138,7 +185,7 @@ test("handleChat recovers from a real 429 once the connection cooldown expires",
   const response = await handleChat(
     buildRequest({
       body: {
-        model: "openai/gpt-4o-mini",
+        model: "openai/gpt-4.1",
         stream: false,
         messages: [{ role: "user", content: "trigger upstream 429 then recover" }],
       },
@@ -156,7 +203,7 @@ test("handleChat recovers from a real 429 once the connection cooldown expires",
 test("handleChat does not wait when the cooldown exceeds maxRetryIntervalSec", async () => {
   await seedConnection("openai", {
     apiKey: "sk-openai-cooldown-long",
-    rateLimitedUntil: new Date(Date.now() + 1500).toISOString(),
+    rateLimitedUntil: new Date(Date.now() + 100000).toISOString(),
     lastError: "cooldown too long",
     errorCode: 429,
   });
@@ -174,7 +221,7 @@ test("handleChat does not wait when the cooldown exceeds maxRetryIntervalSec", a
   const response = await handleChat(
     buildRequest({
       body: {
-        model: "openai/gpt-4o-mini",
+        model: "openai/gpt-4.1",
         stream: false,
         messages: [{ role: "user", content: "do not wait beyond configured interval" }],
       },
@@ -241,7 +288,7 @@ test("handleChat returns model_cooldown when every credential for the requested 
   assert.ok(Number(response.headers.get("Retry-After")) >= 1);
 });
 
-test("handleChat returns stream readiness timeout without entering cooldown-aware retry or account lockout", async () => {
+test("handleChat retries a direct stream readiness timeout once, without cooldown-aware retry or account lockout", async () => {
   const connection = await seedConnection("openai", {
     apiKey: "sk-openai-stream-readiness-timeout",
   });
@@ -256,22 +303,22 @@ test("handleChat returns stream readiness timeout without entering cooldown-awar
     return buildZombieSseResponse();
   };
 
-  const startedAt = Date.now();
   const response = await handleChat(
     buildRequest({
       body: {
-        model: "openai/gpt-4o-mini",
+        model: "openai/gpt-4.1",
         stream: true,
         messages: [{ role: "user", content: "trigger zombie stream" }],
       },
     })
   );
-  const elapsedMs = Date.now() - startedAt;
   const body = (await response.json()) as any;
 
   assert.equal(response.status, 504);
-  assert.equal(fetchCalls, 1);
-  assert.ok(elapsedMs < 1000, `should not wait for cooldown retry, got ${elapsedMs}ms`);
+  // #14209 (issue #14025): a direct (non-combo, non-forced, still-connected) request gets ONE
+  // bounded same-target retry of a readiness timeout before the 504 — so exactly two upstream
+  // calls, and still no cooldown-aware retry loop or account lockout.
+  assert.equal(fetchCalls, 2);
   assert.equal(body.error.code, "STREAM_READINESS_TIMEOUT");
 
   const refreshedConnection = (await getProviderConnectionById((connection as any).id)) as any;
@@ -284,15 +331,13 @@ test("handleChat returns stream readiness timeout without entering cooldown-awar
 test("handleChat aborts the pending cooldown wait when the client disconnects", async () => {
   await seedConnection("openai", {
     apiKey: "sk-openai-cooldown-abort",
-    // Keep the cooldown far enough in the future that a heavily loaded CI
-    // runner cannot let it expire before handleChat reaches the abortable wait.
-    rateLimitedUntil: new Date(Date.now() + 60_000).toISOString(),
+    rateLimitedUntil: new Date(Date.now() + 5_000).toISOString(),
     lastError: "abort retry wait",
     errorCode: 429,
   });
   await settingsDb.updateSettings({
     requestRetry: 1,
-    maxRetryIntervalSec: 120,
+    maxRetryIntervalSec: 10,
   });
 
   let fetchCalls = 0;
@@ -304,19 +349,22 @@ test("handleChat aborts the pending cooldown wait when the client disconnects", 
   const controller = new AbortController();
   setTimeout(() => controller.abort(), 40);
 
+  const startedAt = Date.now();
   const response = await handleChat(
     buildRequestWithSignal(
       {
-        model: "openai/gpt-4o-mini",
+        model: "openai/gpt-4.1",
         stream: false,
         messages: [{ role: "user", content: "abort retry wait" }],
       },
       controller.signal
     )
   );
+  const elapsedMs = Date.now() - startedAt;
   const body = (await response.json()) as any;
 
   assert.equal(fetchCalls, 0);
+  assert.ok(elapsedMs < 1_000, `should abort cooldown wait promptly, got ${elapsedMs}ms`);
   assert.equal(response.status, 499);
   assert.equal(body.error.message, "Request aborted");
 });

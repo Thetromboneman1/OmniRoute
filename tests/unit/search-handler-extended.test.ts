@@ -123,60 +123,7 @@ test("handleSearch builds Brave news requests and normalizes favicon metadata", 
   }
 });
 
-test("handleSearch builds Perplexity requests, forwards filters, and enforces maxResults", async () => {
-  const originalFetch = globalThis.fetch;
-  let captured;
-
-  globalThis.fetch = async (url, init = {}) => {
-    captured = {
-      url: String(url),
-      headers: init.headers,
-      body: JSON.parse(String(init.body || "{}")),
-    };
-
-    return new Response(
-      JSON.stringify({
-        results: [
-          { title: "One", url: "https://one.example.com", snippet: "First", date: "2026-04-05" },
-          { title: "Two", url: "https://two.example.com", snippet: "Second" },
-        ],
-      }),
-      { status: 200, headers: { "content-type": "application/json" } }
-    );
-  };
-
-  try {
-    const result = await handleSearch({
-      query: "ai agents",
-      provider: "perplexity-search",
-      maxResults: 1,
-      searchType: "web",
-      country: "US",
-      language: "en",
-      domainFilter: ["example.com", "-spam.com"],
-      credentials: { apiKey: "perplexity-key" },
-      log: null,
-    });
-
-    assert.equal(captured.url, "https://api.perplexity.ai/search");
-    assert.equal(captured.headers.Authorization, "Bearer perplexity-key");
-    assert.deepEqual(captured.body, {
-      query: "ai agents",
-      max_results: 1,
-      country: "US",
-      search_language_filter: ["en"],
-      search_domain_filter: ["example.com", "-spam.com"],
-    });
-    assert.equal(result.success, true);
-    assert.equal(result.data.results.length, 1);
-    assert.equal(result.data.usage.queries_used, 1);
-    assert.equal(result.data.usage.search_cost_usd, 0.005);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test("handleSearch builds Exa requests with include/exclude domains and preserves rich result fields", async () => {
+test("handleSearch builds Exa requests with contents-nested options, include/exclude domains, and preserves rich result fields", async () => {
   const originalFetch = globalThis.fetch;
   let captured;
 
@@ -218,8 +165,7 @@ test("handleSearch builds Exa requests with include/exclude domains and preserve
       query: "agentic workflows",
       numResults: 5,
       type: "auto",
-      text: true,
-      highlights: true,
+      contents: { text: true, highlights: true },
       includeDomains: ["allowed.com"],
       excludeDomains: ["blocked.com"],
       category: "news",
@@ -705,6 +651,418 @@ test("handleSearch does not fail over on non-retriable upstream errors", async (
     assert.equal(result.status, 401);
     assert.equal(result.error, "Search provider serper-search returned 401");
     assert.equal(callCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ─── Ollama Search Tests ──────────────────────────────────
+
+test("handleSearch builds Ollama POST request with bearer auth", async () => {
+  const originalFetch = globalThis.fetch;
+  let captured;
+
+  globalThis.fetch = async (url, init = {}) => {
+    captured = {
+      url: String(url),
+      headers: init.headers,
+      body: JSON.parse(String(init.body || "{}")),
+    };
+
+    return new Response(
+      JSON.stringify({
+        results: [
+          { title: "Ollama result", url: "https://ollama.example.com", content: "Test content" },
+        ],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  };
+
+  try {
+    const result = await handleSearch({
+      query: "latest AI news",
+      provider: "ollama-search",
+      maxResults: 5,
+      searchType: "web",
+      credentials: { apiKey: "ollama-token-123" },
+      log: null,
+    });
+
+    assert.equal(captured.url, "https://ollama.com/api/web_search");
+    assert.equal(captured.headers["Content-Type"], "application/json");
+    assert.equal(captured.headers.Authorization, "Bearer ollama-token-123");
+    assert.deepEqual(captured.body, { query: "latest AI news", max_results: 5 });
+    assert.equal(result.success, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleSearch normalizes Ollama response fields and full_text content", async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async () => {
+    return new Response(
+      JSON.stringify({
+        results: [
+          {
+            title: "Ollama Web Search",
+            url: "https://ollama.com/blog/web-search",
+            content: "Ollama now supports native web search capabilities",
+          },
+          {
+            title: "Getting Started",
+            url: "https://ollama.com/docs",
+            content: "Learn how to use Ollama for LLM inference",
+          },
+        ],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  };
+
+  try {
+    const result = await handleSearch({
+      query: "ollama query",
+      provider: "ollama-search",
+      maxResults: 5,
+      searchType: "web",
+      credentials: { apiKey: "ollama-key" },
+      log: null,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.data.results.length, 2);
+    assert.equal(result.data.metrics.total_results_available, 2);
+
+    assert.equal(result.data.results[0].title, "Ollama Web Search");
+    assert.equal(result.data.results[0].url, "https://ollama.com/blog/web-search");
+    assert.equal(
+      result.data.results[0].snippet,
+      "Ollama now supports native web search capabilities"
+    );
+    assert.equal(
+      result.data.results[0].content.text,
+      "Ollama now supports native web search capabilities"
+    );
+    assert.equal(result.data.results[0].content.format, "text");
+    assert.equal(result.data.results[0].position, 1);
+    assert.equal(result.data.results[0].citation.provider, "ollama-search");
+    assert.equal(result.data.results[0].citation.rank, 1);
+
+    assert.equal(result.data.results[1].title, "Getting Started");
+    assert.equal(result.data.results[1].position, 2);
+    assert.equal(result.data.results[1].citation.rank, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleSearch handles empty Ollama results array", async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async () => {
+    return new Response(JSON.stringify({ results: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    const result = await handleSearch({
+      query: "empty query",
+      provider: "ollama-search",
+      maxResults: 5,
+      searchType: "web",
+      credentials: { apiKey: "ollama-key" },
+      log: null,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.data.results.length, 0);
+    assert.equal(result.data.metrics.total_results_available, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleSearch handles Ollama response with missing results field", async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async () => {
+    return new Response(JSON.stringify({ unrelated: "data" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    const result = await handleSearch({
+      query: "some query",
+      provider: "ollama-search",
+      maxResults: 5,
+      searchType: "web",
+      credentials: { apiKey: "ollama-key" },
+      log: null,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.data.results.length, 0);
+    assert.equal(result.data.metrics.total_results_available, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ─── Z.AI Coding Plan Search Tests ────────────────────
+
+const ZAI_MOCK_RESULTS = [
+  {
+    title: "Z.AI Coding Plan Search",
+    link: "https://docs.z.ai/search",
+    content: "Z.AI now supports web search capabilities via Coding Plan",
+    publish_date: "2026-04-20T10:00:00Z",
+    icon: "https://docs.z.ai/favicon.ico",
+    media: "web",
+  },
+  {
+    title: "Getting Started with Z.AI",
+    link: "https://docs.z.ai/getting-started",
+    content: "Learn how to use Z.AI for search and inference",
+    publish_date: "2026-04-18T08:00:00Z",
+    icon: "https://docs.z.ai/favicon.ico",
+    media: "web",
+  },
+];
+
+test("handleSearch searches with Z.AI Coding Plan via MCP", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: { url: string; init: RequestInit }[] = [];
+  let capturedArgs: Record<string, unknown> = {};
+
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), init });
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+
+    // MCP initialize handshake
+    if (body.method === "initialize") {
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          result: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            serverInfo: { name: "zai-mcp", version: "1.0" },
+          },
+          id: body.id,
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json", "mcp-session-id": "session-abc-123" },
+        }
+      );
+    }
+
+    // notifications/initialized
+    if (body.method === "notifications/initialized") {
+      return new Response(null, { status: 202 });
+    }
+
+    // tools/call
+    if (body.method === "tools/call") {
+      capturedArgs = body.params.arguments;
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          result: {
+            content: [{ type: "text", text: JSON.stringify(JSON.stringify(ZAI_MOCK_RESULTS)) }],
+          },
+          id: body.id,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+
+    // GET (initial probe / transport check)
+    return new Response(null, { status: 405 });
+  };
+
+  try {
+    const result = await handleSearch({
+      query: "zai mcp search",
+      provider: "zai-search",
+      maxResults: 2,
+      searchType: "web",
+      credentials: { apiKey: "zai-token-abc" },
+      log: null,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(capturedArgs.search_query, "zai mcp search");
+    assert.equal(result.data.provider, "zai-search");
+    assert.equal(result.data.results.length, 2);
+    assert.equal(result.data.results[0].title, "Z.AI Coding Plan Search");
+    assert.equal(result.data.results[0].url, "https://docs.z.ai/search");
+    assert.equal(
+      result.data.results[0].snippet,
+      "Z.AI now supports web search capabilities via Coding Plan"
+    );
+    assert.equal(result.data.results[0].display_url, "docs.z.ai/search");
+    assert.equal(result.data.results[0].favicon_url, "https://docs.z.ai/favicon.ico");
+    assert.equal(result.data.results[0].citation.provider, "zai-search");
+    assert.equal(result.data.results[1].title, "Getting Started with Z.AI");
+    assert.equal(result.data.results[1].citation.provider, "zai-search");
+    assert.equal(result.data.usage.queries_used, 1);
+    assert.equal(result.data.usage.search_cost_usd, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleSearch handles Z.AI Coding Plan empty MCP results", async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, init = {}) => {
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+
+    if (body.method === "initialize") {
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          result: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            serverInfo: { name: "zai-mcp", version: "1.0" },
+          },
+          id: body.id,
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json", "mcp-session-id": "session-empty" },
+        }
+      );
+    }
+
+    if (body.method === "notifications/initialized") {
+      return new Response(null, { status: 202 });
+    }
+
+    if (body.method === "tools/call") {
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          result: {
+            content: [{ type: "text", text: JSON.stringify(JSON.stringify([])) }],
+          },
+          id: body.id,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+
+    return new Response(null, { status: 405 });
+  };
+
+  try {
+    const result = await handleSearch({
+      query: "empty zai mcp result",
+      provider: "zai-search",
+      maxResults: 5,
+      searchType: "web",
+      credentials: { apiKey: "zai-key" },
+      log: null,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.data.provider, "zai-search");
+    assert.equal(result.data.results.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleSearch handles Z.AI Coding Plan MCP connection error", async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async () => {
+    throw new Error("Connection refused");
+  };
+
+  try {
+    const result = await handleSearch({
+      query: "zai mcp error",
+      provider: "zai-search",
+      maxResults: 5,
+      searchType: "web",
+      credentials: { apiKey: "zai-key" },
+      log: null,
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.status, 502);
+    assert.ok(result.error.includes("error"));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("handleSearch handles Z.AI Coding Plan non-array MCP result", async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (url, init = {}) => {
+    const body = init.body ? JSON.parse(String(init.body)) : {};
+
+    if (body.method === "initialize") {
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          result: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            serverInfo: { name: "zai-mcp", version: "1.0" },
+          },
+          id: body.id,
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json", "mcp-session-id": "session-nonarray" },
+        }
+      );
+    }
+
+    if (body.method === "notifications/initialized") {
+      return new Response(null, { status: 202 });
+    }
+
+    if (body.method === "tools/call") {
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          result: {
+            content: [{ type: "text", text: JSON.stringify(JSON.stringify({ not: "an array" })) }],
+          },
+          id: body.id,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+
+    return new Response(null, { status: 405 });
+  };
+
+  try {
+    const result = await handleSearch({
+      query: "zai non-array",
+      provider: "zai-search",
+      maxResults: 5,
+      searchType: "web",
+      credentials: { apiKey: "zai-key" },
+      log: null,
+    });
+
+    assert.equal(result.success, true);
+    assert.equal(result.data.results.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }

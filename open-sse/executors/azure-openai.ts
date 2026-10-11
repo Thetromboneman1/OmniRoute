@@ -1,6 +1,7 @@
 import { DefaultExecutor } from "./default.ts";
 import type { ProviderCredentials } from "./base.ts";
 import { stripTrailingSlashes } from "../utils/urlSanitize.ts";
+import { applyAzureParamRules } from "./azureParamRules.ts";
 
 const DEFAULT_API_VERSION = "2024-12-01-preview";
 
@@ -26,17 +27,12 @@ export class AzureOpenAIExecutor extends DefaultExecutor {
   ) {
     void urlIndex;
 
-    const providerSpecificData =
-      credentials?.providerSpecificData &&
-      typeof credentials.providerSpecificData === "object" &&
-      !Array.isArray(credentials.providerSpecificData)
-        ? credentials.providerSpecificData
-        : {};
-    const baseUrlSource =
+    const providerSpecificData = credentials?.providerSpecificData || {};
+    const baseUrl = normalizeAzureBaseUrl(
       typeof providerSpecificData.baseUrl === "string"
         ? providerSpecificData.baseUrl
-        : this.config.baseUrl;
-    const baseUrl = normalizeAzureBaseUrl(baseUrlSource);
+        : this.config.baseUrl
+    );
     const apiVersion =
       typeof providerSpecificData.apiVersion === "string" && providerSpecificData.apiVersion.trim()
         ? providerSpecificData.apiVersion.trim()
@@ -53,5 +49,18 @@ export class AzureOpenAIExecutor extends DefaultExecutor {
 
     headers.Accept = stream ? "text/event-stream" : "application/json";
     return headers;
+  }
+
+  override transformRequest(
+    model: string,
+    body: unknown,
+    stream: boolean,
+    credentials: ProviderCredentials
+  ): unknown {
+    return applyAzureParamRules(
+      model,
+      body,
+      super.transformRequest(model, body, stream, credentials)
+    );
   }
 }

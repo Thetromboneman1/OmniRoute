@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import {
   detectNativeBinaryTarget,
   isNativeBinaryCompatible,
-} from "../../scripts/native-binary-compat.mjs";
+} from "../../scripts/build/native-binary-compat.mjs";
 
 function makeElfBinary(machine) {
   const buffer = Buffer.alloc(64);
@@ -70,7 +70,7 @@ describe("isNativeBinaryCompatible", () => {
     try {
       callback(file);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   }
 

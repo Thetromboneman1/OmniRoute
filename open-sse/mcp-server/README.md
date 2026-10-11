@@ -1,6 +1,8 @@
 # OmniRoute MCP Server
 
-> **Model Context Protocol server** that exposes OmniRoute's gateway intelligence as **16 tools** for AI agents.
+> **Model Context Protocol server** that exposes OmniRoute's gateway intelligence as **110 tools** for AI agents.
+>
+> **Source of truth for the full tool catalog and REST surface:** [`docs/frameworks/MCP-SERVER.md`](../../docs/frameworks/MCP-SERVER.md). This README focuses on architecture, configuration, and integration examples; the catalog below is a summary subset.
 
 The MCP Server allows any AI agent (Claude Desktop, Cursor, VS Code Copilot, custom agents) to **monitor, control, and optimize** the OmniRoute AI gateway programmatically.
 
@@ -18,8 +20,9 @@ The MCP Server allows any AI agent (Claude Desktop, Cursor, VS Code Copilot, cus
 ┌──────────────────────────────────────────────────────────────────┐
 │                      OmniRoute MCP Server                        │
 │  ┌──────────────┐  ┌─────────────────┐  ┌────────────────────┐  │
-│  │ Scope        │  │  16 MCP Tools   │  │   Audit Logger     │  │
-│  │ Enforcement  │──│  (Phase 1 + 2)  │──│   (SHA-256/SQLite) │  │
+│  │ Scope        │  │ 107 MCP Tools   │  │   Audit Logger     │  │
+│  │ Enforcement  │──│ (core + memory  │──│   (SHA-256/SQLite) │  │
+│  │              │  │  + skills + …)  │  │                    │  │
 │  └──────────────┘  └────────┬────────┘  └────────────────────┘  │
 └─────────────────────────────┼────────────────────────────────────┘
                               │  HTTP (internal)
@@ -45,7 +48,7 @@ export OMNIROUTE_API_KEY="your-api-key"
 
 # Optional: Scope enforcement (default: disabled)
 export OMNIROUTE_MCP_ENFORCE_SCOPES="true"
-export OMNIROUTE_MCP_SCOPES="read:health,read:combos,read:quota,read:usage,read:models,read:cache,read:compression,execute:completions,write:combos,write:budget,write:resilience,write:cache,write:compression"
+export OMNIROUTE_MCP_SCOPES="read:health,read:combos,read:quota,read:usage,read:models,read:cache,read:compression,read:tools,execute:completions,write:combos,write:budget,write:resilience,write:cache,write:compression"
 ```
 
 ### 2. stdio Transport (IDE Integration)
@@ -59,7 +62,7 @@ Add to your MCP client configuration:
   "mcpServers": {
     "omniroute": {
       "command": "node",
-      "args": ["path/to/9router/open-sse/mcp-server/server.ts"],
+      "args": ["path/to/omniroute/open-sse/mcp-server/server.ts"],
       "env": {
         "OMNIROUTE_BASE_URL": "http://localhost:20128",
         "OMNIROUTE_API_KEY": "your-key"
@@ -119,16 +122,16 @@ omniroute --mcp
 
 ### Phase 1: Essential Tools (8)
 
-| #   | Tool                            | Scopes                | Description                                                                |
-| --- | ------------------------------- | --------------------- | -------------------------------------------------------------------------- |
-| 1   | `omniroute_get_health`          | `read:health`         | Gateway health, uptime, memory, circuit breakers, rate limits, cache stats |
-| 2   | `omniroute_list_combos`         | `read:combos`         | List all combos (model chains) with strategies and optional metrics        |
-| 3   | `omniroute_get_combo_metrics`   | `read:combos`         | Performance metrics for a specific combo                                   |
-| 4   | `omniroute_switch_combo`        | `write:combos`        | Activate or deactivate a combo for routing                                 |
-| 5   | `omniroute_check_quota`         | `read:quota`          | Remaining API quota per provider with token health status                  |
-| 6   | `omniroute_route_request`       | `execute:completions` | Send a chat completion through intelligent routing                         |
-| 7   | `omniroute_cost_report`         | `read:usage`          | Cost report by period (session/day/week/month) with per-provider breakdown |
-| 8   | `omniroute_list_models_catalog` | `read:models`         | List all available models across providers with capabilities and pricing   |
+| #   | Tool                            | Scopes                | Description                                                                                         |
+| --- | ------------------------------- | --------------------- | --------------------------------------------------------------------------------------------------- |
+| 1   | `omniroute_get_health`          | `read:health`         | Gateway health, uptime, memory, circuit breakers, rate limits, cache stats + adaptive lane pressure |
+| 2   | `omniroute_list_combos`         | `read:combos`         | List all combos (model chains) with strategies and optional metrics                                 |
+| 3   | `omniroute_get_combo_metrics`   | `read:combos`         | Performance metrics for a specific combo                                                            |
+| 4   | `omniroute_switch_combo`        | `write:combos`        | Activate or deactivate a combo for routing                                                          |
+| 5   | `omniroute_check_quota`         | `read:quota`          | Remaining API quota per provider with token health status                                           |
+| 6   | `omniroute_route_request`       | `execute:completions` | Send a chat completion through intelligent routing                                                  |
+| 7   | `omniroute_cost_report`         | `read:usage`          | Cost report by period (session/day/week/month) with per-provider breakdown                          |
+| 8   | `omniroute_list_models_catalog` | `read:models`         | List all available models across providers with capabilities and pricing                            |
 
 ### Phase 2: Advanced Tools (8)
 
@@ -145,12 +148,98 @@ omniroute --mcp
 
 ### Cache and Compression Tools
 
-| #   | Tool                              | Scopes              | Description                                                                  |
-| --- | --------------------------------- | ------------------- | ---------------------------------------------------------------------------- |
-| 21  | `omniroute_cache_stats`           | `read:cache`        | Semantic cache, prompt-cache, and idempotency statistics                     |
-| 22  | `omniroute_cache_flush`           | `write:cache`       | Flush cache entries globally or by signature/model                           |
-| 23  | `omniroute_compression_status`    | `read:compression`  | Compression settings, analytics summary, and provider-aware cache statistics |
-| 24  | `omniroute_compression_configure` | `write:compression` | Configure compression mode and trigger thresholds at runtime                 |
+| #   | Tool                                | Scopes              | Description                                                                  |
+| --- | ----------------------------------- | ------------------- | ---------------------------------------------------------------------------- |
+| 21  | `omniroute_cache_stats`             | `read:cache`        | Semantic cache, prompt-cache, and idempotency statistics                     |
+| 22  | `omniroute_cache_flush`             | `write:cache`       | Flush cache entries globally or by signature/model                           |
+| 23  | `omniroute_compression_status`      | `read:compression`  | Compression settings, analytics summary, and provider-aware cache statistics |
+| 24  | `omniroute_compression_configure`   | `write:compression` | Configure compression mode and trigger thresholds at runtime                 |
+| 25  | `omniroute_set_compression_engine`  | `write:compression` | Set Caveman, RTK, or stacked compression mode and pipeline                   |
+| 26  | `omniroute_list_compression_combos` | `read:compression`  | List named compression combos and routing assignments                        |
+| 27  | `omniroute_compression_combo_stats` | `read:compression`  | Read analytics grouped by compression combo and engine                       |
+| 28  | `omniroute_ccr_store`               | `write:compression` | Store content in the caller-isolated in-memory CCR store                     |
+| 29  | `omniroute_ccr_retrieve`            | `read:compression`  | Retrieve full or ranged caller-owned CCR content                             |
+| 30  | `omniroute_ccr_inspect`             | `read:compression`  | Inspect CCR metadata without returning content                               |
+| 31  | `omniroute_ccr_list`                | `read:compression`  | List paginated caller-owned CCR metadata                                     |
+| 32  | `omniroute_ccr_delete`              | `write:compression` | Delete a caller-owned CCR block                                              |
+| 33  | `omniroute_ccr_stats`               | `read:compression`  | Report caller usage, bounded-store limits, and lifecycle counters            |
+
+CCR storage is bounded and in-memory only: 2 MiB per block, 16 MiB per principal, 64 MiB global,
+with a 24-hour default TTL. Full MCP retrieval is capped at 256 KiB; larger blocks use ranged or
+grep retrieval. All lifecycle operations are isolated by the authenticated caller principal.
+
+MCP listable metadata descriptions are compressed at registration/list time when description
+compression is enabled. `omniroute_compression_status` exposes those savings separately as
+`analytics.mcpDescriptionCompression` with `source: "mcp_metadata_estimate"`, so clients do not
+mistake metadata shrink estimates for provider token receipts.
+
+### Discovery & Web Tools
+
+| Tool                    | Scopes           | Description                                                                                                                          |
+| ----------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `omniroute_tool_search` | `read:tools`     | Keyword search across the registered MCP tools; returns compact one-line signatures for token-efficient discovery                    |
+| `omniroute_web_fetch`   | `execute:search` | Fetch and extract a URL's content through the web-fetch gateway (Firecrawl, Jina Reader, Tavily, TinyFish) with automatic failover   |
+| `omniroute_web_search`  | `execute:search` | Web search through the search gateway (Serper, Brave, Perplexity, Exa, Tavily, Google PSE, Linkup, SearchAPI, SearXNG) with failover |
+
+### Skills & Catalog Tools
+
+| Tool                              | Scopes         | Description                                                                                              |
+| --------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------- |
+| `omniroute_agent_skills_list`     | `read:catalog` | List all 42 agent skills with optional `category` (`api`\|`cli`) and `area` filters; metadata + coverage |
+| `omniroute_agent_skills_get`      | `read:catalog` | Full metadata + SKILL.md content for a single skill by canonical `id`                                    |
+| `omniroute_agent_skills_coverage` | `read:catalog` | Coverage stats: how many of the 22 API and 20 CLI skills have SKILL.md files on disk vs catalog totals   |
+
+### Proxy, Pricing & Data Tools
+
+| Tool                        | Scopes                            | Description                                                                                |
+| --------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------ |
+| `omniroute_oneproxy_fetch`  | `read:proxies`                    | Fetch free proxies from the 1proxy marketplace (protocol/country/quality/limit filters)    |
+| `omniroute_oneproxy_rotate` | `read:proxies`                    | Get the next available proxy by strategy (`random` / `quality` / `sequential`)             |
+| `omniroute_oneproxy_stats`  | `read:proxies`                    | Pool stats, sync status, distribution by protocol and country                              |
+| `omniroute_sync_pricing`    | `pricing:write`                   | Sync pricing from external sources (LiteLLM) without overwriting user-set prices; `dryRun` |
+| `omniroute_db_health_check` | `read:health`, `write:resilience` | Diagnose (and optionally auto-repair) database drift — broken combo refs, orphan rows      |
+
+### Combo & Routing Tools
+
+| Tool                             | Scopes                                     | Description                                                                                  |
+| -------------------------------- | ------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `omniroute_create_combo`         | `write:combos`                             | Register a new combo (model chain) with name, ordered model list, and optional strategy      |
+| `omniroute_set_routing_strategy` | `write:combos`                             | Update combo routing strategy at runtime (`priority` / `weighted` / `auto` / etc.)           |
+| `omniroute_pick_fastest_model`   | `read:combos`, `read:health`, `read:usage` | Pick the fastest reliable provider-model pair from live telemetry; can apply latency routing |
+
+---
+
+### Adaptive Admission Lane Data
+
+`omniroute_get_health` includes an `adaptiveAdmission` block whenever the gateway's adaptive
+virtual-lane admission is active. It is a curated subset of the live admission snapshot:
+
+| Field              | Meaning                                                                |
+| ------------------ | ---------------------------------------------------------------------- |
+| `virtualLanes`     | Whether per-tenant virtual-lane admission is enabled                   |
+| `pressure`         | Current pressure state (e.g. `healthy`, `high`, `critical`)            |
+| `utilization`      | Current capacity utilization (0.0–1.0)                                 |
+| `laneCount`        | Number of live lanes                                                   |
+| `laneQueuedCount`  | Total requests queued across lanes                                     |
+| `laneQueuedCost`   | Total estimated cost queued across lanes                               |
+| `laneTenants`      | Top 10 lanes by queued cost (`tenantKey`, `queuedCount`, `queuedCost`) |
+| `admittedCount`    | Requests admitted since boot                                           |
+| `rejectedCount`    | Requests rejected since boot                                           |
+| `wouldRejectCount` | Requests that would be rejected under the current limit                |
+| `shutdown`         | Whether the admission runtime is shutting down                         |
+
+`tenantKey` is an opaque per-API-key derived identifier, never the raw key. The block is omitted
+entirely when the health endpoint reports no adaptive-admission data.
+
+### Skills & Tool Navigability
+
+The tables above cover the full `schemas/` catalog (43 entries); the authoritative reference with
+scope-enforcement and transport details lives in
+[`docs/frameworks/MCP-SERVER.md`](../../docs/frameworks/MCP-SERVER.md).
+
+Agents never need to read this file to find a capability: `omniroute_tool_search` performs keyword
+search across the registered tool set and returns compact one-line signatures (token-efficient
+discovery), so newly added capabilities stay discoverable at runtime.
 
 ---
 
@@ -540,12 +629,12 @@ The MCP server supports **fine-grained scope enforcement** for multi-tenant envi
 | `read:usage`          | `cost_report`, `explain_route`, `get_session_snapshot`                                         |
 | `read:models`         | `list_models_catalog`                                                                          |
 | `read:cache`          | `cache_stats`                                                                                  |
-| `read:compression`    | `compression_status`                                                                           |
+| `read:compression`    | `compression_status`, `list_compression_combos`, `compression_combo_stats`                     |
 | `write:combos`        | `switch_combo`                                                                                 |
 | `write:budget`        | `set_budget_guard`                                                                             |
 | `write:resilience`    | `set_resilience_profile`                                                                       |
 | `write:cache`         | `cache_flush`                                                                                  |
-| `write:compression`   | `compression_configure`                                                                        |
+| `write:compression`   | `compression_configure`, `set_compression_engine`                                              |
 | `execute:completions` | `route_request`, `test_combo`                                                                  |
 
 **Wildcard scopes:** Use `read:*` to grant all read scopes, or `*` for full access.
@@ -581,7 +670,7 @@ mcp-server/
 ├── audit.ts               # SQLite audit logger (SHA-256 input hashing)
 ├── scopeEnforcement.ts    # Fine-grained scope enforcement
 ├── schemas/
-│   ├── tools.ts           # Zod schemas for all 16 tools (input/output/scopes)
+│   ├── tools.ts           # Zod schemas for core, cache, compression, and proxy tools
 │   ├── a2a.ts             # A2A protocol types (Agent Card, Task, JSON-RPC)
 │   ├── audit.ts           # Audit & routing decision types + hash helpers
 │   └── index.ts           # Schema barrel export

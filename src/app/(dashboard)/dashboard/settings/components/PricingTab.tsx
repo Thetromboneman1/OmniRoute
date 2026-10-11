@@ -1,8 +1,21 @@
 "use client";
 
+import { FilterSelect, HeroStat, SyncMini } from "./PricingTabHelpers";
+
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { Card, Button } from "@/shared/components";
+import ProviderIcon from "@/shared/components/ProviderIcon";
+import InfoTooltip from "@/shared/components/InfoTooltip";
 import { useTranslations } from "next-intl";
+import { compareTr, matchesSearch } from "@/shared/utils/turkishText";
+import { extractApiErrorMessage } from "@/shared/http/apiErrorMessage";
+
+type CoverageFilter = "all" | "lt50" | "gte50lt100" | "full";
+type AuthFilter = "all" | "oauth" | "apikey" | "unknown";
+type SortKey = "modelsDesc" | "coverageDesc" | "coverageAsc" | "nameAsc";
+
+const INITIAL_VISIBLE = 20;
+const VISIBLE_INCREMENT = 30;
 
 const PRICING_FIELDS = ["input", "output", "cached", "reasoning", "cache_creation"] as const;
 const FIELD_LABEL_KEYS: Record<(typeof PRICING_FIELDS)[number], string> = {
@@ -38,6 +51,8 @@ interface PricingCatalogProvider {
   format: string;
   modelCount: number;
   models: PricingCatalogModel[];
+  /** Original pricing namespace (e.g. public prefix) when it differs from `alias`. */
+  pricingKey?: string;
 }
 
 function getSourceTone(source: PricingSource): string {
@@ -51,6 +66,37 @@ function getSourceTone(source: PricingSource): string {
     default:
       return "bg-bg-subtle text-text-muted border border-border/40";
   }
+}
+
+type PricingBundle = {
+  catalog?: Record<string, PricingCatalogProvider>;
+  pricing?: Record<string, Record<string, Record<string, number>>>;
+  sources?: Record<string, Record<string, PricingSource>>;
+  sync?: SyncStatus;
+};
+
+async function fetchPricingBundle(): Promise<PricingBundle> {
+  const [catalogRes, pricingRes, syncRes] = await Promise.all([
+    fetch("/api/pricing/models"),
+    fetch("/api/pricing?includeSources=1"),
+    fetch("/api/pricing/sync"),
+  ]);
+  const bundle: PricingBundle = {};
+  if (catalogRes.ok) {
+    bundle.catalog = (await catalogRes.json()) as Record<string, PricingCatalogProvider>;
+  }
+  if (pricingRes.ok) {
+    const pricingPayload = (await pricingRes.json()) as {
+      pricing?: Record<string, Record<string, Record<string, number>>>;
+      sourceMap?: Record<string, Record<string, PricingSource>>;
+    };
+    bundle.pricing = pricingPayload.pricing || {};
+    bundle.sources = pricingPayload.sourceMap || {};
+  }
+  if (syncRes.ok) {
+    bundle.sync = (await syncRes.json()) as SyncStatus;
+  }
+  return bundle;
 }
 
 export default function PricingTab() {
@@ -68,6 +114,10 @@ export default function PricingTab() {
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
   const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set());
   const [searchQuery, setSearchQuery] = useState("");
+  const [coverageFilter, setCoverageFilter] = useState<CoverageFilter>("all");
+  const [authFilter, setAuthFilter] = useState<AuthFilter>("all");
+  const [sortKey, setSortKey] = useState<SortKey>("modelsDesc");
+  const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE);
   const [editedProviders, setEditedProviders] = useState<Set<string>>(new Set());
   const [statusMessage, setStatusMessage] = useState<{
     tone: "success" | "error" | "info";
@@ -80,67 +130,132 @@ export default function PricingTab() {
     window.setTimeout(() => setStatusMessage(null), 4000);
   }, []);
 
+  const applyPricingBundle = useCallback((bundle: PricingBundle) => {
+    if (bundle.catalog) setCatalog(bundle.catalog);
+    if (bundle.pricing) setPricingData(bundle.pricing);
+    if (bundle.sources) setPricingSources(bundle.sources);
+    if (bundle.sync) setSyncStatus(bundle.sync);
+    setLoading(false);
+  }, []);
+
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const [catalogRes, pricingRes, syncRes] = await Promise.all([
-        fetch("/api/pricing/models"),
-        fetch("/api/pricing?includeSources=1"),
-        fetch("/api/pricing/sync"),
-      ]);
-
-      if (catalogRes.ok) {
-        setCatalog((await catalogRes.json()) as Record<string, PricingCatalogProvider>);
-      }
-
-      if (pricingRes.ok) {
-        const pricingPayload = (await pricingRes.json()) as {
-          pricing?: Record<string, Record<string, Record<string, number>>>;
-          sourceMap?: Record<string, Record<string, PricingSource>>;
-        };
-        setPricingData(pricingPayload.pricing || {});
-        setPricingSources(pricingPayload.sourceMap || {});
-      }
-
-      if (syncRes.ok) {
-        setSyncStatus((await syncRes.json()) as SyncStatus);
-      }
+      applyPricingBundle(await fetchPricingBundle());
     } catch (error) {
       console.error("Failed to load pricing data:", error);
       showStatus("error", t("pricingLoadFailed"));
-    } finally {
       setLoading(false);
     }
-  }, [showStatus, t]);
+  }, [applyPricingBundle, showStatus, t]);
 
   useEffect(() => {
-    void loadData();
-  }, [loadData]);
+    let cancelled = false;
+    void (async () => {
+      try {
+        const bundle = await fetchPricingBundle();
+        if (!cancelled) applyPricingBundle(bundle);
+      } catch (error) {
+        console.error("Failed to load pricing data:", error);
+        if (!cancelled) {
+          showStatus("error", t("pricingLoadFailed"));
+          setLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [applyPricingBundle, showStatus, t]);
 
   const allProviders = useMemo(() => {
     return Object.entries(catalog)
-      .map(([alias, info]) => ({
-        ...info,
-        alias,
-        pricedModels: pricingData[alias] ? Object.keys(pricingData[alias]).length : 0,
-      }))
+      .map(([alias, info]) => {
+        const pricingKey = info.pricingKey || alias;
+        return {
+          ...info,
+          alias,
+          pricingKey,
+          pricedModels: pricingData[pricingKey] ? Object.keys(pricingData[pricingKey]).length : 0,
+        };
+      })
       .sort((left, right) => right.modelCount - left.modelCount);
   }, [catalog, pricingData]);
 
   const filteredProviders = useMemo(() => {
-    if (!searchQuery.trim()) return allProviders;
-
-    const query = searchQuery.toLowerCase();
-    return allProviders.filter(
-      (provider) =>
-        provider.alias.toLowerCase().includes(query) ||
-        provider.id.toLowerCase().includes(query) ||
+    const providerMatchesSearch = (provider: (typeof allProviders)[number]) => {
+      if (!searchQuery.trim()) return true;
+      return (
+        matchesSearch(provider.alias, searchQuery) ||
+        matchesSearch(provider.id, searchQuery) ||
         provider.models.some(
-          (model) =>
-            model.id.toLowerCase().includes(query) || model.name.toLowerCase().includes(query)
+          (model) => matchesSearch(model.id, searchQuery) || matchesSearch(model.name, searchQuery)
         )
+      );
+    };
+    const coveragePct = (p: (typeof allProviders)[number]) =>
+      p.modelCount > 0 ? (p.pricedModels / p.modelCount) * 100 : 0;
+    const matchesCoverage = (p: (typeof allProviders)[number]) => {
+      if (coverageFilter === "all") return true;
+      const pct = coveragePct(p);
+      if (coverageFilter === "lt50") return pct < 50;
+      if (coverageFilter === "gte50lt100") return pct >= 50 && pct < 100;
+      return pct >= 100;
+    };
+    const matchesAuth = (p: (typeof allProviders)[number]) => {
+      if (authFilter === "all") return true;
+      const auth = (p.authType || "unknown").toLowerCase();
+      return (
+        auth === authFilter || (authFilter === "unknown" && !["oauth", "apikey"].includes(auth))
+      );
+    };
+
+    const filtered = allProviders.filter(
+      (p) => providerMatchesSearch(p) && matchesCoverage(p) && matchesAuth(p)
     );
-  }, [allProviders, searchQuery]);
+
+    // Sort
+    const sorted = [...filtered];
+    switch (sortKey) {
+      case "modelsDesc":
+        sorted.sort((a, b) => b.modelCount - a.modelCount);
+        break;
+      case "coverageDesc":
+        sorted.sort((a, b) => coveragePct(b) - coveragePct(a));
+        break;
+      case "coverageAsc":
+        sorted.sort((a, b) => coveragePct(a) - coveragePct(b));
+        break;
+      case "nameAsc":
+        sorted.sort((a, b) => compareTr(a.alias, b.alias));
+        break;
+    }
+    return sorted;
+  }, [allProviders, searchQuery, coverageFilter, authFilter, sortKey]);
+
+  const authCounts = useMemo(() => {
+    const counts = { oauth: 0, apikey: 0, unknown: 0 };
+    for (const p of allProviders) {
+      const auth = (p.authType || "unknown").toLowerCase();
+      if (auth === "oauth") counts.oauth += 1;
+      else if (auth === "apikey") counts.apikey += 1;
+      else counts.unknown += 1;
+    }
+    return counts;
+  }, [allProviders]);
+
+  const coverageGapCount = useMemo(
+    () => allProviders.filter((p) => p.modelCount > 0 && p.pricedModels / p.modelCount < 1).length,
+    [allProviders]
+  );
+
+  // Reset visible count when filters change (state adjustment during render)
+  const filtersKey = `${searchQuery}|${coverageFilter}|${authFilter}|${sortKey}`;
+  const [prevFiltersKey, setPrevFiltersKey] = useState(filtersKey);
+  if (prevFiltersKey !== filtersKey) {
+    setPrevFiltersKey(filtersKey);
+    setVisibleCount(INITIAL_VISIBLE);
+  }
 
   const stats = useMemo(() => {
     const totalModels = allProviders.reduce((sum, provider) => sum + provider.modelCount, 0);
@@ -161,9 +276,15 @@ export default function PricingTab() {
   }, [allProviders, pricingData, pricingSources]);
 
   const displayProviders = useMemo(() => {
-    if (!selectedProvider) return filteredProviders;
-    return filteredProviders.filter((provider) => provider.alias === selectedProvider);
-  }, [filteredProviders, selectedProvider]);
+    const base = selectedProvider
+      ? filteredProviders.filter((provider) => provider.alias === selectedProvider)
+      : filteredProviders;
+    return base.slice(0, visibleCount);
+  }, [filteredProviders, selectedProvider, visibleCount]);
+
+  const totalFiltered = selectedProvider
+    ? filteredProviders.filter((provider) => provider.alias === selectedProvider).length
+    : filteredProviders.length;
 
   const formatSyncDate = useCallback(
     (value: string | null) => {
@@ -235,23 +356,24 @@ export default function PricingTab() {
   );
 
   const saveProvider = useCallback(
-    async (providerAlias: string) => {
+    async (providerAlias: string, pricingKey?: string) => {
       setSaving(true);
       try {
+        const writeKey = pricingKey || providerAlias;
         const response = await fetch("/api/pricing", {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ [providerAlias]: pricingData[providerAlias] || {} }),
+          body: JSON.stringify({ [writeKey]: pricingData[writeKey] || {} }),
         });
 
         if (!response.ok) {
-          const errorPayload = (await response.json().catch(() => ({}))) as { error?: string };
-          throw new Error(errorPayload.error || t("saveFailed"));
+          const errorPayload = await response.json().catch(() => null);
+          throw new Error(extractApiErrorMessage(errorPayload, t("saveFailed")));
         }
 
         setEditedProviders((previous) => {
           const next = new Set(previous);
-          next.delete(providerAlias);
+          next.delete(writeKey);
           return next;
         });
         await loadData();
@@ -271,22 +393,24 @@ export default function PricingTab() {
   );
 
   const resetProvider = useCallback(
-    async (providerAlias: string) => {
+    async (providerAlias: string, pricingKey?: string) => {
       if (!confirm(t("resetPricingConfirm", { provider: providerAlias.toUpperCase() }))) return;
 
       try {
-        const response = await fetch(`/api/pricing?provider=${providerAlias}`, {
+        const writeKey = pricingKey || providerAlias;
+        const params = new URLSearchParams({ provider: writeKey });
+        const response = await fetch(`/api/pricing?${params.toString()}`, {
           method: "DELETE",
         });
 
         if (!response.ok) {
-          const errorPayload = (await response.json().catch(() => ({}))) as { error?: string };
-          throw new Error(errorPayload.error || t("resetFailed"));
+          const errorPayload = await response.json().catch(() => null);
+          throw new Error(extractApiErrorMessage(errorPayload, t("resetFailed")));
         }
 
         setEditedProviders((previous) => {
           const next = new Set(previous);
-          next.delete(providerAlias);
+          next.delete(writeKey);
           return next;
         });
         await loadData();
@@ -360,10 +484,6 @@ export default function PricingTab() {
     }
   }, [loadData, showStatus, t]);
 
-  const selectProviderFilter = useCallback((alias: string) => {
-    setSelectedProvider((previous) => (previous === alias ? null : alias));
-  }, []);
-
   if (loading) {
     return (
       <div className="flex items-center justify-center py-16">
@@ -372,54 +492,117 @@ export default function PricingTab() {
     );
   }
 
+  const coveragePct =
+    stats.totalModels > 0 ? Math.round((stats.pricedCount / stats.totalModels) * 100) : 0;
+
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex items-start justify-between flex-wrap gap-4">
-        <div>
-          <h2 className="text-xl font-bold">{t("modelPricing")}</h2>
-          <p className="text-text-muted text-sm mt-1">{t("modelPricingDesc")}</p>
-        </div>
-        <div className="flex gap-3 text-sm">
-          <StatPill label={t("providers")} value={stats.providers} />
-          <StatPill label={t("registry")} value={stats.totalModels} />
-          <StatPill label={t("priced")} value={stats.pricedCount} accent="text-success" />
-          <StatPill
-            label={t("pricingSourceUser")}
-            value={stats.overriddenCount}
-            accent="text-amber-400"
-          />
-        </div>
-      </div>
-
+      {/* Hero — combined header (stats + sync + how-it-works tooltip) */}
       <Card className="p-5">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div>
-            <h3 className="text-sm font-semibold uppercase tracking-wide text-text-muted">
-              {t("pricingSyncTitle")}
-            </h3>
-            <p className="text-sm text-text-muted mt-1">{t("pricingSyncDescription")}</p>
-          </div>
+        <div className="flex items-start justify-between gap-3 mb-4">
           <div className="flex items-center gap-2">
-            <Button variant="secondary" onClick={() => void clearSyncedPricing()} loading={syncing}>
-              {t("clearSyncedPricing")}
-            </Button>
-            <Button variant="primary" onClick={() => void triggerSync()} loading={syncing}>
-              {syncing ? t("syncing") : t("syncNow")}
-            </Button>
+            <h2 className="text-xl font-bold flex items-center gap-2">
+              <span className="material-symbols-outlined text-[22px] text-primary">payments</span>
+              {t("modelPricing")}
+            </h2>
+            <InfoTooltip
+              text={`${t("pricingDescInput")} · ${t("pricingDescOutput")} · ${t("pricingDescCached")} · ${t("pricingDescReasoning")} · ${t("pricingDescCacheWrite")} · ${t("pricingDescFormula")}`}
+            />
           </div>
+          <p className="text-text-muted text-xs hidden sm:block self-center">
+            {t("modelPricingDesc")}
+          </p>
         </div>
 
-        <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 mt-4">
-          <SyncMetric
-            label={t("pricingSyncStatus")}
-            value={syncStatus?.enabled ? t("syncEnabled") : t("syncDisabled")}
-          />
-          <SyncMetric label={t("lastSync")} value={formatSyncDate(syncStatus?.lastSync || null)} />
-          <SyncMetric
-            label={t("syncedModels")}
-            value={String(syncStatus?.lastSyncModelCount || 0)}
-          />
-          <SyncMetric label={t("nextSync")} value={formatSyncDate(syncStatus?.nextSync || null)} />
+        <div className="grid grid-cols-1 lg:grid-cols-[1.2fr_1fr] gap-4">
+          {/* Stats panel with coverage bar */}
+          <div className="rounded-lg border border-border/40 bg-bg-subtle/30 p-4">
+            <div className="grid grid-cols-4 gap-3 mb-3">
+              <HeroStat label={t("providers")} value={stats.providers} />
+              <HeroStat label={t("registry")} value={stats.totalModels} />
+              <HeroStat label={t("priced")} value={stats.pricedCount} accent="text-emerald-400" />
+              <HeroStat
+                label={t("pricingSourceUser")}
+                value={stats.overriddenCount}
+                accent="text-amber-400"
+              />
+            </div>
+            <div>
+              <div className="flex items-center justify-between text-[11px] text-text-muted mb-1">
+                <span className="uppercase tracking-wide font-semibold">
+                  {t("priced")} / {t("registry")}
+                </span>
+                <span className="tabular-nums font-semibold">{coveragePct}%</span>
+              </div>
+              <div className="h-2 rounded-sm bg-black/[0.08] dark:bg-white/[0.06] overflow-hidden">
+                <div
+                  className={`h-full transition-[width] duration-300 ${
+                    coveragePct >= 90
+                      ? "bg-emerald-500"
+                      : coveragePct >= 60
+                        ? "bg-amber-500"
+                        : "bg-red-500"
+                  }`}
+                  style={{ width: `${Math.min(coveragePct, 100)}%` }}
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Sync panel */}
+          <div className="rounded-lg border border-border/40 bg-bg-subtle/30 p-4 flex flex-col gap-3">
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <h3 className="text-xs font-bold uppercase tracking-wide text-text-muted">
+                  {t("pricingSyncTitle")}
+                </h3>
+                <div className="flex items-center gap-1.5 mt-1">
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full ${
+                      syncStatus?.enabled ? "bg-emerald-500 animate-pulse" : "bg-text-muted"
+                    }`}
+                  />
+                  <span className="text-xs text-text-main font-medium">
+                    {syncStatus?.enabled
+                      ? t("pricingAutoSyncEnabled")
+                      : t("pricingAutoSyncDisabled")}
+                  </span>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => void clearSyncedPricing()}
+                  loading={syncing}
+                >
+                  {t("clearSyncedPricing")}
+                </Button>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={() => void triggerSync()}
+                  loading={syncing}
+                >
+                  {syncing ? t("syncing") : t("syncNow")}
+                </Button>
+              </div>
+            </div>
+            <div className="grid grid-cols-3 gap-2 text-[11px]">
+              <SyncMini
+                label={t("lastSync")}
+                value={formatSyncDate(syncStatus?.lastSync || null)}
+              />
+              <SyncMini
+                label={t("syncedModels")}
+                value={String(syncStatus?.lastSyncModelCount || 0)}
+              />
+              <SyncMini
+                label={t("nextSync")}
+                value={formatSyncDate(syncStatus?.nextSync || null)}
+              />
+            </div>
+          </div>
         </div>
       </Card>
 
@@ -437,64 +620,123 @@ export default function PricingTab() {
         </div>
       )}
 
-      <div className="flex gap-3 items-center flex-wrap">
-        <div className="relative flex-1 min-w-[200px]">
-          <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-text-muted text-lg">
-            search
-          </span>
-          <input
-            type="text"
-            placeholder={t("searchProvidersModels")}
-            value={searchQuery}
-            onChange={(event) => setSearchQuery(event.target.value)}
-            className="w-full pl-10 pr-3 py-2 bg-bg-base border border-border rounded-lg focus:outline-none focus:border-primary text-sm"
+      {/* Search + Filters */}
+      <div className="flex flex-col gap-2">
+        <div className="flex gap-2 items-center flex-wrap">
+          <div className="relative flex-1 min-w-[260px]">
+            <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-text-muted text-lg">
+              search
+            </span>
+            <input
+              type="text"
+              placeholder={t("searchProvidersModels")}
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              className="w-full pl-10 pr-3 py-2 bg-bg-base border border-border rounded-lg focus:outline-none focus:border-primary text-sm"
+            />
+          </div>
+
+          <FilterSelect
+            label={t("pricingCoverage")}
+            value={coverageFilter}
+            onChange={(v) => setCoverageFilter(v as CoverageFilter)}
+            options={[
+              { value: "all", label: `${t("pricingAll")} (${allProviders.length})` },
+              { value: "lt50", label: "<50%" },
+              { value: "gte50lt100", label: "50–99%" },
+              { value: "full", label: "100%" },
+            ]}
+          />
+
+          <FilterSelect
+            label={t("pricingAuth")}
+            value={authFilter}
+            onChange={(v) => setAuthFilter(v as AuthFilter)}
+            options={[
+              { value: "all", label: t("pricingAll") },
+              { value: "oauth", label: `OAuth (${authCounts.oauth})` },
+              { value: "apikey", label: `API Key (${authCounts.apikey})` },
+              {
+                value: "unknown",
+                label: `${t("pricingAuthUnknown")} (${authCounts.unknown})`,
+              },
+            ]}
+          />
+
+          <FilterSelect
+            label={t("pricingSort")}
+            value={sortKey}
+            onChange={(v) => setSortKey(v as SortKey)}
+            options={[
+              { value: "modelsDesc", label: t("pricingMostModels") },
+              { value: "coverageDesc", label: t("pricingHighestCoverage") },
+              { value: "coverageAsc", label: t("pricingLowestCoverage") },
+              { value: "nameAsc", label: t("pricingNameAscending") },
+            ]}
           />
         </div>
-        {selectedProvider && (
-          <button
-            onClick={() => setSelectedProvider(null)}
-            className="px-3 py-2 text-xs bg-primary/10 text-primary border border-primary/20 rounded-lg hover:bg-primary/20 transition-colors flex items-center gap-1"
-          >
-            <span className="material-symbols-outlined text-sm">close</span>
-            {selectedProvider.toUpperCase()} - {t("showAll")}
-          </button>
-        )}
-      </div>
 
-      <div className="flex flex-wrap gap-1.5">
-        {allProviders.map((provider) => (
+        {/* Quick shortcuts */}
+        <div className="flex items-center gap-2 flex-wrap text-[11px]">
           <button
-            key={provider.alias}
-            onClick={() => selectProviderFilter(provider.alias)}
-            className={`px-2.5 py-1 rounded-md text-xs font-medium transition-all ${
-              selectedProvider === provider.alias
-                ? "bg-primary text-white shadow-sm"
-                : editedProviders.has(provider.alias)
-                  ? "bg-yellow-500/15 text-yellow-400 border border-yellow-500/30"
-                  : "bg-bg-subtle text-text-muted hover:bg-bg-hover border border-transparent"
+            type="button"
+            onClick={() => setCoverageFilter(coverageFilter === "lt50" ? "all" : "lt50")}
+            className={`inline-flex items-center gap-1 px-2 py-1 rounded-md border text-xs transition-colors cursor-pointer ${
+              coverageFilter === "lt50"
+                ? "bg-amber-500/15 border-amber-500/30 text-amber-400"
+                : "bg-bg-subtle border-border text-text-muted hover:text-text-main"
             }`}
           >
-            {provider.alias.toUpperCase()}{" "}
-            <span className="opacity-60">({provider.modelCount})</span>
+            <span className="material-symbols-outlined text-[14px]">warning</span>
+            {t("pricingCoverageGaps")} ({coverageGapCount})
           </button>
-        ))}
+          {(searchQuery ||
+            coverageFilter !== "all" ||
+            authFilter !== "all" ||
+            sortKey !== "modelsDesc" ||
+            selectedProvider) && (
+            <button
+              type="button"
+              onClick={() => {
+                setSearchQuery("");
+                setCoverageFilter("all");
+                setAuthFilter("all");
+                setSortKey("modelsDesc");
+                setSelectedProvider(null);
+              }}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-border bg-bg-subtle text-xs text-text-muted hover:text-text-main cursor-pointer"
+            >
+              <span className="material-symbols-outlined text-[14px]">close</span>
+              {t("pricingClearFilters")}
+            </button>
+          )}
+          <span className="text-text-muted ml-auto">
+            {t("pricingShowingProviders", {
+              visible: displayProviders.length,
+              total: totalFiltered,
+            })}
+            {totalFiltered !== allProviders.length &&
+              ` ${t("pricingFilteredFrom", { count: allProviders.length })}`}
+          </span>
+        </div>
       </div>
 
+      {/* Provider list */}
       <div className="flex flex-col gap-2">
         {displayProviders.map((provider) => (
           <ProviderSection
             key={provider.alias}
             provider={provider}
-            pricingData={pricingData[provider.alias] || {}}
-            sourceMap={pricingSources[provider.alias] || {}}
+            pricingData={pricingData[provider.pricingKey || provider.alias] || {}}
+            sourceMap={pricingSources[provider.pricingKey || provider.alias] || {}}
             isExpanded={expandedProviders.has(provider.alias)}
-            isEdited={editedProviders.has(provider.alias)}
+            isEdited={editedProviders.has(provider.pricingKey || provider.alias)}
             onToggle={() => toggleProvider(provider.alias)}
             onPricingChange={(model, field, value) =>
-              handlePricingChange(provider.alias, model, field, value)
+              handlePricingChange(provider.pricingKey || provider.alias, model, field, value)
             }
-            onSave={() => void saveProvider(provider.alias)}
-            onReset={() => void resetProvider(provider.alias)}
+            onSave={() => void saveProvider(provider.alias, provider.pricingKey)}
+            onReset={() => void resetProvider(provider.alias, provider.pricingKey)}
             saving={saving}
             getSourceLabel={getSourceLabel}
           />
@@ -503,39 +745,21 @@ export default function PricingTab() {
         {displayProviders.length === 0 && (
           <div className="text-center py-12 text-text-muted">{t("noProvidersMatch")}</div>
         )}
+
+        {visibleCount < totalFiltered && (
+          <button
+            type="button"
+            onClick={() => setVisibleCount((c) => c + VISIBLE_INCREMENT)}
+            className="mt-2 mx-auto px-4 py-2 rounded-md border border-border bg-bg-subtle hover:bg-black/[0.04] dark:hover:bg-white/[0.04] text-sm text-text-main cursor-pointer flex items-center gap-1.5"
+          >
+            <span className="material-symbols-outlined text-[16px]">expand_more</span>
+            {t("pricingShowMoreProviders", {
+              count: Math.min(VISIBLE_INCREMENT, totalFiltered - visibleCount),
+              remaining: totalFiltered - visibleCount,
+            })}
+          </button>
+        )}
       </div>
-
-      <Card className="p-4 mt-2">
-        <h3 className="text-sm font-semibold mb-2">
-          <span className="material-symbols-outlined text-sm align-middle mr-1">info</span>
-          {t("howPricingWorks")}
-        </h3>
-        <div className="text-xs text-text-muted space-y-1">
-          <p>
-            {t("pricingDescInput")} • {t("pricingDescOutput")} • {t("pricingDescCached")} •{" "}
-            {t("pricingDescReasoning")} • {t("pricingDescCacheWrite")}
-          </p>
-          <p>{t("pricingDescFormula")}</p>
-        </div>
-      </Card>
-    </div>
-  );
-}
-
-function StatPill({ label, value, accent }: { label: string; value: number; accent?: string }) {
-  return (
-    <div className="bg-bg-subtle rounded-lg px-3 py-2 text-center">
-      <div className="text-text-muted text-xs font-semibold">{label}</div>
-      <div className={`text-lg font-bold ${accent || ""}`}>{value}</div>
-    </div>
-  );
-}
-
-function SyncMetric({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-lg border border-border/20 bg-surface/20 px-4 py-3">
-      <p className="text-xs uppercase tracking-wide text-text-muted font-semibold">{label}</p>
-      <p className="text-sm font-medium text-text-main mt-1">{value}</p>
     </div>
   );
 }
@@ -590,63 +814,82 @@ function ProviderSection({
     >
       <button
         onClick={onToggle}
-        className="w-full flex items-center justify-between px-4 py-3 hover:bg-bg-hover/50 transition-colors text-left"
+        className="w-full flex items-center justify-between gap-3 px-4 py-3 hover:bg-bg-hover/50 transition-colors text-left"
       >
-        <div className="flex items-center gap-3 min-w-0">
+        <div className="flex items-center gap-3 min-w-0 flex-1">
           <span
-            className={`material-symbols-outlined text-lg transition-transform ${
+            className={`material-symbols-outlined text-lg text-text-muted transition-transform shrink-0 ${
               isExpanded ? "rotate-90" : ""
             }`}
           >
             chevron_right
           </span>
-          <div className="min-w-0">
-            <span className="font-semibold text-sm">
+          <div className="w-7 h-7 rounded-md flex items-center justify-center overflow-hidden shrink-0 bg-bg-subtle">
+            <ProviderIcon providerId={provider.id} size={28} type="color" />
+          </div>
+          <div className="min-w-0 flex items-center gap-2">
+            <span className="font-semibold text-sm truncate">
               {provider.id.charAt(0).toUpperCase() + provider.id.slice(1)}
             </span>
-            <span className="text-text-muted text-xs ml-2">({provider.alias.toUpperCase()})</span>
+            <span className="text-text-muted text-[11px] truncate">
+              ({provider.alias.toUpperCase()})
+            </span>
           </div>
-          <span className="px-1.5 py-0.5 bg-bg-subtle text-text-muted text-[10px] rounded uppercase font-semibold">
+          <span
+            className={`px-1.5 py-0.5 text-[9px] rounded uppercase font-semibold shrink-0 ${
+              provider.authType === "oauth"
+                ? "bg-sky-500/15 text-sky-400 border border-sky-500/25"
+                : provider.authType === "apikey"
+                  ? "bg-violet-500/15 text-violet-400 border border-violet-500/25"
+                  : "bg-bg-subtle text-text-muted border border-border/40"
+            }`}
+          >
             {authBadge}
           </span>
-          <span className="px-1.5 py-0.5 bg-bg-subtle text-text-muted text-[10px] rounded uppercase font-semibold">
+          <span className="px-1.5 py-0.5 bg-bg-subtle text-text-muted text-[9px] rounded uppercase font-semibold shrink-0">
             {provider.format}
           </span>
         </div>
-        <div className="flex items-center gap-3">
-          <div className="hidden xl:flex items-center gap-1.5">
-            {sourceCounts.user > 0 && (
-              <span className={`px-1.5 py-0.5 rounded text-[10px] ${getSourceTone("user")}`}>
-                {sourceCounts.user} {getSourceLabel("user")}
-              </span>
-            )}
-            {sourceCounts.modelsDev > 0 && (
-              <span className={`px-1.5 py-0.5 rounded text-[10px] ${getSourceTone("modelsDev")}`}>
-                {sourceCounts.modelsDev} {getSourceLabel("modelsDev")}
-              </span>
-            )}
-            {sourceCounts.litellm > 0 && (
-              <span className={`px-1.5 py-0.5 rounded text-[10px] ${getSourceTone("litellm")}`}>
-                {sourceCounts.litellm} {getSourceLabel("litellm")}
-              </span>
-            )}
-          </div>
-          {isEdited && <span className="text-yellow-500 text-xs font-medium">{t("unsaved")}</span>}
-          <span className="text-text-muted text-xs">
-            {pricedCount}/{provider.modelCount} {t("withPricing")}
+        <div className="flex items-center gap-3 shrink-0">
+          {sourceCounts.user > 0 && (
+            <span
+              className="inline-flex items-center gap-1 text-[10px] font-semibold text-amber-400"
+              title={`${sourceCounts.user} ${getSourceLabel("user")}`}
+            >
+              💎 {sourceCounts.user}
+            </span>
+          )}
+          {isEdited && (
+            <span className="text-yellow-500 text-[11px] font-semibold">{t("unsaved")}</span>
+          )}
+          <span className="text-text-muted text-[11px] tabular-nums hidden sm:inline">
+            {pricedCount}/{provider.modelCount}
           </span>
-          <div className="w-16 h-1.5 bg-bg-subtle rounded-full overflow-hidden">
-            <div
-              className="h-full bg-primary rounded-full transition-all"
-              style={{
-                width: `${
-                  provider.modelCount > 0
-                    ? Math.round((pricedCount / provider.modelCount) * 100)
-                    : 0
-                }%`,
-              }}
-            />
-          </div>
+          {(() => {
+            const pct =
+              provider.modelCount > 0 ? Math.round((pricedCount / provider.modelCount) * 100) : 0;
+            const barColor =
+              pct >= 100 ? "bg-emerald-500" : pct >= 50 ? "bg-amber-500" : "bg-red-500";
+            const textColor =
+              pct >= 100 ? "text-emerald-400" : pct >= 50 ? "text-amber-400" : "text-red-400";
+            const icon = pct >= 100 ? "✓" : pct >= 50 ? "◐" : "⚠";
+            return (
+              <>
+                <div className="w-20 h-1.5 bg-bg-subtle rounded-full overflow-hidden">
+                  <div
+                    className={`h-full ${barColor} rounded-full transition-all`}
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
+                <span
+                  className={`text-[11px] font-bold tabular-nums w-10 text-right ${textColor}`}
+                  title={`${pricedCount}/${provider.modelCount} ${t("withPricing")}`}
+                >
+                  {pct}% {icon}
+                </span>
+              </>
+            );
+          })()}
         </div>
       </button>
 

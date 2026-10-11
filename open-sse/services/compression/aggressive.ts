@@ -1,43 +1,27 @@
 import type { AggressiveConfig, CompressionStats, Summarizer } from "./types.ts";
 import { DEFAULT_AGGRESSIVE_CONFIG } from "./types.ts";
-import { compressToolResult } from "./toolResultCompressor.ts";
+import {
+  compressToolResult,
+  compressAnthropicToolResultBlock,
+  isAnthropicToolResultBlock,
+} from "./toolResultCompressor.ts";
 import { applyAging } from "./progressiveAging.ts";
 import { RuleBasedSummarizer } from "./summarizer.ts";
 import { cavemanCompress } from "./caveman.ts";
 import { applyLiteCompression } from "./lite.ts";
+import { extractTextContent, replaceTextContent, type ChatMessageLike } from "./messageContent.ts";
 
 const COMPRESSED_MARKER_RE = /^\[COMPRESSED:/;
 
-interface ChatMessage {
-  role: string;
-  content?: string | Array<{ type: string; text?: string }>;
-  [key: string]: unknown;
-}
+type ChatMessage = ChatMessageLike;
 
 interface AggressiveCompressionResult {
   messages: ChatMessage[];
   stats: CompressionStats;
 }
 
-function extractText(content?: string | Array<{ type: string; text?: string }>): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .filter(
-        (p): p is { type: string; text?: string } =>
-          typeof p === "object" && p !== null && "text" in p
-      )
-      .map((p) => p.text ?? "")
-      .join("\n");
-  }
-  return "";
-}
-
 function setContent(msg: ChatMessage, newContent: string): ChatMessage {
-  if (typeof msg.content === "string") {
-    return { ...msg, content: newContent };
-  }
-  return { ...msg, content: [{ type: "text", text: newContent }] };
+  return replaceTextContent(msg, newContent) as ChatMessage;
 }
 
 function estimateTokens(text: string): number {
@@ -71,7 +55,7 @@ export function compressAggressive(
   };
 
   const originalTokens = messages.reduce(
-    (sum, m) => sum + estimateTokens(extractText(m.content)),
+    (sum, m) => sum + estimateTokens(extractTextContent(m.content)),
     0
   );
   resultStats.originalTokens = originalTokens;
@@ -80,19 +64,41 @@ export function compressAggressive(
   let summarizerSavings = 0;
   let toolResultSavings = 0;
   let agingSavings = 0;
+  const lastUserIdx = currentMessages.findLastIndex((m) => m.role === "user");
 
   // Step 1: Tool-result compression
   try {
     const afterToolResult = currentMessages.map((msg) => {
-      if (msg.role !== "tool" && msg.role !== "function") return msg;
-      const text = extractText(msg.content);
-      if (!text || COMPRESSED_MARKER_RE.test(text)) return msg;
+      if (cfg.preserveSystemPrompt !== false && msg.role === "system") return msg;
 
-      const result = compressToolResult(text, cfg.toolStrategies);
-      if (result.strategy === "none" || result.saved <= 0) return msg;
+      // OpenAI-shape: a dedicated tool/function message whose content is the result text.
+      if (msg.role === "tool" || msg.role === "function") {
+        const text = extractTextContent(msg.content);
+        if (!text || COMPRESSED_MARKER_RE.test(text)) return msg;
 
-      toolResultSavings += result.saved;
-      return setContent(msg, result.compressed);
+        const result = compressToolResult(text, cfg.toolStrategies);
+        if (result.strategy === "none" || result.saved <= 0) return msg;
+
+        toolResultSavings += result.saved;
+        return setContent(msg, result.compressed);
+      }
+
+      // Anthropic-shape: `tool_result` content blocks live inside a (typically user)
+      // message's content array. Compress the text inside each block while preserving
+      // the tool_use_id and block structure exactly (B-AGG-ANTHROPIC-TR).
+      if (!Array.isArray(msg.content)) return msg;
+      if (!msg.content.some(isAnthropicToolResultBlock)) return msg;
+
+      let blockSavings = 0;
+      const nextContent = msg.content.map((part) => {
+        if (!isAnthropicToolResultBlock(part)) return part;
+        const { block, saved } = compressAnthropicToolResultBlock(part, cfg.toolStrategies);
+        blockSavings += saved;
+        return block;
+      });
+      if (blockSavings <= 0) return msg;
+      toolResultSavings += blockSavings;
+      return { ...msg, content: nextContent };
     });
     currentMessages = afterToolResult;
   } catch (err) {
@@ -101,7 +107,13 @@ export function compressAggressive(
 
   // Step 2: Progressive aging
   try {
-    const agingResult = applyAging(currentMessages, cfg.thresholds, summarizer);
+    const agingResult = applyAging(
+      currentMessages,
+      cfg.thresholds,
+      summarizer,
+      cfg.preserveSystemPrompt !== false,
+      lastUserIdx
+    );
     agingSavings = agingResult.saved;
     currentMessages = agingResult.messages as ChatMessage[];
   } catch (err) {
@@ -111,8 +123,10 @@ export function compressAggressive(
   // Step 3: Fallback summarizer for remaining long messages
   if (cfg.summarizerEnabled) {
     try {
-      currentMessages = currentMessages.map((msg) => {
-        const text = extractText(msg.content);
+      currentMessages = currentMessages.map((msg, idx) => {
+        if (cfg.preserveSystemPrompt !== false && msg.role === "system") return msg;
+        if (idx === lastUserIdx) return msg;
+        const text = extractTextContent(msg.content);
         if (!text || COMPRESSED_MARKER_RE.test(text)) return msg;
         if (text.length <= cfg.maxTokensPerMessage * 4) return msg;
 
@@ -122,7 +136,10 @@ export function compressAggressive(
         });
         if (summary && summary.length < text.length) {
           summarizerSavings += estimateTokens(text) - estimateTokens(summary);
-          return setContent(msg, `[COMPRESSED:summary] ${summary}`);
+          const finalSummary = COMPRESSED_MARKER_RE.test(summary)
+            ? summary
+            : `[COMPRESSED:summary] ${summary}`;
+          return setContent(msg, finalSummary);
         }
         return msg;
       });
@@ -133,7 +150,7 @@ export function compressAggressive(
 
   // Downgrade chain: if total savings < threshold, try caveman then lite
   const compressedTokens = currentMessages.reduce(
-    (sum, m) => sum + estimateTokens(extractText(m.content)),
+    (sum, m) => sum + estimateTokens(extractTextContent(m.content)),
     0
   );
   resultStats.compressedTokens = compressedTokens;
@@ -142,13 +159,27 @@ export function compressAggressive(
 
   if (resultStats.savingsPercent < cfg.minSavingsThreshold * 100) {
     try {
-      const cavemanResult = cavemanCompress({ messages: currentMessages });
-      if (cavemanResult?.compressed && cavemanResult.stats) {
-        const cavemanSavings = cavemanResult.stats.savingsPercent ?? 0;
-        if (cavemanSavings > resultStats.savingsPercent) {
-          currentMessages = (cavemanResult.body?.messages ?? currentMessages) as ChatMessage[];
-          resultStats.compressedTokens = cavemanResult.stats.compressedTokens ?? compressedTokens;
-          resultStats.savingsPercent = cavemanSavings;
+      const cavemanResult = cavemanCompress(
+        {
+          messages: currentMessages as unknown as Parameters<typeof cavemanCompress>[0]["messages"],
+        },
+        { enabled: true }
+      );
+      if (cavemanResult?.compressed && cavemanResult.body?.messages) {
+        const rawMsgs = cavemanResult.body.messages as ChatMessage[];
+        const candidateMsgs = rawMsgs.map((msg, idx) =>
+          idx === lastUserIdx ? currentMessages[idx] : msg
+        );
+        const candidateTokens = candidateMsgs.reduce(
+          (sum, m) => sum + estimateTokens(extractTextContent(m.content)),
+          0
+        );
+        const candidateSavings =
+          originalTokens > 0 ? ((originalTokens - candidateTokens) / originalTokens) * 100 : 0;
+        if (candidateSavings > resultStats.savingsPercent) {
+          currentMessages = candidateMsgs;
+          resultStats.compressedTokens = candidateTokens;
+          resultStats.savingsPercent = candidateSavings;
           resultStats.techniquesUsed.push("caveman-fallback");
         }
       }
@@ -157,13 +188,25 @@ export function compressAggressive(
     }
 
     try {
-      const liteResult = applyLiteCompression({ messages: currentMessages });
-      if (liteResult?.compressed && liteResult.stats) {
-        const liteSavings = liteResult.stats.savingsPercent ?? 0;
-        if (liteSavings > resultStats.savingsPercent) {
-          currentMessages = (liteResult.body?.messages ?? currentMessages) as ChatMessage[];
-          resultStats.compressedTokens = liteResult.stats.compressedTokens ?? compressedTokens;
-          resultStats.savingsPercent = liteSavings;
+      const liteResult = applyLiteCompression(
+        { messages: currentMessages },
+        { preserveSystemPrompt: cfg.preserveSystemPrompt !== false }
+      );
+      if (liteResult?.compressed && liteResult.body?.messages) {
+        const rawMsgs = liteResult.body.messages as ChatMessage[];
+        const candidateMsgs = rawMsgs.map((msg, idx) =>
+          idx === lastUserIdx ? currentMessages[idx] : msg
+        );
+        const candidateTokens = candidateMsgs.reduce(
+          (sum, m) => sum + estimateTokens(extractTextContent(m.content)),
+          0
+        );
+        const candidateSavings =
+          originalTokens > 0 ? ((originalTokens - candidateTokens) / originalTokens) * 100 : 0;
+        if (candidateSavings > resultStats.savingsPercent) {
+          currentMessages = candidateMsgs;
+          resultStats.compressedTokens = candidateTokens;
+          resultStats.savingsPercent = candidateSavings;
           resultStats.techniquesUsed.push("lite-fallback");
         }
       }

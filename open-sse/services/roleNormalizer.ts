@@ -23,17 +23,69 @@ const PROVIDERS_WITHOUT_SYSTEM_ROLE = new Set([
   // Known to reject system role (from troubleshooting report)
   // GLM uses Claude format, so this is handled through claude translator
   // But if accessed through OpenAI-format providers like nvidia, it needs this:
+  // DuckDuckGo duck.ai (duckchat/v1/chat) accepts only user/assistant roles — a
+  // system/developer message yields 400 ERR_BAD_REQUEST (#ddgw). Registry id +
+  // alias are both listed because either may arrive as the routing provider id.
+  "duckduckgo-web",
+  "ddgw",
 ]);
 
 /**
+ * Providers known to natively accept the OpenAI `developer` role.
+ * Issue #2281: When the upstream provider is OpenAI-compatible but NOT in
+ * this allowlist (DeepSeek, MiniMax, Mimo, GLM, etc.), the default behavior
+ * maps `developer` → `system`. Without this, requests from Codex/Responses
+ * API clients fail with "unknown variant `developer`" 400 errors.
+ *
+ * Operators can still force preservation per-model via the dashboard
+ * "Compatibility → preserveOpenAIDeveloperRole = true" toggle.
+ */
+const PROVIDERS_PRESERVING_DEVELOPER_ROLE = new Set(["openai", "azure-openai", "azure", "github"]);
+
+function defaultPreserveDeveloperForProvider(provider: string): boolean {
+  const id = provider.trim().toLowerCase();
+  if (!id) return false;
+  if (PROVIDERS_PRESERVING_DEVELOPER_ROLE.has(id)) return true;
+  // Treat any provider id containing "openai" as OpenAI-compatible enough
+  // to preserve developer role by default (e.g. "azure-openai-gov").
+  if (id.includes("openai")) return true;
+  return false;
+}
+
+/**
  * Models that are known to reject the `system` role regardless of provider.
- * Uses prefix matching (e.g., "glm-" matches "glm-4.7", "glm-4.5", etc.)
+ * Uses prefix matching (e.g., "ernie-" matches "ernie-4.0").
  */
 const MODELS_WITHOUT_SYSTEM_ROLE = [
-  "glm-", // ZhipuAI GLM models (prefix: glm-5.1, glm-4.7, etc.)
-  "glm", // Exact match for model id "glm" (e.g., Pollinations)
   "ernie-", // Baidu ERNIE models
 ];
+
+/**
+ * ZhipuAI GLM rejects the `system` role EXCEPT generation > 5.0: per z.ai docs,
+ * GLM 5.1 / 5.2 (and newer) accept it, so their system prompt must NOT be folded
+ * into the first user turn (#5610). Everything else GLM — bare "glm" (Pollinations),
+ * the 4.x family, and the 5.0 generation — still needs the fold. The version is read
+ * from "glm-<major>.<minor>" or the Fireworks "glm-5p1" point alias.
+ */
+function isGlmWithoutSystemRole(modelLower: string): boolean {
+  if (!modelLower.startsWith("glm")) return false;
+  const match = modelLower.match(/glm-?(\d+)(?:[.p](\d+))?/);
+  if (match) {
+    const major = Number(match[1]);
+    const minor = match[2] ? Number(match[2]) : 0;
+    if (major > 5 || (major === 5 && minor >= 1)) return false;
+  }
+  return true;
+}
+
+const PROVIDER_SCOPED_MODELS_WITHOUT_SYSTEM_ROLE: Record<string, RegExp[]> = {
+  // ZenMux exposes Z.AI GLM through OpenAI-compatible model ids such as
+  // "z-ai/glm-5.2". Z.AI rejects compressed histories that start with a
+  // system summary followed by an assistant/tool bundle, while OpenRouter
+  // tolerates the same shape. Treat these vendor-prefixed GLM ids like native
+  // GLM so normalizeSystemRole moves system/developer content into a user turn.
+  zenmux: [/(?:^|\/)glm(?:-|$)/i],
+};
 
 interface MessageContentPart {
   type?: string;
@@ -66,9 +118,17 @@ function extractTextFromContent(content: unknown): string {
  * Check if a provider+model combo supports the system role.
  */
 function supportsSystemRole(provider: string, model: string): boolean {
-  if (PROVIDERS_WITHOUT_SYSTEM_ROLE.has(provider)) return false;
+  const providerLower = (provider || "").trim().toLowerCase();
+  if (PROVIDERS_WITHOUT_SYSTEM_ROLE.has(providerLower)) return false;
 
   const modelLower = (model || "").toLowerCase();
+
+  for (const pattern of PROVIDER_SCOPED_MODELS_WITHOUT_SYSTEM_ROLE[providerLower] ?? []) {
+    if (pattern.test(modelLower)) return false;
+  }
+
+  if (isGlmWithoutSystemRole(modelLower)) return false;
+
   for (const prefix of MODELS_WITHOUT_SYSTEM_ROLE) {
     if (modelLower.startsWith(prefix)) return false;
   }
@@ -83,24 +143,32 @@ function supportsSystemRole(provider: string, model: string): boolean {
  *
  * Logic:
  * - When targetFormat !== "openai": always convert developer → system (Claude, Gemini, etc.).
- * - When targetFormat === "openai": convert only when preserveDeveloperRole === false.
- *   This covers OpenAI-compatible providers (MiniMax, etc.) that use targetFormat "openai"
- *   but do not accept the developer role; the per-model preserveDeveloperRole flag is set
- *   via the dashboard "Compatibility" toggle ("Do not preserve developer role").
- * - When targetFormat === "openai" && preserveDeveloperRole !== false: keep developer (e.g. official OpenAI).
+ * - When targetFormat === "openai" && preserveDeveloperRole === false: map to system.
+ * - When targetFormat === "openai" && preserveDeveloperRole === true: keep developer.
+ * - When targetFormat === "openai" && preserveDeveloperRole === undefined (default):
+ *   resolve from {@link defaultPreserveDeveloperForProvider} — preserve only for
+ *   the OpenAI-compatible allowlist; map to system for everyone else (#2281).
  *
  * @param messages - Array of messages
  * @param targetFormat - The target format (e.g., "openai", "claude", "gemini")
- * @param preserveDeveloperRole - For targetFormat openai: undefined/true = keep developer (legacy default); false = map to system (MiniMax and other OpenAI-compatible gateways that reject developer)
+ * @param preserveDeveloperRole - undefined = provider-driven default; true = always keep; false = always map to system
+ * @param provider - Provider id (used when preserveDeveloperRole is undefined)
  */
 export function normalizeDeveloperRole(
   messages: NormalizedMessage[] | unknown,
   targetFormat: string,
-  preserveDeveloperRole?: boolean
+  preserveDeveloperRole?: boolean,
+  provider?: string
 ): NormalizedMessage[] | unknown {
   if (!Array.isArray(messages)) return messages;
 
-  if (targetFormat === "openai" && preserveDeveloperRole !== false) return messages;
+  if (targetFormat === "openai") {
+    const effectivePreserve =
+      preserveDeveloperRole !== undefined
+        ? preserveDeveloperRole
+        : defaultPreserveDeveloperForProvider(provider ?? "");
+    if (effectivePreserve) return messages;
+  }
 
   return messages.map((msg: NormalizedMessage) => {
     if (!msg || typeof msg !== "object") return msg;
@@ -213,7 +281,7 @@ export function normalizeRoles(
   if (!Array.isArray(messages)) return messages;
 
   let result = normalizeModelRole(messages);
-  result = normalizeDeveloperRole(result, targetFormat, preserveDeveloperRole);
+  result = normalizeDeveloperRole(result, targetFormat, preserveDeveloperRole, provider);
   result = normalizeSystemRole(result, provider, model);
 
   return result;

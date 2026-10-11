@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 
 const require = createRequire(import.meta.url);
 const childProcess = require("node:child_process");
-const modulePath = path.join(process.cwd(), "scripts/runtime-env.mjs");
+const modulePath = path.join(process.cwd(), "scripts/build/runtime-env.mjs");
 
 const originalSpawn = childProcess.spawn;
 const originalProcessOn = process.on;
@@ -40,6 +40,9 @@ test("runtime env helpers normalize runtime ports and conflicting color flags", 
       PORT: "22128",
       DASHBOARD_PORT: "22128",
       API_PORT: "21128",
+      // #8999 (docker entrypoint moved to /app) made withRuntimePortEnv also pin
+      // the bind address, defaulting to 0.0.0.0 when OMNIROUTE_HOSTNAME is unset.
+      HOSTNAME: "0.0.0.0",
     }
   );
 

@@ -1,6 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
-import { getProviderConnectionById } from "@/lib/localDb";
+import { getCachedProviderConnectionById } from "@/lib/db/readCache";
 import { createBackup } from "@/shared/services/backupService";
 import { getCliConfigPaths } from "@/shared/services/cliRuntime";
 import {
@@ -93,6 +93,18 @@ function extractCodexAccountId(idToken: string, providerSpecificData: unknown): 
   );
 }
 
+function extractCodexEmail(connection: CodexConnectionLike): string | null {
+  const idToken = toNonEmptyString(connection.idToken);
+  if (idToken) {
+    const payload = decodeJwtPayload(idToken);
+    if (payload) {
+      const fromClaim = toNonEmptyString(payload.email);
+      if (fromClaim) return fromClaim;
+    }
+  }
+  return toNonEmptyString(connection.email);
+}
+
 function shouldRefreshCodexConnection(connection: CodexConnectionLike): boolean {
   if (!toNonEmptyString(connection.accessToken)) {
     return true;
@@ -122,10 +134,12 @@ function getConnectionLabel(connection: CodexConnectionLike): string {
 }
 
 function sanitizeFileNamePart(value: string): string {
+  // Keep alphanumerics, dot, underscore, hyphen and @ so email addresses survive
+  // intact in the exported filename (e.g. `auth-diego@example.com.json`).
   const normalized = value
     .trim()
     .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/[^a-z0-9._@-]+/g, "-")
     .replace(/^-+|-+$/g, "");
 
   return normalized || "account";
@@ -183,7 +197,9 @@ function buildCodexAuthPayload(connection: CodexConnectionLike): CodexAuthFilePa
 }
 
 async function resolveFreshCodexConnection(connectionId: string): Promise<CodexConnectionLike> {
-  const connection = (await getProviderConnectionById(connectionId)) as CodexConnectionLike | null;
+  const connection = (await getCachedProviderConnectionById(
+    connectionId
+  )) as CodexConnectionLike | null;
   if (!connection) {
     throw new CodexAuthFileError("Connection not found", 404, "not_found");
   }
@@ -209,15 +225,24 @@ async function resolveFreshCodexConnection(connectionId: string): Promise<CodexC
     );
   }
 
-  const refreshed = await getAccessToken("codex", {
-    connectionId,
-    accessToken: connection.accessToken,
-    refreshToken,
-    expiresAt: connection.expiresAt,
-    expiresIn: connection.expiresIn,
-    idToken: connection.idToken,
-    providerSpecificData: connection.providerSpecificData,
-  });
+  // Pass onPersist so the DB write is atomic with the network call inside the mutex.
+  let persistedRefresh: any = null;
+  const refreshed = await getAccessToken(
+    "codex",
+    {
+      connectionId,
+      accessToken: connection.accessToken,
+      refreshToken,
+      expiresAt: connection.expiresAt,
+      expiresIn: connection.expiresIn,
+      idToken: connection.idToken,
+      providerSpecificData: connection.providerSpecificData,
+    },
+    async (result) => {
+      await updateProviderCredentials(connectionId, result);
+      persistedRefresh = result;
+    }
+  );
 
   if (isUnrecoverableRefreshError(refreshed)) {
     throw new CodexAuthFileError(
@@ -235,7 +260,16 @@ async function resolveFreshCodexConnection(connectionId: string): Promise<CodexC
     );
   }
 
-  await updateProviderCredentials(connectionId, refreshed);
+  // If onPersist was not triggered (no accessToken path), fall back to explicit persist.
+  if (!persistedRefresh) {
+    await updateProviderCredentials(connectionId, refreshed);
+  }
+
+  const effectiveExpiresAt = refreshed.expiresAt
+    ? refreshed.expiresAt
+    : typeof refreshed.expiresIn === "number"
+      ? new Date(Date.now() + refreshed.expiresIn * 1000).toISOString()
+      : connection.expiresAt || null;
 
   return {
     ...connection,
@@ -243,10 +277,7 @@ async function resolveFreshCodexConnection(connectionId: string): Promise<CodexC
     refreshToken: toNonEmptyString(refreshed.refreshToken) || refreshToken,
     expiresIn:
       typeof refreshed.expiresIn === "number" ? refreshed.expiresIn : connection.expiresIn || null,
-    expiresAt:
-      typeof refreshed.expiresIn === "number"
-        ? new Date(Date.now() + refreshed.expiresIn * 1000).toISOString()
-        : connection.expiresAt || null,
+    expiresAt: effectiveExpiresAt,
     providerSpecificData: refreshed.providerSpecificData
       ? {
           ...toRecord(connection.providerSpecificData),
@@ -260,7 +291,8 @@ export async function buildCodexAuthFile(connectionId: string): Promise<BuiltCod
   const connection = await resolveFreshCodexConnection(connectionId);
   const payload = buildCodexAuthPayload(connection);
   const connectionLabel = getConnectionLabel(connection);
-  const fileName = `codex-auth-${sanitizeFileNamePart(connectionLabel)}.json`;
+  const fileNameIdentifier = extractCodexEmail(connection) || connectionLabel;
+  const fileName = `auth-${sanitizeFileNamePart(fileNameIdentifier)}.json`;
   const content = JSON.stringify(payload, null, 2) + "\n";
 
   return {
@@ -275,14 +307,36 @@ export async function buildCodexAuthFile(connectionId: string): Promise<BuiltCod
 export async function writeCodexAuthFileToLocalCli(connectionId: string) {
   const built = await buildCodexAuthFile(connectionId);
   const paths = getCliConfigPaths("codex");
+  // authPath is sourced exclusively from the static CLI_TOOLS table in
+  // src/shared/services/cliRuntime.ts (joined against os.homedir() inside
+  // that helper). No external/user input ever reaches the path APIs below.
   const authPath = paths?.auth;
 
   if (!authPath) {
     throw new CodexAuthFileError("Codex auth path could not be resolved", 500, "path_unavailable");
   }
 
-  await fs.mkdir(path.dirname(authPath), { recursive: true });
-  await createBackup("codex", authPath);
+  const authDir = path.dirname(authPath);
+  await fs.mkdir(authDir, { recursive: true });
+
+  // Side-by-side .bak inside the .codex directory for one-click manual
+  // rollback. Both halves are server-controlled (authDir from the static
+  // CLI_TOOLS table; basename from a server-generated ISO timestamp), so
+  // string concatenation here is safe — and avoids the false-positive
+  // taint on path.join when Semgrep cannot follow the trust chain.
+  let savedBakPath: string | null = null;
+  try {
+    await fs.access(authPath);
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    savedBakPath = `${authDir}${path.sep}auth-${ts}.bak`;
+    await fs.copyFile(authPath, savedBakPath);
+  } catch {
+    // No existing file; nothing to back up side-by-side.
+  }
+
+  // Centralized history (audit trail across all CLI tools).
+  const centralizedBackupPath = await createBackup("codex", authPath);
+
   await fs.writeFile(authPath, built.content, { encoding: "utf8", mode: 0o600 });
 
   try {
@@ -294,5 +348,97 @@ export async function writeCodexAuthFileToLocalCli(connectionId: string) {
   return {
     ...built,
     authPath,
+    savedBakPath,
+    centralizedBackupPath,
   };
+}
+
+/**
+ * Decision for the guarded write (see writeCodexAuthFileToLocalCliIfNeeded).
+ */
+export type CodexAuthWriteDecision =
+  | "written" // wrote a fresh auth.json (was absent, stale, or force)
+  | "skipped_present_fresh"; // an existing, non-stale auth.json was left untouched
+
+/**
+ * Guarded variant of writeCodexAuthFileToLocalCli for the codex-app-server
+ * "Sign in with ChatGPT" flow. Per the design decision (William, Q2):
+ *
+ *   - Write ONLY when ~/.codex/auth.json is ABSENT, or STALE (its token is at/
+ *     past the refresh buffer), or when `force` is set.
+ *   - NEVER clobber an existing, healthy (non-stale) auth.json — a user may be
+ *     managing the CLI session themselves. (The underlying writer always makes a
+ *     backup regardless, so even a forced overwrite is recoverable.)
+ *
+ * Staleness is read from the existing file's `last_refresh` + the token's own
+ * expiry claim (JWT `exp` on the access_token) when present; if neither is
+ * readable we treat the file as fresh (do not clobber).
+ *
+ * Returns the write decision plus (when written) the underlying write result.
+ */
+export async function writeCodexAuthFileToLocalCliIfNeeded(
+  connectionId: string,
+  options: { force?: boolean } = {}
+): Promise<{
+  decision: CodexAuthWriteDecision;
+  authPath: string | null;
+  result?: Awaited<ReturnType<typeof writeCodexAuthFileToLocalCli>>;
+}> {
+  const paths = getCliConfigPaths("codex");
+  const authPath = paths?.auth ?? null;
+
+  if (!options.force && authPath) {
+    const existing = await readExistingCodexAuth(authPath);
+    if (existing && !isCodexAuthStale(existing)) {
+      // Present and healthy — do not clobber a session we didn't (or don't need
+      // to) manage. The connection can still authenticate turns via this file.
+      return { decision: "skipped_present_fresh", authPath };
+    }
+  }
+
+  const result = await writeCodexAuthFileToLocalCli(connectionId);
+  return { decision: "written", authPath: result.authPath, result };
+}
+
+/** Read + parse an existing ~/.codex/auth.json; null when absent/unreadable. */
+async function readExistingCodexAuth(authPath: string): Promise<CodexAuthFilePayload | null> {
+  try {
+    const raw = await fs.readFile(authPath, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    const rec = toRecord(parsed);
+    const tokens = toRecord(rec.tokens);
+    if (!toNonEmptyString(tokens.access_token)) return null;
+    return parsed as CodexAuthFilePayload;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A stored auth.json is "stale" when its access_token is at/past the refresh
+ * buffer. Prefer the JWT `exp` claim on the access_token; fall back to
+ * `last_refresh` + a conservative validity window; if neither is parseable,
+ * treat as NOT stale (never clobber on ambiguity).
+ */
+function isCodexAuthStale(payload: CodexAuthFilePayload): boolean {
+  const accessToken = toNonEmptyString(payload?.tokens?.access_token);
+  if (accessToken) {
+    const claims = decodeJwtPayload(accessToken);
+    const exp = claims && typeof claims.exp === "number" ? claims.exp : null;
+    if (exp) {
+      const expiresAtMs = exp * 1000;
+      return expiresAtMs - Date.now() <= CODEX_REFRESH_BUFFER_MS;
+    }
+  }
+  // No usable exp claim — fall back to last_refresh age. Codex access tokens are
+  // short-lived (~hours); if the file hasn't refreshed in > 6h, consider it stale.
+  const lastRefresh = toNonEmptyString(payload?.last_refresh);
+  if (lastRefresh) {
+    const refreshedMs = new Date(lastRefresh).getTime();
+    if (!Number.isNaN(refreshedMs)) {
+      const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+      return Date.now() - refreshedMs >= SIX_HOURS_MS;
+    }
+  }
+  return false;
 }

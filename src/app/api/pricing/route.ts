@@ -1,19 +1,27 @@
 import { NextResponse } from "next/server";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import {
   getPricing,
   getPricingWithSources,
   updatePricing,
   resetPricing,
   resetAllPricing,
-} from "@/lib/localDb";
+} from "@/lib/db/settings";
 import { updatePricingSchema } from "@/shared/validation/schemas";
-import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import {
+  formatValidationMessage,
+  isValidationFailure,
+  validateBody,
+} from "@/shared/validation/helpers";
 
 /**
  * GET /api/pricing
  * Get current pricing configuration (merged user + defaults)
  */
 export async function GET(request: Request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   try {
     const includeSources = new URL(request.url).searchParams.get("includeSources") === "1";
     if (includeSources) {
@@ -34,6 +42,9 @@ export async function GET(request: Request) {
  * Body: { provider: { model: { input: number, output: number, cached: number, ... } } }
  */
 export async function PATCH(request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   let rawBody;
   try {
     rawBody = await request.json();
@@ -52,7 +63,15 @@ export async function PATCH(request) {
   try {
     const validation = validateBody(updatePricingSchema, rawBody);
     if (isValidationFailure(validation)) {
-      return NextResponse.json({ error: validation.error }, { status: 400 });
+      // #12494: PricingTab reads this payload as `{ error?: string }` and feeds it
+      // straight to `new Error(...)`, so handing back the `{ message, details }`
+      // object rendered as "Falha ao salvar preços: [object Object]". Send a string.
+      // `formatValidationMessage` names the offending field ("field: reason") instead
+      // of the bare "Invalid request" constant, so the toast stays actionable (#10849).
+      return NextResponse.json(
+        { error: formatValidationMessage(validation.error) },
+        { status: 400 }
+      );
     }
     const body = validation.data;
 
@@ -70,6 +89,9 @@ export async function PATCH(request) {
  * Query params: ?provider=xxx&model=yyy (optional)
  */
 export async function DELETE(request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   try {
     const { searchParams } = new URL(request.url);
     const provider = searchParams.get("provider");

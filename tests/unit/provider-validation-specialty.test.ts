@@ -1,14 +1,35 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const { validateProviderApiKey, validateClaudeCodeCompatibleProvider } =
-  await import("../../src/lib/providers/validation.ts");
+const {
+  validateProviderApiKey,
+  validateClaudeCodeCompatibleProvider,
+  validateCommandCodeProvider,
+  isSecurityBlockError,
+} = await import("../../src/lib/providers/validation.ts");
+
+const { SafeOutboundFetchError } = await import("../../src/shared/network/safeOutboundFetch.ts");
+
+const { __setTlsFetchOverrideForTesting: __setPplxTlsFetchOverride } =
+  await import("../../open-sse/services/perplexityTlsClient.ts");
+
+const { __setTlsFetchOverrideForTesting: __setGrokTlsFetchOverride } =
+  await import("../../open-sse/services/grokTlsClient.ts");
 
 const originalFetch = globalThis.fetch;
 
 test.afterEach(() => {
   globalThis.fetch = originalFetch;
+  __setPplxTlsFetchOverride(null);
+  __setGrokTlsFetchOverride(null);
 });
+
+function toPlainHeaders(headers: HeadersInit | undefined) {
+  if (headers instanceof Headers) return Object.fromEntries(headers.entries());
+  return Object.fromEntries(
+    Object.entries(headers || {}).map(([key, value]) => [key, String(value)])
+  );
+}
 
 function metaAiSseText(content: string, streamingState = "DONE") {
   return `event: next
@@ -34,7 +55,130 @@ data:
 `;
 }
 
-test("specialty provider validators cover Deepgram, AssemblyAI, NanoBanana, ElevenLabs and Inworld branches", async () => {
+test("Kiro API key validator resolves profiles with bearer auth", async () => {
+  const calls: Array<{ url: string; headers: Record<string, string> }> = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const headers = toPlainHeaders(init.headers);
+    calls.push({ url: String(url), headers });
+
+    assert.equal(String(url), "https://codewhisperer.us-east-1.amazonaws.com");
+    assert.equal(headers.Authorization, "Bearer ksk-valid");
+    assert.equal(headers["x-amz-target"], "AmazonCodeWhispererService.ListAvailableProfiles");
+    assert.equal(headers.Accept, "application/json");
+
+    return new Response(
+      JSON.stringify({
+        profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:123:profile/API" }],
+      }),
+      { status: 200 }
+    );
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "kiro",
+    apiKey: "ksk-valid",
+    providerSpecificData: { region: "us-east-1" },
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.error, null);
+  assert.equal(result.method, "kiro_list_available_profiles");
+  assert.equal(calls.length, 1);
+});
+
+test("Kiro API key validator accepts API keys that cannot list profiles", async () => {
+  const calls: Array<{
+    url: string;
+    headers: Record<string, string>;
+    body?: Record<string, unknown>;
+  }> = [];
+  globalThis.fetch = async () => new Response("unexpected", { status: 500 });
+
+  globalThis.fetch = async (url, init = {}) => {
+    const headers = toPlainHeaders(init.headers);
+    const body = init.body ? JSON.parse(String(init.body)) : undefined;
+    calls.push({ url: String(url), headers, body });
+
+    if (calls.length === 1) {
+      return new Response(
+        JSON.stringify({
+          __type: "com.amazon.aws.codewhisperer#AccessDeniedException",
+          message: "API key authentication is not supported for this operation.",
+        }),
+        { status: 403 }
+      );
+    }
+
+    assert.equal(
+      String(url),
+      "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse"
+    );
+    assert.equal(headers.Authorization, "Bearer ksk-valid-without-profile-list");
+    assert.equal(headers.tokentype, "API_KEY");
+    assert.equal(
+      headers["X-Amz-Target"] || headers["x-amz-target"],
+      "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+    );
+    assert.equal(body.conversationState.currentMessage.userInputMessage.modelId, "auto");
+    assert.equal(body.inferenceConfig.maxTokens, 1);
+    return new Response(new ReadableStream(), { status: 200 });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "kiro",
+    apiKey: "ksk-valid-without-profile-list",
+    providerSpecificData: { region: "us-east-1" },
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.error, null);
+  assert.equal(result.method, "kiro_generate_assistant_response");
+  assert.equal(calls.length, 2);
+});
+
+test("Kiro API key validator rejects runtime auth failures after profile lookup is unsupported", async () => {
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    if (calls === 1) {
+      return new Response(
+        JSON.stringify({
+          __type: "com.amazon.aws.codewhisperer#AccessDeniedException",
+          message: "API key authentication is not supported for this operation.",
+        }),
+        { status: 403 }
+      );
+    }
+    return new Response(JSON.stringify({ message: "bearer token is invalid" }), { status: 403 });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "kiro",
+    apiKey: "ksk-runtime-invalid",
+    providerSpecificData: { region: "us-east-1" },
+  });
+
+  assert.equal(result.valid, false);
+  assert.equal(result.error, "Invalid Kiro API key or AWS region");
+  assert.equal(calls, 2);
+});
+
+test("Kiro API key validator fails as invalid instead of unsupported", async () => {
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ message: "Access denied" }), { status: 403 });
+
+  const result = await validateProviderApiKey({
+    provider: "kiro",
+    apiKey: "ksk-invalid",
+    providerSpecificData: { region: "us-east-1" },
+  });
+
+  assert.equal(result.valid, false);
+  assert.equal(result.unsupported, false);
+  assert.match(result.error || "", /Failed to list profiles/);
+});
+
+test("specialty provider validators cover Deepgram, AssemblyAI, ElevenLabs and Inworld branches", async () => {
   globalThis.fetch = async (url, init = {}) => {
     const target = String(url);
     const headers = init.headers || {};
@@ -46,9 +190,6 @@ test("specialty provider validators cover Deepgram, AssemblyAI, NanoBanana, Elev
     if (target.match(/assemblyai/i)) {
       assert.equal(headers.Authorization, "aa-key");
       return new Response(JSON.stringify({ error: "unauthorized" }), { status: 403 });
-    }
-    if (target.match(/nanobanana/i)) {
-      return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
     }
     if (target.match(/elevenlabs/i)) {
       return new Response(JSON.stringify({ voices: [] }), { status: 200 });
@@ -62,15 +203,47 @@ test("specialty provider validators cover Deepgram, AssemblyAI, NanoBanana, Elev
 
   const deepgram = await validateProviderApiKey({ provider: "deepgram", apiKey: "dg-key" });
   const assembly = await validateProviderApiKey({ provider: "assemblyai", apiKey: "aa-key" });
-  const banana = await validateProviderApiKey({ provider: "nanobanana", apiKey: "nb-key" });
   const eleven = await validateProviderApiKey({ provider: "elevenlabs", apiKey: "el-key" });
   const inworld = await validateProviderApiKey({ provider: "inworld", apiKey: "iw-key" });
 
   assert.equal(deepgram.valid, true);
   assert.equal(assembly.error, "Invalid API key");
-  assert.equal(banana.error, "Invalid API key");
   assert.equal(eleven.valid, true);
   assert.equal(inworld.valid, true);
+});
+
+test("validateCommandCodeProvider ignores caller baseUrl and chatPath overrides", async () => {
+  globalThis.fetch = async (url, init = {}) => {
+    assert.equal(String(url), "https://api.commandcode.ai/provider/v1/chat/completions");
+    const headers = init.headers as Record<string, string>;
+    assert.equal(headers.Authorization, "Bearer cc-key");
+    const body = JSON.parse(String(init.body));
+    assert.equal(body.model, "command-code-validation-model");
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
+  const result = await validateCommandCodeProvider({
+    apiKey: "cc-key",
+    providerSpecificData: {
+      baseUrl: "https://evil.example/api",
+      chatPath: "/v1/chat/completions",
+      validationModelId: "command-code-validation-model",
+    },
+  });
+
+  assert.equal(result.valid, true);
+});
+
+test("validateCommandCodeProvider defaults probe model to DeepSeek flash", async () => {
+  globalThis.fetch = async (_url, init = {}) => {
+    const body = JSON.parse(String(init.body));
+    assert.equal(body.model, "deepseek/deepseek-v4-flash");
+    return new Response("", { status: 400 });
+  };
+
+  const result = await validateCommandCodeProvider({ apiKey: "cc-key" });
+
+  assert.deepEqual(result, { valid: true, error: null });
 });
 
 test("specialty providers surface network failures and non-auth upstream failures", async () => {
@@ -78,9 +251,6 @@ test("specialty providers surface network failures and non-auth upstream failure
     const target = String(url);
     if (target.match(/deepgram/i)) {
       throw new Error("deepgram offline");
-    }
-    if (target.match(/nanobanana/i)) {
-      throw new Error("nanobanana offline");
     }
     if (target.match(/elevenlabs/i)) {
       return new Response(JSON.stringify({ error: "server" }), { status: 500 });
@@ -95,13 +265,11 @@ test("specialty providers surface network failures and non-auth upstream failure
   };
 
   const deepgram = await validateProviderApiKey({ provider: "deepgram", apiKey: "dg-key" });
-  const banana = await validateProviderApiKey({ provider: "nanobanana", apiKey: "nb-key" });
   const eleven = await validateProviderApiKey({ provider: "elevenlabs", apiKey: "el-key" });
   const inworld = await validateProviderApiKey({ provider: "inworld", apiKey: "iw-key" });
   const longcat = await validateProviderApiKey({ provider: "longcat", apiKey: "lc-key" });
 
   assert.equal(deepgram.error, "deepgram offline");
-  assert.equal(banana.error, "nanobanana offline");
   assert.equal(eleven.error, "Validation failed: 500");
   assert.equal(inworld.error, "Invalid API key");
   assert.equal(longcat.error, "longcat offline");
@@ -118,13 +286,9 @@ test("embedding and rerank specialty validators cover Voyage AI and Jina AI", as
       return new Response(JSON.stringify({ data: [{ embedding: [0.1, 0.2] }] }), { status: 200 });
     }
 
-    if (target === "https://api.jina.ai/v1/rerank") {
+    if (target === "https://api.jina.ai/v1/models") {
       assert.equal((init.headers as Record<string, string>).Authorization, "Bearer jina-key");
-      const body = JSON.parse(String(init.body));
-      assert.equal(body.model, "jina-reranker-v3");
-      return new Response(JSON.stringify({ results: [{ index: 0, relevance_score: 0.99 }] }), {
-        status: 200,
-      });
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
     }
 
     throw new Error(`unexpected fetch: ${target}`);
@@ -176,13 +340,25 @@ test("AWS Polly specialty validator requires an access key id", async () => {
   assert.equal(result.error, "Missing AWS accessKeyId");
 });
 
+test("AWS Polly specialty validator identifies invalid AWS credentials", async () => {
+  globalThis.fetch = async () => new Response("forbidden", { status: 403 });
+
+  const result = await validateProviderApiKey({
+    provider: "aws-polly",
+    apiKey: "aws-secret",
+    providerSpecificData: { accessKeyId: "AKIA_POLLY" },
+  });
+
+  assert.equal(result.error, "Invalid AWS credentials");
+});
+
 test("embedding and rerank specialty validators surface auth failures for Voyage AI and Jina AI", async () => {
   globalThis.fetch = async (url) => {
     const target = String(url);
     if (target === "https://api.voyageai.com/v1/embeddings") {
       return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
     }
-    if (target === "https://api.jina.ai/v1/rerank") {
+    if (target === "https://api.jina.ai/v1/models") {
       return new Response(JSON.stringify({ error: "forbidden" }), { status: 403 });
     }
     throw new Error(`unexpected fetch: ${target}`);
@@ -192,7 +368,49 @@ test("embedding and rerank specialty validators surface auth failures for Voyage
   const jina = await validateProviderApiKey({ provider: "jina-ai", apiKey: "jina-key" });
 
   assert.equal(voyage.error, "Invalid API key");
-  assert.equal(jina.error, "Invalid API key");
+  assert.equal(jina.error, "Invalid API key (GET https://api.jina.ai/v1/models)");
+});
+
+test("v0-vercel specialty validator checks the Platform API chats endpoint", async () => {
+  globalThis.fetch = async (url, init = {}) => {
+    assert.equal(String(url), "https://api.v0.dev/v1/chats?limit=1");
+    assert.equal((init.headers as Record<string, string>).Authorization, "Bearer v0-key");
+    return new Response(JSON.stringify({ object: "list", data: [] }), { status: 200 });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "v0-vercel",
+    apiKey: "v0-key",
+    providerSpecificData: {
+      baseUrl: "https://api.v0.dev/v1/chat/completions",
+    },
+  });
+
+  assert.deepEqual(result, {
+    valid: true,
+    error: null,
+    method: "v0_platform_chats_list",
+  });
+});
+
+test("v0-vercel specialty validator treats auth failures as invalid API key", async () => {
+  globalThis.fetch = async (url, init = {}) => {
+    assert.equal(String(url), "https://api.v0.dev/v1/chats?limit=1");
+    assert.equal((init.headers as Record<string, string>).Authorization, "Bearer bad-v0-key");
+    return new Response(JSON.stringify({ error: { type: "unauthorized_error" } }), {
+      status: 401,
+    });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "v0-vercel",
+    apiKey: "bad-v0-key",
+    providerSpecificData: {
+      baseUrl: "https://api.v0.dev/v1",
+    },
+  });
+
+  assert.equal(result.error, "Invalid API key");
 });
 
 test("gitlab specialty validator accepts PAT auth on the direct access endpoint", async () => {
@@ -216,16 +434,26 @@ test("gitlab specialty validator treats 401 as invalid PAT", async () => {
 
 test("web-cookie provider validators accept valid Grok, Perplexity, Blackbox and Muse Spark session cookies", async () => {
   const calls = [];
+
+  // Grok now uses tlsFetchGrok (TLS-impersonating client) to bypass Cloudflare Enterprise.
+  let grokTlsCall: { url: string; options: Record<string, unknown> } | null = null;
+  __setGrokTlsFetchOverride(async (url, options) => {
+    grokTlsCall = { url, options };
+    return { status: 200, headers: new Headers(), text: null, body: null };
+  });
+
+  // Perplexity now uses tlsFetchPerplexity (TLS-impersonating client) instead of globalThis.fetch
+  // to bypass Cloudflare Enterprise. Use the test-only override hook to intercept calls.
+  let pplxTlsCall: { url: string; options: Record<string, unknown> } | null = null;
+  __setPplxTlsFetchOverride(async (url, options) => {
+    pplxTlsCall = { url, options };
+    return { status: 200, headers: new Headers(), text: null, body: null };
+  });
+
   globalThis.fetch = async (url, init = {}) => {
     const target = String(url);
     calls.push({ url: target, init });
 
-    if (target.includes("grok.com/rest/app-chat/conversations/new")) {
-      return new Response(JSON.stringify({ ok: true }), { status: 200 });
-    }
-    if (target.includes("perplexity.ai/rest/sse/perplexity_ask")) {
-      return new Response(JSON.stringify({ ok: true }), { status: 200 });
-    }
     if (target.includes("app.blackbox.ai/api/auth/session")) {
       return new Response(
         JSON.stringify({
@@ -273,12 +501,6 @@ test("web-cookie provider validators accept valid Grok, Perplexity, Blackbox and
   assert.equal(blackbox.valid, true);
   assert.equal(museSpark.valid, true);
 
-  const grokCall = calls.find((call) =>
-    call.url.includes("grok.com/rest/app-chat/conversations/new")
-  );
-  const perplexityCall = calls.find((call) =>
-    call.url.includes("perplexity.ai/rest/sse/perplexity_ask")
-  );
   const blackboxSessionCall = calls.find((call) =>
     call.url.includes("app.blackbox.ai/api/auth/session")
   );
@@ -287,12 +509,25 @@ test("web-cookie provider validators accept valid Grok, Perplexity, Blackbox and
   );
   const museSparkCall = calls.find((call) => call.url.includes("meta.ai/api/graphql"));
 
-  assert.equal(grokCall?.init.headers.Cookie, "sso=grok-cookie");
-  const grokBody = JSON.parse(String(grokCall?.init.body || "{}"));
+  // Grok goes through tlsFetchGrok (TLS override), not globalThis.fetch.
+  assert.ok(grokTlsCall, "grok TLS override was called");
+  assert.ok(grokTlsCall!.url.includes("grok.com/rest/app-chat/conversations/new"));
+  assert.equal(
+    (grokTlsCall!.options.headers as Record<string, string>)["Cookie"],
+    "sso=grok-cookie"
+  );
+  const grokBody = JSON.parse(String(grokTlsCall!.options.body || "{}"));
   assert.equal(grokBody.modeId, "fast");
   assert.equal("modelName" in grokBody, false);
   assert.equal("modelMode" in grokBody, false);
-  assert.equal(perplexityCall?.init.headers.Cookie, "__Secure-next-auth.session-token=pplx-cookie");
+  // Perplexity goes through tlsFetchPerplexity (TLS override), not globalThis.fetch.
+  // options.headers is a plain object; the validator sets Cookie from the session token.
+  assert.ok(pplxTlsCall, "perplexity TLS override was called");
+  assert.ok(pplxTlsCall!.url.includes("perplexity.ai/rest/sse/perplexity_ask"));
+  assert.equal(
+    (pplxTlsCall!.options.headers as Record<string, string>)["Cookie"],
+    "__Secure-next-auth.session-token=pplx-cookie"
+  );
   assert.equal(blackboxSessionCall?.init.headers.Cookie, "__Secure-authjs.session-token=bb-cookie");
   assert.equal(
     blackboxSubscriptionCall?.init.headers.Cookie,
@@ -303,14 +538,17 @@ test("web-cookie provider validators accept valid Grok, Perplexity, Blackbox and
 });
 
 test("web-cookie provider validators surface auth and subscription failures", async () => {
+  // Perplexity uses tlsFetchPerplexity (TLS-impersonating client). Return 403 to simulate
+  // an invalid session cookie so the validator emits the expected error message.
+  __setPplxTlsFetchOverride(async () => {
+    return { status: 403, headers: new Headers(), text: null, body: null };
+  });
+  __setGrokTlsFetchOverride(async () => {
+    return { status: 401, headers: new Headers(), text: "Unauthorized", body: null };
+  });
+
   globalThis.fetch = async (url, init = {}) => {
     const target = String(url);
-    if (target.includes("grok.com/rest/app-chat/conversations/new")) {
-      return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
-    }
-    if (target.includes("perplexity.ai/rest/sse/perplexity_ask")) {
-      return new Response(JSON.stringify({ error: "forbidden" }), { status: 403 });
-    }
     if (target.includes("app.blackbox.ai/api/auth/session")) {
       const cookie = (init.headers as Record<string, string>)?.Cookie || "";
       if (cookie.includes("expired-cookie")) {
@@ -371,26 +609,25 @@ test("web-cookie provider validators surface auth and subscription failures", as
 
 test("grok-web validator: full DevTools cookie blob is parsed for the sso value", async () => {
   let capturedCookie = "";
-  globalThis.fetch = async (url, init = {}) => {
-    const target = String(url);
-    if (target.includes("grok.com/rest/app-chat/conversations/new")) {
-      capturedCookie = ((init.headers as Record<string, string>) || {}).Cookie || "";
-      return new Response(JSON.stringify({ result: { conversation: {} } }), { status: 200 });
-    }
-    throw new Error(`unexpected fetch: ${target}`);
-  };
+  __setGrokTlsFetchOverride(async (_url, options) => {
+    capturedCookie = ((options.headers as Record<string, string>) || {}).Cookie || "";
+    return { status: 200, headers: new Headers(), text: null, body: null };
+  });
 
   const blob = "i18nextLng=en; stblid=foo; __cf_bm=bar; sso=eyJTARGET.abc.def; cf_clearance=baz;";
   const result = await validateProviderApiKey({ provider: "grok-web", apiKey: blob });
 
   assert.equal(result.valid, true);
-  assert.equal(capturedCookie, "sso=eyJTARGET.abc.def");
+  // #5350 — the outbound cookie now forwards the Cloudflare cookies too.
+  assert.match(capturedCookie, /(?:^|;\s*)sso=eyJTARGET\.abc\.def(?:;|$)/);
+  assert.match(capturedCookie, /(?:^|;\s*)cf_clearance=baz(?:;|$)/);
+  assert.match(capturedCookie, /(?:^|;\s*)__cf_bm=bar(?:;|$)/);
 });
 
 test("grok-web validator: empty/missing sso in input returns 'Missing sso cookie'", async () => {
-  globalThis.fetch = async () => {
+  __setGrokTlsFetchOverride(async () => {
     throw new Error("validator should short-circuit before fetching");
-  };
+  });
   const result = await validateProviderApiKey({
     provider: "grok-web",
     apiKey: "foo=1; bar=2;",
@@ -400,16 +637,14 @@ test("grok-web validator: empty/missing sso in input returns 'Missing sso cookie
 });
 
 test("grok-web validator: non-auth 403 is reported as failure with upstream body, not silently passed", async () => {
-  globalThis.fetch = async (url) => {
-    const target = String(url);
-    if (target.includes("grok.com/rest/app-chat/conversations/new")) {
-      return new Response(
-        JSON.stringify({ error: { code: 7, message: "Model is not found", details: [] } }),
-        { status: 403 }
-      );
-    }
-    throw new Error(`unexpected fetch: ${target}`);
-  };
+  __setGrokTlsFetchOverride(async () => {
+    return {
+      status: 403,
+      headers: new Headers(),
+      text: JSON.stringify({ error: { code: 7, message: "Model is not found", details: [] } }),
+      body: null,
+    };
+  });
 
   const result = await validateProviderApiKey({ provider: "grok-web", apiKey: "good-cookie" });
   assert.equal(result.valid, false);
@@ -417,199 +652,186 @@ test("grok-web validator: non-auth 403 is reported as failure with upstream body
   assert.match(result.error || "", /Model is not found/);
 });
 
-test("grok-web validator: generic 403 forbidden is rejected, not silently passed", async () => {
-  globalThis.fetch = async (url) => {
-    const target = String(url);
-    if (target.includes("grok.com/rest/app-chat/conversations/new")) {
-      return new Response("Forbidden", { status: 403 });
-    }
-    throw new Error(`unexpected fetch: ${target}`);
-  };
+test("grok-web validator: generic non-auth 403 maps to IP-reputation guidance, not 'invalid cookie' (#3474)", async () => {
+  __setGrokTlsFetchOverride(async () => {
+    return { status: 403, headers: new Headers(), text: "Forbidden", body: null };
+  });
 
   const result = await validateProviderApiKey({ provider: "grok-web", apiKey: "any-cookie" });
   assert.equal(result.valid, false);
+  // A bare/non-auth 403 from grok.com is almost always an anti-bot/IP-reputation
+  // block — the cookie itself is likely fine. The message must point the user to a
+  // residential IP or proxy, NOT tell them the cookie is invalid.
+  assert.match(result.error || "", /residential IP|proxy/i);
+  assert.doesNotMatch(result.error || "", /invalid SSO cookie/i);
+});
+
+test("grok-web validator: anti-bot 'Request rejected' 403 maps to IP-reputation guidance (#3474)", async () => {
+  __setGrokTlsFetchOverride(async () => {
+    return {
+      status: 403,
+      headers: new Headers(),
+      text: "Request rejected by anti-bot rules.",
+      body: null,
+    };
+  });
+
+  const result = await validateProviderApiKey({ provider: "grok-web", apiKey: "good-cookie" });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /residential IP|proxy/i);
+  // Cookie may be fine — must not claim it is invalid/expired.
+  assert.doesNotMatch(result.error || "", /invalid SSO cookie|expired/i);
+});
+
+test("grok-web validator: Cloudflare challenge returned with a 403 status maps to IP guidance (#3474)", async () => {
+  __setGrokTlsFetchOverride(async () => {
+    return {
+      status: 403,
+      headers: new Headers(),
+      text: "<html><title>Just a moment...</title><script>window._cf_chl_opt</script></html>",
+      body: null,
+    };
+  });
+
+  const result = await validateProviderApiKey({ provider: "grok-web", apiKey: "sso=abc" });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /residential IP|proxy/i);
+});
+
+test("grok-web validator: IP-reputation 403 message does not leak a stack/raw error (Hard Rule #12) (#3474)", async () => {
+  __setGrokTlsFetchOverride(async () => {
+    return {
+      status: 403,
+      headers: new Headers(),
+      text: "Request rejected by anti-bot rules.\n    at GrokWeb.validate (/app/secret/path.ts:42:13)",
+      body: null,
+    };
+  });
+
+  const result = await validateProviderApiKey({ provider: "grok-web", apiKey: "good-cookie" });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /residential IP|proxy/i);
+  assert.ok(!(result.error || "").includes("at GrokWeb.validate"));
+  assert.ok(!(result.error || "").includes("/app/secret/path.ts"));
+  assert.ok(!(result.error || "").includes("    at "));
+});
+
+test("grok-web validator: structured non-auth 403 (resource error) still surfaces upstream body for maintainers (#3474)", async () => {
+  // Distinct from an anti-bot block: a genuine upstream API error (e.g. the probe
+  // model was renamed) carries a structured error.message and must NOT be masked
+  // by the IP-reputation guidance — the maintainer needs to see the real cause.
+  __setGrokTlsFetchOverride(async () => {
+    return {
+      status: 403,
+      headers: new Headers(),
+      text: JSON.stringify({ error: { code: 7, message: "Model is not found", details: [] } }),
+      body: null,
+    };
+  });
+
+  const result = await validateProviderApiKey({ provider: "grok-web", apiKey: "good-cookie" });
+  assert.equal(result.valid, false);
   assert.match(result.error || "", /Grok rejected validation \(403\)/);
+  assert.match(result.error || "", /Model is not found/);
+  assert.doesNotMatch(result.error || "", /residential IP|proxy/i);
+});
+
+test("grok-web validator: auth-shaped 401 keeps the re-paste/re-authenticate guidance (no regression) (#3474)", async () => {
+  __setGrokTlsFetchOverride(async () => {
+    return { status: 401, headers: new Headers(), text: "Unauthorized", body: null };
+  });
+
+  const result = await validateProviderApiKey({ provider: "grok-web", apiKey: "expired-cookie" });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /Invalid SSO cookie|re-paste/i);
+  assert.doesNotMatch(result.error || "", /residential IP|proxy/i);
 });
 
 test("grok-web validator: 403 with credential-rejection body is treated as auth-failed", async () => {
-  globalThis.fetch = async (url) => {
-    const target = String(url);
-    if (target.includes("grok.com/rest/app-chat/conversations/new")) {
-      return new Response(
-        JSON.stringify({
-          error: {
-            code: 16,
-            message: "Failed to look up session ID. [WKE=unauthenticated:invalid-credentials]",
-            details: [],
-          },
-        }),
-        { status: 403 }
-      );
-    }
-    throw new Error(`unexpected fetch: ${target}`);
-  };
+  __setGrokTlsFetchOverride(async () => {
+    return {
+      status: 403,
+      headers: new Headers(),
+      text: JSON.stringify({
+        error: {
+          code: 16,
+          message: "Failed to look up session ID. [WKE=unauthenticated:invalid-credentials]",
+          details: [],
+        },
+      }),
+      body: null,
+    };
+  });
 
   const result = await validateProviderApiKey({ provider: "grok-web", apiKey: "bad-cookie" });
   assert.equal(result.valid, false);
   assert.match(result.error || "", /Invalid SSO cookie/i);
 });
 
-// ─── chatgpt-web validator ──────────────────────────────────────────────────
-// Mocks the TLS-impersonating fetch so unit tests don't need the native binding.
-
-const { __setTlsFetchOverrideForTesting } =
-  await import("../../open-sse/services/chatgptTlsClient.ts");
-
-function makeTlsResponse(status: number, body: string, headers: Record<string, string> = {}): any {
-  const h = new Headers();
-  for (const [k, v] of Object.entries(headers)) h.set(k, v);
-  return { status, headers: h, text: body, body: null };
-}
-
-test.afterEach(() => {
-  __setTlsFetchOverrideForTesting(null);
-});
-
-test("chatgpt-web validator: accepts a valid session response with accessToken", async () => {
-  let captured: { url: string; opts: any } | null = null;
-  __setTlsFetchOverrideForTesting(async (url, opts) => {
-    captured = { url, opts };
-    return makeTlsResponse(
-      200,
-      JSON.stringify({ accessToken: "tok-abc", expires: "2030-01-01T00:00:00Z" }),
-      { "content-type": "application/json" }
-    );
+// #5350 — when the user DID supply a cf_clearance, an auth-shaped 401 / invalid-credentials 403
+// is almost always an IP-reputation block (cf_clearance is IP+TLS+UA-pinned and cannot be
+// replayed from a different machine), NOT a bad cookie. Surface the IP guidance instead of the
+// misleading "Invalid SSO cookie" verdict.
+test("grok-web validator: 401 WITH a cf_clearance maps to IP-reputation guidance, not 'invalid cookie' (#5350)", async () => {
+  __setGrokTlsFetchOverride(async () => {
+    return { status: 401, headers: new Headers(), text: "Unauthorized", body: null };
   });
 
-  const result = await validateProviderApiKey({
-    provider: "chatgpt-web",
-    apiKey: "__Secure-next-auth.session-token=eyJSESSION",
-  });
-
-  assert.equal(result.valid, true);
-  assert.equal(captured?.url, "https://chatgpt.com/api/auth/session");
-  assert.equal(
-    (captured?.opts.headers as Record<string, string>).Cookie,
-    "__Secure-next-auth.session-token=eyJSESSION"
-  );
-});
-
-test("chatgpt-web validator: prepends session-token name to bare values", async () => {
-  let capturedCookie = "";
-  __setTlsFetchOverrideForTesting(async (_url, opts) => {
-    capturedCookie = (opts.headers as Record<string, string>).Cookie || "";
-    return makeTlsResponse(200, JSON.stringify({ accessToken: "tok" }), {
-      "content-type": "application/json",
-    });
-  });
-
-  await validateProviderApiKey({ provider: "chatgpt-web", apiKey: "eyJBARE" });
-  assert.equal(capturedCookie, "__Secure-next-auth.session-token=eyJBARE");
-});
-
-test("chatgpt-web validator: passes full DevTools cookie blob through verbatim", async () => {
-  let capturedCookie = "";
-  __setTlsFetchOverrideForTesting(async (_url, opts) => {
-    capturedCookie = (opts.headers as Record<string, string>).Cookie || "";
-    return makeTlsResponse(200, JSON.stringify({ accessToken: "tok" }), {
-      "content-type": "application/json",
-    });
-  });
-
-  const blob =
-    "Cookie: oai-did=foo; __Secure-next-auth.session-token.0=eyJchunk0; __Secure-next-auth.session-token.1=eyJchunk1; cf_clearance=cf123;";
-  await validateProviderApiKey({ provider: "chatgpt-web", apiKey: blob });
-  assert.equal(
-    capturedCookie,
-    "oai-did=foo; __Secure-next-auth.session-token.0=eyJchunk0; __Secure-next-auth.session-token.1=eyJchunk1; cf_clearance=cf123;"
-  );
-});
-
-test("chatgpt-web validator: 401 without cf-mitigated → invalid session cookie", async () => {
-  __setTlsFetchOverrideForTesting(async () =>
-    makeTlsResponse(401, JSON.stringify({ error: "unauthorized" }), {
-      "content-type": "application/json",
-    })
-  );
-
-  const result = await validateProviderApiKey({
-    provider: "chatgpt-web",
-    apiKey: "stale-token",
-  });
+  const blob = "sso=eyJTARGET.abc.def; sso-rw=RW; cf_clearance=CF; __cf_bm=BM";
+  const result = await validateProviderApiKey({ provider: "grok-web", apiKey: blob });
   assert.equal(result.valid, false);
-  assert.match(result.error || "", /Invalid ChatGPT session cookie/i);
+  assert.match(result.error || "", /residential IP|proxy/i);
+  assert.doesNotMatch(result.error || "", /invalid SSO cookie/i);
 });
 
-test("chatgpt-web validator: 403 with cf-mitigated header → Cloudflare hint", async () => {
-  __setTlsFetchOverrideForTesting(async () =>
-    makeTlsResponse(403, "<html>Just a moment...</html>", {
-      "content-type": "text/html",
-      "cf-mitigated": "challenge",
-    })
-  );
-
-  const result = await validateProviderApiKey({
-    provider: "chatgpt-web",
-    apiKey: "good-but-no-cf-cookies",
+test("grok-web validator: invalid-credentials 403 WITH a cf_clearance maps to IP-reputation guidance (#5350)", async () => {
+  __setGrokTlsFetchOverride(async () => {
+    return {
+      status: 403,
+      headers: new Headers(),
+      text: JSON.stringify({
+        error: {
+          code: 16,
+          message: "Failed to look up session ID. [WKE=unauthenticated:invalid-credentials]",
+          details: [],
+        },
+      }),
+      body: null,
+    };
   });
+
+  const blob = "sso=eyJTARGET.abc.def; cf_clearance=CF";
+  const result = await validateProviderApiKey({ provider: "grok-web", apiKey: blob });
   assert.equal(result.valid, false);
-  assert.match(result.error || "", /Cloudflare blocked the validator/i);
+  assert.match(result.error || "", /residential IP|proxy/i);
+  assert.doesNotMatch(result.error || "", /invalid SSO cookie/i);
 });
 
-test("chatgpt-web validator: 200 without accessToken → session expired", async () => {
-  __setTlsFetchOverrideForTesting(async () =>
-    makeTlsResponse(200, JSON.stringify({}), { "content-type": "application/json" })
-  );
-
-  const result = await validateProviderApiKey({
-    provider: "chatgpt-web",
-    apiKey: "expired-token",
+test("grok-web validator: TLS client unavailable surfaces actionable error", async () => {
+  __setGrokTlsFetchOverride(async () => {
+    const { TlsClientUnavailableError } = await import("../../open-sse/services/grokTlsClient.ts");
+    throw new TlsClientUnavailableError("native binary not found");
   });
+
+  const result = await validateProviderApiKey({ provider: "grok-web", apiKey: "sso=abc" });
   assert.equal(result.valid, false);
-  assert.match(result.error || "", /session expired/i);
+  assert.match(result.error || "", /TLS impersonation client unavailable/i);
+  assert.match(result.error || "", /native binary not found/i);
 });
 
-test("chatgpt-web validator: 5xx → ChatGPT unavailable", async () => {
-  __setTlsFetchOverrideForTesting(async () =>
-    makeTlsResponse(503, "service unavailable", { "content-type": "text/plain" })
-  );
-
-  const result = await validateProviderApiKey({
-    provider: "chatgpt-web",
-    apiKey: "any-token",
+test("grok-web validator: Cloudflare challenge page is detected and reported", async () => {
+  __setGrokTlsFetchOverride(async () => {
+    return {
+      status: 200,
+      headers: new Headers(),
+      text: "<html><title>Just a moment...</title><script>window._cf_chl_opt</script></html>",
+      body: null,
+    };
   });
+
+  const result = await validateProviderApiKey({ provider: "grok-web", apiKey: "sso=abc" });
   assert.equal(result.valid, false);
-  assert.match(result.error || "", /ChatGPT unavailable \(503\)/);
-});
-
-test("chatgpt-web validator: 200 non-JSON content-type surfaces a cookie hint", async () => {
-  __setTlsFetchOverrideForTesting(async () =>
-    makeTlsResponse(200, "<html>blocked</html>", {
-      "content-type": "text/html",
-      "cf-ray": "ray-123",
-    })
-  );
-
-  const result = await validateProviderApiKey({
-    provider: "chatgpt-web",
-    apiKey: "any-token",
-  });
-  assert.equal(result.valid, false);
-  assert.match(result.error || "", /non-JSON.*text\/html.*cf-ray=ray-123/i);
-});
-
-test("chatgpt-web validator: TlsClientUnavailableError surfaces a clear message", async () => {
-  const { TlsClientUnavailableError } = await import("../../open-sse/services/chatgptTlsClient.ts");
-  __setTlsFetchOverrideForTesting(async () => {
-    throw new TlsClientUnavailableError("native binding failed to load");
-  });
-
-  const result = await validateProviderApiKey({
-    provider: "chatgpt-web",
-    apiKey: "any-token",
-  });
-  assert.equal(result.valid, false);
-  assert.match(result.error || "", /chatgpt-web requires this/i);
+  assert.match(result.error || "", /Cloudflare anti-bot/i);
 });
 
 test("search provider validators cover success, client errors, server errors and custom user agent injection", async () => {
@@ -727,6 +949,75 @@ test("google PSE validator requires cx", async () => {
   assert.equal(result.error, "Programmable Search Engine ID (cx) is required");
 });
 
+test("Maritalk validates with Key auth against the models endpoint", async () => {
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), init });
+    assert.equal(String(url), "https://chat.maritaca.ai/api/models");
+    assert.equal(init.headers.Authorization, "Key maritalk-key");
+    return new Response(JSON.stringify({ data: [{ id: "sabia-4" }] }), {
+      status: 200,
+    });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "maritalk",
+    apiKey: "maritalk-key",
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.method, "maritalk_models");
+  assert.equal(calls.length, 1);
+});
+
+test("Maritalk falls back to chat probe when the models endpoint is unreachable", async () => {
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), init });
+
+    if (String(url) === "https://chat.maritaca.ai/api/models") {
+      return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+    }
+
+    assert.equal(String(url), "https://chat.maritaca.ai/api/chat/completions");
+    assert.equal(init.headers.Authorization, "Key maritalk-key");
+    const body = JSON.parse(String(init.body));
+    assert.equal(body.model, "sabia-4");
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+    });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "maritalk",
+    apiKey: "maritalk-key",
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(calls.length, 2);
+});
+
+test("Maritalk treats a rate-limited models probe as valid credentials", async () => {
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), init });
+    assert.equal(String(url), "https://chat.maritaca.ai/api/models");
+    assert.equal(init.headers.Authorization, "Key maritalk-key");
+    return new Response(JSON.stringify({ error: "rate limited" }), {
+      status: 429,
+    });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "maritalk",
+    apiKey: "maritalk-key",
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.warning, "Rate limited, but credentials are valid");
+  assert.equal(calls.length, 1);
+});
+
 test("local OpenAI-style providers validate without sending Authorization when apiKey is blank", async () => {
   const originalAllowPrivateProviderUrls = process.env.OMNIROUTE_ALLOW_PRIVATE_PROVIDER_URLS;
   process.env.OMNIROUTE_ALLOW_PRIVATE_PROVIDER_URLS = "true";
@@ -750,21 +1041,28 @@ test("local OpenAI-style providers validate without sending Authorization when a
       provider: "lemonade",
       providerSpecificData: { baseUrl: "http://localhost:13305/api/v1" },
     });
+    const llamaCpp = await validateProviderApiKey({
+      provider: "llama-cpp",
+      providerSpecificData: { baseUrl: "http://127.0.0.1:8080/v1" },
+    });
 
     assert.equal(lmStudio.valid, true);
     assert.equal(vllm.valid, true);
     assert.equal(lemonade.valid, true);
+    assert.equal(llamaCpp.valid, true);
     assert.deepEqual(
       calls.map((call) => call.url),
       [
         "http://localhost:1234/v1/models",
         "http://localhost:8000/v1/models",
         "http://localhost:13305/api/v1/models",
+        "http://127.0.0.1:8080/v1/models",
       ]
     );
     assert.equal(calls[0].headers.Authorization, undefined);
     assert.equal(calls[1].headers.Authorization, undefined);
     assert.equal(calls[2].headers.Authorization, undefined);
+    assert.equal(calls[3].headers.Authorization, undefined);
   } finally {
     if (originalAllowPrivateProviderUrls === undefined) {
       delete process.env.OMNIROUTE_ALLOW_PRIVATE_PROVIDER_URLS;
@@ -775,9 +1073,13 @@ test("local OpenAI-style providers validate without sending Authorization when a
 });
 
 test("OpenAI-compatible validator covers /responses mode and final ping fallback", async () => {
-  const calls = [];
+  const calls: Array<{ url: string; method: string; body: string | undefined }> = [];
   globalThis.fetch = async (url, init = {}) => {
-    calls.push({ url: String(url), method: init.method || "GET" });
+    calls.push({
+      url: String(url),
+      method: init.method || "GET",
+      body: typeof init.body === "string" ? init.body : undefined,
+    });
     if (String(url).endsWith("/models")) {
       return new Response(JSON.stringify({ error: "no models" }), { status: 500 });
     }
@@ -825,6 +1127,11 @@ test("OpenAI-compatible validator covers /responses mode and final ping fallback
     calls.map((call) => call.url),
     ["https://openai-like.example.com/v1/models", "https://openai-like.example.com/v1/responses"]
   );
+  const responsesBody = JSON.parse(calls[1].body || "{}");
+  assert.deepEqual(responsesBody.input, [{ role: "user", content: "test" }]);
+  assert.equal(responsesBody.max_output_tokens, 1);
+  assert.equal(responsesBody.messages, undefined);
+  assert.equal(responsesBody.max_tokens, undefined);
   assert.equal(pingFallback.valid, true);
   assert.equal(pingFallback.error, null);
 });
@@ -986,7 +1293,7 @@ test("registry providers cover remaining OpenAI-like and Claude-like validation 
   assert.equal(calls[1].headers["x-api-key"], "sk-claude");
 });
 
-test("specialty validators cover remaining status branches for Deepgram, AssemblyAI, NanoBanana, ElevenLabs, Inworld, Bailian and LongCat", async () => {
+test("specialty validators cover remaining status branches for Deepgram, AssemblyAI, ElevenLabs, Inworld, Bailian and LongCat", async () => {
   globalThis.fetch = async (url) => {
     const target = String(url);
     if (target.match(/deepgram/i)) {
@@ -995,16 +1302,15 @@ test("specialty validators cover remaining status branches for Deepgram, Assembl
     if (target.match(/assemblyai/i)) {
       return new Response(JSON.stringify({ transcripts: [] }), { status: 200 });
     }
-    if (target.match(/nanobanana/i)) {
-      return new Response(JSON.stringify({ error: "bad request" }), { status: 400 });
-    }
     if (target.match(/elevenlabs/i)) {
       return new Response(JSON.stringify({ error: "forbidden" }), { status: 403 });
     }
     if (target.match(/inworld/i)) {
       throw new Error("inworld offline");
     }
-    if (target.match(/dashscope\.aliyuncs\.com/i)) {
+    // Alibaba-family hosts: dashscope.aliyuncs.com (pay-as-you-go / AIGC) and
+    // *.maas.aliyuncs.com (Token Plan).
+    if (target.match(/(?:dashscope|maas)\.aliyuncs\.com/i)) {
       return new Response(JSON.stringify({ error: "server" }), { status: 500 });
     }
     if (target.match(/longcat/i)) {
@@ -1015,14 +1321,13 @@ test("specialty validators cover remaining status branches for Deepgram, Assembl
 
   const deepgram = await validateProviderApiKey({ provider: "deepgram", apiKey: "dg-key" });
   const assembly = await validateProviderApiKey({ provider: "assemblyai", apiKey: "aa-key" });
-  const banana = await validateProviderApiKey({ provider: "nanobanana", apiKey: "nb-key" });
   const eleven = await validateProviderApiKey({ provider: "elevenlabs", apiKey: "el-key" });
   const inworld = await validateProviderApiKey({ provider: "inworld", apiKey: "iw-key" });
   const bailian = await validateProviderApiKey({
     provider: "bailian-coding-plan",
     apiKey: "bailian-key",
     providerSpecificData: {
-      baseUrl: "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1/messages",
+      baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic/v1/messages",
     },
   });
   const longcatInvalid = await validateProviderApiKey({ provider: "longcat", apiKey: "lc-key" });
@@ -1042,7 +1347,6 @@ test("specialty validators cover remaining status branches for Deepgram, Assembl
 
   assert.equal(deepgram.error, "Validation failed: 500");
   assert.equal(assembly.valid, true);
-  assert.equal(banana.error, "Validation failed: 400");
   assert.equal(eleven.error, "Invalid API key");
   assert.equal(inworld.error, "inworld offline");
   assert.equal(bailian.error, "Validation failed: 500");
@@ -1329,65 +1633,92 @@ test("specialty validators accept watsonx, OCI and SAP enterprise gateways", asy
   assert.equal(sap.method, "sap_models");
 });
 
-test("specialty validator accepts Bedrock mantle discovery and runtime chat fallback", async () => {
-  let runtimeChatProbed = false;
+test("specialty validator accepts native Bedrock model discovery with a configured region", async () => {
+  const seenUrls: string[] = [];
 
   globalThis.fetch = async (url, init = {}) => {
     const target = String(url);
+    seenUrls.push(target);
+    assert.equal((init.headers as Record<string, string>).Authorization, "Bearer bedrock-key");
 
-    if (target === "https://bedrock-mantle.us-east-1.api.aws/v1/models") {
-      assert.equal((init.headers as Record<string, string>).Authorization, "Bearer bedrock-key");
-      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    if (
+      target === "https://bedrock.eu-west-2.amazonaws.com/foundation-models?byOutputModality=TEXT"
+    ) {
+      return new Response(
+        JSON.stringify({
+          modelSummaries: [
+            {
+              modelId: "anthropic.claude-sonnet-4-6",
+              modelName: "Claude Sonnet 4.6",
+              providerName: "Anthropic",
+              inputModalities: ["TEXT", "IMAGE"],
+              outputModalities: ["TEXT"],
+              responseStreamingSupported: true,
+            },
+          ],
+        }),
+        { status: 200 }
+      );
     }
 
-    if (target === "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1/models") {
-      assert.equal((init.headers as Record<string, string>).Authorization, "Bearer runtime-key");
-      return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+    if (
+      target ===
+      "https://bedrock.eu-west-2.amazonaws.com/inference-profiles?maxResults=100&typeEquals=SYSTEM_DEFINED"
+    ) {
+      return new Response(
+        JSON.stringify({
+          inferenceProfileSummaries: [
+            {
+              inferenceProfileId: "eu.anthropic.claude-sonnet-4-6",
+              inferenceProfileName: "EU Claude Sonnet 4.6",
+              models: [
+                {
+                  modelArn:
+                    "arn:aws:bedrock:eu-west-2::foundation-model/anthropic.claude-sonnet-4-6",
+                },
+              ],
+            },
+          ],
+        }),
+        { status: 200 }
+      );
     }
 
-    if (target === "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1/chat/completions") {
-      runtimeChatProbed = true;
-      const body = JSON.parse(String(init.body || "{}"));
-      assert.equal((init.headers as Record<string, string>).Authorization, "Bearer runtime-key");
-      assert.equal(body.model, "openai.gpt-oss-120b-1:0");
-      return new Response(JSON.stringify({ error: "bad request" }), { status: 400 });
-    }
-
-    throw new Error(`unexpected fetch: ${target}`);
-  };
-
-  const mantle = await validateProviderApiKey({
-    provider: "bedrock",
-    apiKey: "bedrock-key",
-  });
-  const runtime = await validateProviderApiKey({
-    provider: "bedrock",
-    apiKey: "runtime-key",
-    providerSpecificData: {
-      baseUrl: "https://bedrock-runtime.us-east-1.amazonaws.com",
-    },
-  });
-
-  assert.equal(mantle.valid, true);
-  assert.equal(runtime.valid, true);
-  assert.equal(runtimeChatProbed, true);
-});
-
-test("specialty validator rejects invalid Bedrock credentials", async () => {
-  globalThis.fetch = async (url, init = {}) => {
-    const target = String(url);
-
-    if (target === "https://bedrock-mantle.us-east-1.api.aws/v1/models") {
-      assert.equal((init.headers as Record<string, string>).Authorization, "Bearer bedrock-key");
-      return new Response(JSON.stringify({ error: "forbidden" }), { status: 403 });
-    }
-
-    throw new Error(`unexpected fetch: ${target}`);
+    throw new Error("unexpected fetch: " + target);
   };
 
   const bedrock = await validateProviderApiKey({
     provider: "bedrock",
     apiKey: "bedrock-key",
+    providerSpecificData: { region: "eu-west-2" },
+  });
+
+  assert.equal(bedrock.valid, true);
+  assert.equal(bedrock.method, "bedrock_native_models");
+  assert.deepEqual(seenUrls, [
+    "https://bedrock.eu-west-2.amazonaws.com/foundation-models?byOutputModality=TEXT",
+    "https://bedrock.eu-west-2.amazonaws.com/inference-profiles?maxResults=100&typeEquals=SYSTEM_DEFINED",
+  ]);
+});
+
+test("specialty validator rejects invalid native Bedrock credentials", async () => {
+  globalThis.fetch = async (url, init = {}) => {
+    const target = String(url);
+
+    if (
+      target === "https://bedrock.eu-west-2.amazonaws.com/foundation-models?byOutputModality=TEXT"
+    ) {
+      assert.equal((init.headers as Record<string, string>).Authorization, "Bearer bedrock-key");
+      return new Response(JSON.stringify({ message: "forbidden" }), { status: 403 });
+    }
+
+    throw new Error("unexpected fetch: " + target);
+  };
+
+  const bedrock = await validateProviderApiKey({
+    provider: "bedrock",
+    apiKey: "bedrock-key",
+    providerSpecificData: { region: "eu-west-2" },
   });
 
   assert.equal(bedrock.error, "Invalid API key");
@@ -1515,7 +1846,7 @@ test("specialty validator accepts Nous Research credentials on chat completions"
       const headers = init.headers as Record<string, string>;
       const body = JSON.parse(String(init.body));
       assert.equal(headers.Authorization, "Bearer nous-key");
-      assert.equal(body.model, "nousresearch/hermes-4-70b");
+      assert.equal(body.model, "Hermes-4-70B");
       return new Response(
         JSON.stringify({
           id: "chatcmpl-nous",
@@ -1535,6 +1866,33 @@ test("specialty validator accepts Nous Research credentials on chat completions"
 
   assert.equal(nous.valid, true);
   assert.equal(nous.method, "nous_chat_completions");
+});
+
+test("BytePlus key validation reaches the Ark endpoint instead of 'not supported' (#3877)", async () => {
+  // #3877: byteplus was in APIKEY_PROVIDERS but never registered in the routing
+  // registry, so validation returned {unsupported:true} → UI showed "invalid" for any
+  // key. With the registry entry, a valid ark-... key probes the Ark /models endpoint
+  // with Bearer auth and validates.
+  let probedModelsUrl: string | null = null;
+  globalThis.fetch = async (url, init = {}) => {
+    const target = String(url);
+    if (target === "https://ark.ap-southeast.bytepluses.com/api/v3/models") {
+      probedModelsUrl = target;
+      const headers = toPlainHeaders(init.headers);
+      assert.equal(headers.Authorization, "Bearer ark-test-key");
+      return new Response(JSON.stringify({ data: [{ id: "kimi-k2-thinking" }] }), { status: 200 });
+    }
+    throw new Error(`unexpected fetch: ${target}`);
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "byteplus",
+    apiKey: "ark-test-key",
+  });
+
+  assert.equal(result.unsupported, undefined, "byteplus must not be 'validation not supported'");
+  assert.equal(result.valid, true);
+  assert.equal(probedModelsUrl, "https://ark.ap-southeast.bytepluses.com/api/v3/models");
 });
 
 test("specialty validator rejects invalid Nous Research credentials", async () => {
@@ -1558,52 +1916,32 @@ test("specialty validator rejects invalid Nous Research credentials", async () =
   assert.equal(nous.error, "Invalid API key");
 });
 
-test("specialty validator accepts the public Petals generate endpoint without an API key", async () => {
+test("specialty validator accepts Nous Research key when probe model is rejected (400)", async () => {
+  // #3881: a valid key whose probe model is rejected (model-not-found / bad request)
+  // must still validate — the 4xx proves auth was accepted, only the request shape
+  // was wrong. Mirrors the longcat/nvidia validators.
   globalThis.fetch = async (url, init = {}) => {
     const target = String(url);
 
-    if (target === "https://chat.petals.dev/api/v1/generate") {
+    if (target === "https://inference-api.nousresearch.com/v1/chat/completions") {
       const headers = init.headers as Record<string, string>;
-      const body = new URLSearchParams(String(init.body));
-      assert.equal(headers.Authorization, undefined);
-      assert.equal(headers["Content-Type"], "application/x-www-form-urlencoded");
-      assert.equal(body.get("model"), "stabilityai/StableBeluga2");
-      assert.equal(body.get("inputs"), "test");
-      assert.equal(body.get("max_new_tokens"), "1");
-      return new Response(JSON.stringify({ ok: true, outputs: "hi" }), { status: 200 });
+      assert.equal(headers.Authorization, "Bearer nous-key");
+      return new Response(
+        JSON.stringify({ error: { message: "model not found", type: "invalid_request_error" } }),
+        { status: 400 }
+      );
     }
 
     throw new Error(`unexpected fetch: ${target}`);
   };
 
-  const petals = await validateProviderApiKey({
-    provider: "petals",
-    apiKey: "",
+  const nous = await validateProviderApiKey({
+    provider: "nous-research",
+    apiKey: "nous-key",
   });
 
-  assert.equal(petals.valid, true);
-  assert.equal(petals.method, "petals_generate");
-});
-
-test("specialty validator surfaces Petals upstream unavailability", async () => {
-  globalThis.fetch = async (url, init = {}) => {
-    const target = String(url);
-
-    if (target === "https://chat.petals.dev/api/v1/generate") {
-      const headers = init.headers as Record<string, string>;
-      assert.equal(headers.Authorization, undefined);
-      return new Response(JSON.stringify({ error: "unavailable" }), { status: 503 });
-    }
-
-    throw new Error(`unexpected fetch: ${target}`);
-  };
-
-  const petals = await validateProviderApiKey({
-    provider: "petals",
-    apiKey: "",
-  });
-
-  assert.equal(petals.error, "Provider unavailable (503)");
+  assert.equal(nous.valid, true);
+  assert.equal(nous.method, "nous_chat_completions");
 });
 
 test("specialty validator rejects invalid Poe credentials", async () => {
@@ -1806,4 +2144,768 @@ test("specialty validator rejects invalid Runway credentials", async () => {
   });
 
   assert.equal(runway.error, "Invalid API key");
+});
+
+test("validateCommandCodeProvider sends Command Code probe URL, headers, and flat OpenAI body", async () => {
+  const calls: Array<{
+    url: string;
+    method?: string;
+    headers?: HeadersInit;
+    body?: BodyInit | null;
+  }> = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({
+      url: String(url),
+      method: init.method,
+      headers: toPlainHeaders(init.headers),
+      body: JSON.parse(String(init.body)),
+    });
+    return new Response("", { status: 400 });
+  };
+
+  const result = await validateCommandCodeProvider({
+    apiKey: "cc_test_key",
+    providerSpecificData: { validationModelId: "gpt-5.4-mini" },
+  });
+
+  assert.deepEqual(result, { valid: true, error: null });
+  assert.equal(calls.length, 1);
+  // Probe targets the documented /provider/v1/chat/completions endpoint, not
+  // the CLI-only /alpha/generate (#10265).
+  assert.equal(calls[0].url, "https://api.commandcode.ai/provider/v1/chat/completions");
+  assert.equal(calls[0].method, "POST");
+  assert.equal(calls[0].headers.Authorization, "Bearer cc_test_key");
+  assert.equal(calls[0].headers["Content-Type"], "application/json");
+  // No CLI-impersonation headers.
+  assert.equal(calls[0].headers["x-command-code-version"], undefined);
+  assert.equal(calls[0].headers["x-cli-environment"], undefined);
+  assert.equal(calls[0].headers["x-project-slug"], undefined);
+  // Flat OpenAI chat.completions body (no CLI wrapper).
+  assert.equal(calls[0].body.params, undefined, "CLI envelope params wrapper must not be sent");
+  assert.equal(calls[0].body.model, "gpt-5.4-mini");
+  assert.equal(calls[0].body.stream, true);
+  assert.equal(calls[0].body.max_tokens, 1);
+});
+
+for (const status of [400, 422, 429]) {
+  test(`validateCommandCodeProvider accepts ${status} as direct validator auth success`, async () => {
+    globalThis.fetch = async () => new Response("", { status });
+    assert.deepEqual(await validateCommandCodeProvider({ apiKey: "cc_test_key" }), {
+      valid: true,
+      error: null,
+    });
+  });
+}
+
+test("validateCommandCodeProvider rejects auth failures and provider outages", async () => {
+  globalThis.fetch = async () => new Response("unauthorized", { status: 401 });
+  assert.deepEqual(await validateCommandCodeProvider({ apiKey: "bad" }), {
+    valid: false,
+    error: "Invalid API key",
+  });
+
+  globalThis.fetch = async () => new Response("server down", { status: 500 });
+  assert.deepEqual(await validateCommandCodeProvider({ apiKey: "cc_test_key" }), {
+    valid: false,
+    error: "Provider unavailable (500)",
+  });
+});
+
+test("validateCommandCodeProvider falls back to /alpha/generate when /provider/v1 returns 403 (Go plan)", async () => {
+  const calls: Array<{
+    url: string;
+    headers: Record<string, string>;
+    body: Record<string, unknown>;
+  }> = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const urlStr = String(url);
+    calls.push({
+      url: urlStr,
+      headers: (init.headers || {}) as Record<string, string>,
+      body: JSON.parse(String(init.body)) as Record<string, unknown>,
+    });
+
+    if (urlStr.includes("/provider/v1/chat/completions")) {
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: "Your Go plan doesn't include API access.",
+            type: "permission_error",
+            code: "upgrade_required",
+          },
+        }),
+        { status: 403, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    if (urlStr.includes("/alpha/generate")) {
+      return new Response("ok", { status: 200 });
+    }
+
+    return new Response("Not found", { status: 404 });
+  };
+
+  const result = await validateCommandCodeProvider({ apiKey: "cc_go_plan_key" });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.error, null);
+  assert.equal(calls.length, 2);
+  assert.ok(calls[0].url.includes("/provider/v1/chat/completions"));
+  assert.ok(calls[1].url.includes("/alpha/generate"));
+  assert.equal(calls[1].headers["x-cli-environment"], "external");
+  assert.equal(calls[1].headers["x-command-code-version"], "1.15.1");
+  assert.equal(calls[1].body.config.environment, "external");
+});
+
+// ─── claude-web validator ────────────────────────────────────────────────────
+
+const { __setTlsFetchOverrideForTesting: __setClaudeTlsFetchOverride } =
+  await import("../../open-sse/services/claudeTlsClient.ts");
+
+function makeClaudeTlsResponse(status: number, body: string, headers: Record<string, string> = {}) {
+  const h = new Headers();
+  for (const [k, v] of Object.entries(headers)) h.set(k, v);
+  return { status, ok: status >= 200 && status < 300, headers: h, text: body, body: null };
+}
+
+test("claude-web validator: 200 from /api/organizations → valid", async () => {
+  let captured: { url: string; opts: unknown } | null = null;
+  __setClaudeTlsFetchOverride(async (url, opts) => {
+    captured = { url, opts };
+    return makeClaudeTlsResponse(200, JSON.stringify({ orgs: [] }));
+  });
+
+  const result = await validateProviderApiKey({
+    provider: "claude-web",
+    apiKey: "sessionKey=sk-ant-sid02-test-session-key",
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.error, null);
+  assert.equal(captured?.url, "https://claude.ai/api/organizations");
+  assert.match(
+    (captured?.opts.headers as Record<string, string>).Cookie || "",
+    /sessionKey=sk-ant-sid02-test-session-key/
+  );
+  __setClaudeTlsFetchOverride(null);
+});
+
+test("claude-web validator: full cookie blob passes through verbatim", async () => {
+  let capturedCookie = "";
+  __setClaudeTlsFetchOverride(async (_url, opts) => {
+    capturedCookie = (opts.headers as Record<string, string>).Cookie || "";
+    return makeClaudeTlsResponse(200, JSON.stringify({ orgs: [] }));
+  });
+
+  const blob =
+    "__cf_bm=abc123; sessionKey=sk-ant-sid02-test; intercom-device-id-lupk8zyo=xyz; __stripe_mid=stripe123";
+  await validateProviderApiKey({ provider: "claude-web", apiKey: blob });
+  assert.equal(capturedCookie, blob);
+  __setClaudeTlsFetchOverride(null);
+});
+
+test("claude-web validator: 401 → invalid session cookie", async () => {
+  __setClaudeTlsFetchOverride(async () =>
+    makeClaudeTlsResponse(401, JSON.stringify({ error: "unauthorized" }))
+  );
+
+  const result = await validateProviderApiKey({
+    provider: "claude-web",
+    apiKey: "sessionKey=expired-key",
+  });
+
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /Invalid or expired session cookie/i);
+  __setClaudeTlsFetchOverride(null);
+});
+
+// #9406 inverted this contract: a 429 session shows as UNHEALTHY (valid:false)
+// so the dashboard stops painting rate-limited sessions green. The dedicated
+// repro (tests/unit/repro-9406-claude-web-429-valid.test.ts) owns the full
+// contract incl. Retry-After forwarding; this sibling keeps the validator-level
+// assertion aligned with it.
+test("claude-web validator: 429 → invalid (rate limited session is not healthy, #9406)", async () => {
+  __setClaudeTlsFetchOverride(async () =>
+    makeClaudeTlsResponse(429, JSON.stringify({ error: "rate limited" }))
+  );
+
+  const result = await validateProviderApiKey({
+    provider: "claude-web",
+    apiKey: "sessionKey=sk-ant-sid02-good-key",
+  });
+
+  assert.equal(result.valid, false);
+  __setClaudeTlsFetchOverride(null);
+});
+
+test("claude-web validator: 500 → Claude.ai unavailable", async () => {
+  __setClaudeTlsFetchOverride(async () => makeClaudeTlsResponse(500, "internal server error"));
+
+  const result = await validateProviderApiKey({
+    provider: "claude-web",
+    apiKey: "sessionKey=sk-ant-sid02-any-key",
+  });
+
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /Claude\.ai unavailable \(500\)/i);
+  __setClaudeTlsFetchOverride(null);
+});
+
+test("claude-web validator: TLS client unavailable → clear error", async () => {
+  const { TlsClientUnavailableError } = await import("../../open-sse/services/claudeTlsClient.ts");
+  __setClaudeTlsFetchOverride(async () => {
+    throw new TlsClientUnavailableError("wreq-js 3.2 native binding unavailable");
+  });
+
+  const result = await validateProviderApiKey({
+    provider: "claude-web",
+    apiKey: "sessionKey=sk-ant-sid02-any-key",
+  });
+
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /wreq-js 3\.2 native binding unavailable/i);
+  __setClaudeTlsFetchOverride(null);
+});
+
+test("claude-web validator: bare sessionKey value gets prefixed", async () => {
+  let capturedCookie = "";
+  __setClaudeTlsFetchOverride(async (_url, opts) => {
+    capturedCookie = (opts.headers as Record<string, string>).Cookie || "";
+    return makeClaudeTlsResponse(200, JSON.stringify({ orgs: [] }));
+  });
+
+  await validateProviderApiKey({
+    provider: "claude-web",
+    apiKey: "sk-ant-sid02-bare-value",
+  });
+  assert.equal(capturedCookie, "sessionKey=sk-ant-sid02-bare-value");
+  __setClaudeTlsFetchOverride(null);
+});
+
+// ─── gemini-web validator ────────────────────────────────────────────────────
+
+test("gemini-web validator: 200 from gemini.google.com → valid", async () => {
+  globalThis.fetch = async (url, init = {}) => {
+    const target = String(url);
+    const headers = init.headers || {};
+    if (target.includes("gemini.google.com/app")) {
+      assert.match((headers as Record<string, string>).Cookie || "", /__Secure-1PSID=eyJPSID/);
+      return new Response("ok", { status: 200 });
+    }
+    throw new Error(`unexpected fetch: ${target}`);
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "gemini-web",
+    apiKey: "__Secure-1PSID=eyJPSID",
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.error, null);
+});
+
+test("gemini-web validator: bare value gets __Secure-1PSID prefix", async () => {
+  let capturedCookie = "";
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).includes("gemini.google.com")) {
+      capturedCookie = ((init.headers as Record<string, string>) || {}).Cookie || "";
+      return new Response("ok", { status: 200 });
+    }
+    throw new Error(`unexpected fetch: ${String(url)}`);
+  };
+
+  await validateProviderApiKey({ provider: "gemini-web", apiKey: "eyJbarevalue" });
+  assert.equal(capturedCookie, "__Secure-1PSID=eyJbarevalue");
+});
+
+test("gemini-web validator: accepts cookies JSON exported by browser tools", async () => {
+  let capturedCookie = "";
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).includes("gemini.google.com")) {
+      capturedCookie = ((init.headers as Record<string, string>) || {}).Cookie || "";
+      return new Response("ok", { status: 200 });
+    }
+    throw new Error(`unexpected fetch: ${String(url)}`);
+  };
+
+  await validateProviderApiKey({
+    provider: "gemini-web",
+    apiKey: JSON.stringify({
+      cookies: {
+        "__Secure-1PSID": "psid-json",
+        "__Secure-1PSIDTS": "psidts-json",
+      },
+    }),
+  });
+
+  assert.equal(capturedCookie, "__Secure-1PSID=psid-json; __Secure-1PSIDTS=psidts-json");
+});
+
+test("gemini-web validator: 401 → invalid cookie", async () => {
+  globalThis.fetch = async () => new Response("unauthorized", { status: 401 });
+
+  const result = await validateProviderApiKey({
+    provider: "gemini-web",
+    apiKey: "__Secure-1PSID=expired",
+  });
+
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /Invalid or expired __Secure-1PSID/i);
+});
+
+test("gemini-web validator: 500 → unavailable", async () => {
+  globalThis.fetch = async () => new Response("down", { status: 500 });
+
+  const result = await validateProviderApiKey({
+    provider: "gemini-web",
+    apiKey: "__Secure-1PSID=eyJany",
+  });
+
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /Gemini validation failed \(500\)/i);
+});
+
+// ─── copilot-web validator ───────────────────────────────────────────────────
+
+test("copilot-web validator: valid access_token → 200", async () => {
+  globalThis.fetch = async (url, init = {}) => {
+    const target = String(url);
+    if (target.includes("copilot.microsoft.com/c/api/conversations")) {
+      assert.match(
+        ((init.headers as Record<string, string>) || {}).Authorization || "",
+        /Bearer eyJhbGci/
+      );
+      return new Response(JSON.stringify({ conversations: [] }), { status: 200 });
+    }
+    throw new Error(`unexpected fetch: ${target}`);
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "copilot-web",
+    apiKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test",
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.error, null);
+});
+
+test("copilot-web validator: cookie with access_token= is extracted", async () => {
+  let capturedAuth = "";
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).includes("copilot.microsoft.com")) {
+      capturedAuth = ((init.headers as Record<string, string>) || {}).Authorization || "";
+      return new Response(JSON.stringify({}), { status: 200 });
+    }
+    throw new Error(`unexpected fetch: ${String(url)}`);
+  };
+
+  await validateProviderApiKey({
+    provider: "copilot-web",
+    apiKey: `${"padding=value; ".repeat(12)}access_token=eyJhbGciOiJIUzI1NiJ9.payload.sig; other_cookie=foo`,
+  });
+  assert.equal(capturedAuth, "Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig");
+});
+
+test("copilot-web validator: 401 → invalid token", async () => {
+  globalThis.fetch = async () => new Response("unauthorized", { status: 401 });
+
+  const result = await validateProviderApiKey({
+    provider: "copilot-web",
+    apiKey: "bad-token",
+  });
+
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /Invalid or expired access_token/i);
+});
+
+test("copilot-web validator: 500 → unavailable", async () => {
+  globalThis.fetch = async () => new Response("down", { status: 500 });
+
+  const result = await validateProviderApiKey({
+    provider: "copilot-web",
+    apiKey: "any-token",
+  });
+
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /Copilot unavailable \(500\)/i);
+});
+
+test("copilot-web validator: empty input → paste prompt", async () => {
+  globalThis.fetch = async () => {
+    throw new Error("should not fetch");
+  };
+
+  const result = await validateProviderApiKey({ provider: "copilot-web", apiKey: "" });
+
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /Paste your access_token/i);
+});
+
+// ─── copilot-m365-web validator ──────────────────────────────────────────────
+
+test("copilot-m365-web validator: accepts pasted OmniRoute credential without /models probe", async () => {
+  globalThis.fetch = async () => {
+    throw new Error("should not fetch");
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "copilot-m365-web",
+    apiKey: "access_token=tok; chathubPath=redacted-account@redacted-tenant",
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.error, null);
+  assert.match(result.warning || "", /verified when the provider sends a chat/i);
+});
+
+test("copilot-m365-web validator: requires chathubPath", async () => {
+  globalThis.fetch = async () => {
+    throw new Error("should not fetch");
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "copilot-m365-web",
+    apiKey: "access_token=tok",
+  });
+
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /Chathub path/i);
+});
+
+// ─── t3-web validator ────────────────────────────────────────────────────────
+
+test("t3-web validator: valid cookies → valid", async () => {
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).includes("t3.chat")) {
+      return new Response("ok", { status: 200 });
+    }
+    throw new Error(`unexpected fetch: ${String(url)}`);
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "t3-web",
+    apiKey: "cookies=__session=abc123; convexSessionId=def456",
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.error, null);
+});
+
+test("t3-web validator: 500 → unavailable", async () => {
+  globalThis.fetch = async () => new Response("down", { status: 500 });
+
+  const result = await validateProviderApiKey({
+    provider: "t3-web",
+    apiKey: "cookies=__session=abc",
+  });
+
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /t3\.chat unavailable \(500\)/i);
+});
+
+test("t3-web validator: valid cookies → passes through", async () => {
+  globalThis.fetch = async (url, init = {}) => {
+    if (String(url).includes("t3.chat")) {
+      return new Response("ok", { status: 200 });
+    }
+    throw new Error(`unexpected fetch: ${String(url)}`);
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "t3-web",
+    apiKey: "__session=abc123; convex-session-id=def456",
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.error, null);
+});
+
+test("llama-cpp is classified as a self-hosted chat provider", async () => {
+  const { isSelfHostedChatProvider, isLocalProvider, providerAllowsOptionalApiKey } =
+    await import("../../src/shared/constants/providers.ts");
+
+  assert.equal(isSelfHostedChatProvider("llama-cpp"), true);
+  assert.equal(isLocalProvider("llama-cpp"), true);
+  assert.equal(providerAllowsOptionalApiKey("llama-cpp"), true);
+});
+
+// ─── Gitlawb Opengateway specialty validators ──────────────────────────────
+
+test("gitlawb validator: accepts valid API key via chat/completions probe", async () => {
+  const calls: Array<{ url: string; headers?: HeadersInit; body?: BodyInit | null }> = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), headers: init.headers || {}, body: init.body });
+    assert.equal(String(url), "https://opengateway.gitlawb.com/v1/xiaomi-mimo/chat/completions");
+    assert.equal((init.headers as Record<string, string>).Authorization, "Bearer glb-valid-key");
+    const body = JSON.parse(String(init.body));
+    assert.equal(body.model, "mimo-v2.5-pro");
+    assert.equal(body.messages[0].content, "test");
+    assert.equal(body.max_tokens, 1);
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+    });
+  };
+
+  const result = await validateProviderApiKey({ provider: "gitlawb", apiKey: "glb-valid-key" });
+  assert.equal(result.valid, true);
+  assert.equal(calls.length, 1);
+});
+
+test("gitlawb validator: 400/422/429 treated as auth success", async () => {
+  for (const status of [400, 422, 429]) {
+    globalThis.fetch = async (url) => {
+      assert.equal(String(url), "https://opengateway.gitlawb.com/v1/xiaomi-mimo/chat/completions");
+      return new Response(JSON.stringify({ error: "bad request" }), { status });
+    };
+    const result = await validateProviderApiKey({ provider: "gitlawb", apiKey: "glb-key" });
+    assert.equal(result.valid, true, `status ${status} should pass auth`);
+    assert.equal(result.error, null, `status ${status} should not return error`);
+  }
+});
+
+test("gitlawb validator: rejects invalid API key (401)", async () => {
+  globalThis.fetch = async (url) => {
+    assert.equal(String(url), "https://opengateway.gitlawb.com/v1/xiaomi-mimo/chat/completions");
+    return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+  };
+
+  const result = await validateProviderApiKey({ provider: "gitlawb", apiKey: "glb-bad-key" });
+  assert.equal(result.valid, false);
+  assert.equal(result.error, "Invalid API key");
+});
+
+test("gitlawb validator: rejects invalid API key (403)", async () => {
+  globalThis.fetch = async (url) => {
+    assert.equal(String(url), "https://opengateway.gitlawb.com/v1/xiaomi-mimo/chat/completions");
+    return new Response(JSON.stringify({ error: "forbidden" }), { status: 403 });
+  };
+
+  const result = await validateProviderApiKey({ provider: "gitlawb", apiKey: "glb-bad-key" });
+  assert.equal(result.valid, false);
+  assert.equal(result.error, "Invalid API key");
+});
+
+test("gitlawb validator: surfaces network failures", async () => {
+  globalThis.fetch = async () => {
+    throw new Error("gitlawb opengateway offline");
+  };
+
+  const result = await validateProviderApiKey({ provider: "gitlawb", apiKey: "glb-key" });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /gitlawb opengateway offline/i);
+});
+
+test("gitlawb validator: accepts custom baseUrl override", async () => {
+  globalThis.fetch = async (url, init = {}) => {
+    assert.equal(String(url), "https://custom-gateway.example.com/v1/xiaomi-mimo/chat/completions");
+    assert.equal((init.headers as Record<string, string>).Authorization, "Bearer glb-key");
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+    });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "gitlawb",
+    apiKey: "glb-key",
+    providerSpecificData: {
+      baseUrl: "https://custom-gateway.example.com/v1/xiaomi-mimo",
+    },
+  });
+  assert.equal(result.valid, true);
+});
+
+// ─── Gitlawb-GMI (GMI Cloud) ─────────────────────────────────────────────
+
+test("gitlawb-gmi validator: accepts valid API key via chat/completions probe", async () => {
+  const calls: Array<{ url: string; headers?: HeadersInit }> = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), headers: init.headers || {} });
+    assert.equal(String(url), "https://opengateway.gitlawb.com/v1/gmi-cloud/chat/completions");
+    assert.equal(
+      (init.headers as Record<string, string>).Authorization,
+      "Bearer glb-gmi-valid-key"
+    );
+    const body = JSON.parse(String(init.body));
+    assert.equal(body.model, "XiaomiMiMo/MiMo-V2.5-Pro");
+    assert.equal(body.messages[0].content, "test");
+    assert.equal(body.max_tokens, 1);
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+    });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "gitlawb-gmi",
+    apiKey: "glb-gmi-valid-key",
+  });
+  assert.equal(result.valid, true);
+  assert.equal(calls.length, 1);
+});
+
+test("gitlawb-gmi validator: accepts 400/422/429 as auth success", async () => {
+  for (const status of [400, 422, 429]) {
+    globalThis.fetch = async (url) => {
+      assert.equal(String(url), "https://opengateway.gitlawb.com/v1/gmi-cloud/chat/completions");
+      return new Response(JSON.stringify({ error: "bad request" }), { status });
+    };
+    const result = await validateProviderApiKey({
+      provider: "gitlawb-gmi",
+      apiKey: "glb-gmi-key",
+    });
+    assert.equal(result.valid, true, `status ${status} should pass auth`);
+  }
+});
+
+test("gitlawb-gmi validator: rejects invalid API key (401)", async () => {
+  globalThis.fetch = async (url) => {
+    assert.equal(String(url), "https://opengateway.gitlawb.com/v1/gmi-cloud/chat/completions");
+    return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "gitlawb-gmi",
+    apiKey: "glb-gmi-bad-key",
+  });
+  assert.equal(result.valid, false);
+  assert.equal(result.error, "Invalid API key");
+});
+
+test("gitlawb-gmi validator: rejects invalid API key (403)", async () => {
+  globalThis.fetch = async (url) => {
+    assert.equal(String(url), "https://opengateway.gitlawb.com/v1/gmi-cloud/chat/completions");
+    return new Response(JSON.stringify({ error: "forbidden" }), { status: 403 });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "gitlawb-gmi",
+    apiKey: "glb-gmi-bad-key",
+  });
+  assert.equal(result.valid, false);
+  assert.equal(result.error, "Invalid API key");
+});
+
+test("gitlawb-gmi validator: surfaces network failures", async () => {
+  globalThis.fetch = async () => {
+    throw new Error("gitlawb-gmi opengateway offline");
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "gitlawb-gmi",
+    apiKey: "glb-gmi-key",
+  });
+  assert.equal(result.valid, false);
+  assert.match(result.error || "", /gitlawb-gmi opengateway offline/i);
+});
+
+test("gitlawb-gmi validator: accepts custom baseUrl override", async () => {
+  globalThis.fetch = async (url, init = {}) => {
+    assert.equal(String(url), "https://custom-gateway.example.com/v1/gmi-cloud/chat/completions");
+    assert.equal((init.headers as Record<string, string>).Authorization, "Bearer glb-gmi-key");
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ok" } }] }), {
+      status: 200,
+    });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "gitlawb-gmi",
+    apiKey: "glb-gmi-key",
+    providerSpecificData: {
+      baseUrl: "https://custom-gateway.example.com/v1/gmi-cloud",
+    },
+  });
+  assert.equal(result.valid, true);
+});
+
+// #3288 / #3758: a blocked redirect (REDIRECT_BLOCKED) to a PUBLIC host is benign — the
+// redirect was never followed, so it must NOT be mislabeled as an SSRF security block.
+// Only a redirect whose target is a private/internal host is a genuine security event.
+test("isSecurityBlockError: public-host redirect block is NOT a security block", () => {
+  const publicRedirect = new SafeOutboundFetchError("Redirect blocked", {
+    code: "REDIRECT_BLOCKED",
+    url: "https://public-provider.example.com/api/v2/models/",
+    method: "GET",
+    attempts: 1,
+    status: 307,
+    location: "https://public-provider.example.com/login",
+    isRetryable: false,
+  });
+  assert.equal(isSecurityBlockError(publicRedirect), false);
+});
+
+test("isSecurityBlockError: private-host redirect block IS a security block", () => {
+  const privateRedirect = new SafeOutboundFetchError("Redirect blocked", {
+    code: "REDIRECT_BLOCKED",
+    url: "https://api.example.com/probe",
+    method: "GET",
+    attempts: 1,
+    status: 302,
+    location: "http://169.254.169.254/latest/meta-data/",
+    isRetryable: false,
+  });
+  assert.equal(isSecurityBlockError(privateRedirect), true);
+});
+
+test("isSecurityBlockError: a URL-guard block remains a security block", () => {
+  const guardBlock = new SafeOutboundFetchError("Blocked private host", {
+    code: "URL_GUARD_BLOCKED",
+    url: "http://10.0.0.5/internal",
+    method: "GET",
+    attempts: 1,
+    isRetryable: false,
+  });
+  assert.equal(isSecurityBlockError(guardBlock), true);
+});
+
+// ─── huggingface validator (whoami-v2 auth probe) ────────────────────────────
+// Fine-grained HF Inference-Provider tokens are valid even when model/task
+// endpoints reject them. The validator must probe whoami-v2 as a pure auth
+// check: only 401/403 is invalid; any other non-OK status is transient.
+
+test("huggingface validator accepts a token whoami-v2 recognizes", async () => {
+  const calls: { url: string; headers: Record<string, string> }[] = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), headers: toPlainHeaders(init.headers) });
+    return new Response(JSON.stringify({ name: "hf-user", auth: { type: "access_token" } }), {
+      status: 200,
+    });
+  };
+
+  const result = await validateProviderApiKey({ provider: "huggingface", apiKey: "hf_validtoken" });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.error, null);
+  assert.equal(result.method, "huggingface_whoami");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://huggingface.co/api/whoami-v2");
+  assert.equal(calls[0].headers.Authorization, "Bearer hf_validtoken");
+});
+
+test("huggingface validator treats 401/403 as an invalid token", async () => {
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
+  const unauthorized = await validateProviderApiKey({ provider: "huggingface", apiKey: "hf_bad" });
+  assert.equal(unauthorized.valid, false);
+  assert.equal(unauthorized.error, "Invalid API key");
+
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: "Forbidden" }), { status: 403 });
+  const forbidden = await validateProviderApiKey({ provider: "huggingface", apiKey: "hf_bad" });
+  assert.equal(forbidden.valid, false);
+  assert.equal(forbidden.error, "Invalid API key");
+});
+
+test("huggingface validator does NOT mark a fine-grained token invalid on a non-auth status", async () => {
+  // This is the false-negative the port fixes: a 503/404 from a model/task
+  // probe used to read as "invalid key". whoami-v2 returning a non-auth,
+  // non-OK status must surface as a transient error, never "Invalid API key".
+  globalThis.fetch = async () => new Response("upstream down", { status: 503 });
+
+  const result = await validateProviderApiKey({
+    provider: "huggingface",
+    apiKey: "hf_finegrained",
+  });
+
+  assert.equal(result.valid, false);
+  assert.notEqual(result.error, "Invalid API key");
+  assert.match(result.error || "", /HuggingFace token check returned 503/);
 });

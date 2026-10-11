@@ -1,5 +1,17 @@
 import { BaseGuardrail, type GuardrailContext, type GuardrailResult } from "./base";
-import { extractMessageContents, sanitizeRequest } from "@/shared/utils/inputSanitizer";
+import {
+  buildInjectionScanText,
+  extractMessageContents,
+  sanitizeRequest,
+} from "@/shared/utils/inputSanitizer";
+import { getFeatureFlagOverride } from "@/lib/db/featureFlags";
+import { parseEnvBoolean } from "@/shared/utils/envBoolean";
+import {
+  resolveBlockThreshold,
+  shouldBlockDetections,
+  SEVERITY_SCORES as SHARED_SEVERITY_SCORES,
+  type InjectionSeverity,
+} from "@/shared/utils/injectionSeverity";
 
 type Detection = {
   match: string;
@@ -47,11 +59,7 @@ const DEFAULT_GUARD_PATTERNS: PatternLike[] = [
   },
 ];
 
-const SEVERITY_SCORES = {
-  high: 3,
-  low: 1,
-  medium: 2,
-};
+const SEVERITY_SCORES = SHARED_SEVERITY_SCORES;
 
 function normalizePatternEntry(entry: PatternLike, index: number) {
   if (entry instanceof RegExp) {
@@ -99,29 +107,60 @@ function detectWithPatterns(text: string, patterns: ReturnType<typeof normalizeP
 }
 
 function shouldBlock(detections: Detection[], threshold: "low" | "medium" | "high") {
-  const minimumSeverity = SEVERITY_SCORES[threshold] || SEVERITY_SCORES.high;
-  return detections.some(
-    (detection) => (SEVERITY_SCORES[detection.severity] || 0) >= minimumSeverity
-  );
+  return shouldBlockDetections(detections, threshold);
 }
 
 function getLogger(options: PromptInjectionGuardrailOptions, context: GuardrailContext) {
-  return options.logger || context.log || console;
+  // `logger: null` is an explicit opt-out (chat-family routes are re-evaluated by the
+  // guardrail registry with the request's pino logger — #11936 dedupe). An omitted
+  // logger defers to the context log so middleware-only routes keep their trace.
+  if (options.logger !== undefined) return options.logger;
+  return context.log ?? null;
+}
+
+function emitGuardrailLog(
+  logger: GuardrailContext["log"] | Console,
+  level: "debug" | "info" | "warn",
+  message: string,
+  meta?: Record<string, unknown>
+) {
+  const target = logger?.[level];
+  if (typeof target !== "function") return;
+
+  if (logger === console) {
+    target.call(logger, message, meta || "");
+    return;
+  }
+
+  target.call(logger, "GUARDRAIL", message, meta);
 }
 
 function getMode(options: PromptInjectionGuardrailOptions) {
+  // A dashboard-set DB override for INJECTION_GUARD_MODE wins over env vars, so the
+  // Feature Flags UI actually controls this guard (DB > ENV > default, matching
+  // resolveFeatureFlag). Read DB-only here to preserve the existing env fallback
+  // chain and "warn" default when no override is set — i.e. behavior is unchanged
+  // for every deployment that has not explicitly set the flag. Fail-safe: any DB
+  // read error falls back to the env-based behavior.
+  let dbOverride: string | undefined;
+  try {
+    dbOverride = getFeatureFlagOverride("INJECTION_GUARD_MODE");
+  } catch {
+    dbOverride = undefined;
+  }
   return (options.mode ||
+    dbOverride ||
     process.env.INJECTION_GUARD_MODE ||
     process.env.INPUT_SANITIZER_MODE ||
     "warn") as "block" | "warn" | "log";
 }
 
 function getThreshold(options: PromptInjectionGuardrailOptions) {
-  return (options.blockThreshold || "high") as "low" | "medium" | "high";
+  return resolveBlockThreshold(options.blockThreshold);
 }
 
 function isEnabled(options: PromptInjectionGuardrailOptions) {
-  return options.enabled ?? process.env.INPUT_SANITIZER_ENABLED !== "false";
+  return options.enabled ?? parseEnvBoolean(process.env.INPUT_SANITIZER_ENABLED, true);
 }
 
 export function evaluatePromptInjection(
@@ -147,9 +186,16 @@ export function evaluatePromptInjection(
     .map(normalizePatternEntry)
     .filter(Boolean);
 
-  const sanitizerResult = sanitizeRequest(body, logger as Console);
+  const sanitizerResult = sanitizeRequest(body, {
+    info() {},
+    warn() {},
+  } as Console);
   const contents = extractMessageContents(body);
-  const customDetections = detectWithPatterns(contents.join("\n"), patterns);
+  // Same 16 KB budget as detectInjection, and now the same bytes: custom
+  // patterns and built-in ones disagreeing about what was scanned would be its
+  // own bug (hot-path perf, #3932 / #4041).
+  const scanText = buildInjectionScanText(contents.join("\n"));
+  const customDetections = detectWithPatterns(scanText, patterns);
   const existingDetections = new Set(
     sanitizerResult.detections.map((d: Detection) => `${d.pattern}:${d.match}:${d.severity}`)
   );
@@ -172,7 +218,7 @@ export function evaluatePromptInjection(
   }
 
   if (mode === "block" && shouldBlock(result.detections, threshold)) {
-    logger.warn?.("[InjectionGuard] Blocked request with prompt injection:", {
+    emitGuardrailLog(logger, "warn", "Request blocked by prompt injection guard", {
       detections: result.detections.map((detection) => ({
         pattern: detection.pattern,
         severity: detection.severity,
@@ -182,16 +228,19 @@ export function evaluatePromptInjection(
   }
 
   if (mode === "warn" || mode === "log") {
-    logger[mode === "warn" ? "warn" : "info"]?.(
-      "[InjectionGuard] Detected potential injection patterns:",
-      {
-        detections: result.detections.map((detection) => ({
-          pattern: detection.pattern,
-          severity: detection.severity,
-        })),
-        pii: result.piiDetections.length,
-      }
-    );
+    const hasHighSeverity = result.detections.some((detection) => detection.severity === "high");
+    if (mode === "warn" && !hasHighSeverity) {
+      return { blocked: false, result };
+    }
+
+    const level = mode === "log" ? "info" : "warn";
+    emitGuardrailLog(logger, level, "Prompt injection guard flagged request", {
+      detections: result.detections.map((detection) => ({
+        pattern: detection.pattern,
+        severity: detection.severity,
+      })),
+      pii: result.piiDetections.length,
+    });
   }
 
   return { blocked: false, result };

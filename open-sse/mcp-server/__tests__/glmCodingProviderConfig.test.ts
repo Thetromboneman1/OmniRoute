@@ -6,7 +6,7 @@ import {
   getModelsByProviderId,
   getProviderModels,
 } from "../../config/providerModels.ts";
-import { supportsToolCalling } from "../../services/modelCapabilities.ts";
+import { buildGlmAnthropicMessagesUrl, buildGlmOpenAIChatUrl } from "../../config/glmProvider.ts";
 import { getPricingForModel } from "../../../src/shared/constants/pricing.ts";
 
 describe("GLM Coding provider registry surfaces", () => {
@@ -16,29 +16,68 @@ describe("GLM Coding provider registry surfaces", () => {
     expect(entry).toBeDefined();
     expect(entry?.id).toBe("glm");
     expect(entry?.alias).toBe("glm");
-    expect(entry?.format).toBe("claude");
-    expect(entry?.baseUrl).toBe("https://api.z.ai/api/anthropic/v1/messages");
+    expect(entry?.format).toBe("openai");
+    expect(entry?.executor).toBe("glm");
+    expect(entry?.baseUrl).toBe("https://api.z.ai/api/coding/paas/v4/chat/completions");
     expect(entry?.authType).toBe("apikey");
-    expect(entry?.authHeader).toBe("x-api-key");
-    expect(entry?.headers?.["Anthropic-Version"]).toBe("2023-06-01");
+    expect(entry?.authHeader).toBe("bearer");
+    expect(entry?.headers?.["Anthropic-Version"]).toBeUndefined();
+    expect(entry?.requestDefaults).toEqual({ maxTokens: 16384 });
+    expect(entry?.timeoutMs).toBe(3000000);
   });
 
-  it("registers GLMT as an explicit high-budget preset over the GLM transport", () => {
+  it("preserves custom GLM base URL query parameters while deriving transport endpoints", () => {
+    const providerSpecificData = {
+      baseUrl:
+        "https://proxy.example/glm/api/coding/paas/v4/chat/completions?tenant=alpha&route=glm",
+    };
+
+    expect(buildGlmOpenAIChatUrl(providerSpecificData)).toBe(
+      "https://proxy.example/glm/api/coding/paas/v4/chat/completions?tenant=alpha&route=glm"
+    );
+    expect(
+      buildGlmAnthropicMessagesUrl({
+        anthropicBaseUrl:
+          "https://proxy.example/glm/api/anthropic/v1/messages?tenant=alpha&route=glm",
+      })
+    ).toBe("https://proxy.example/glm/api/anthropic/v1/messages?tenant=alpha&route=glm&beta=true");
+  });
+
+  it("registers GLMT as an explicit high-budget preset over the dual GLM transport", () => {
     const entry = getRegistryEntry("glmt");
 
     expect(entry).toBeDefined();
     expect(entry?.id).toBe("glmt");
     expect(entry?.alias).toBe("glmt");
-    expect(entry?.format).toBe("claude");
-    expect(entry?.baseUrl).toBe("https://api.z.ai/api/anthropic/v1/messages");
+    expect(entry?.format).toBe("openai");
+    expect(entry?.executor).toBe("glm");
+    expect(entry?.baseUrl).toBe("https://api.z.ai/api/coding/paas/v4/chat/completions");
     expect(entry?.authType).toBe("apikey");
-    expect(entry?.authHeader).toBe("x-api-key");
+    expect(entry?.authHeader).toBe("bearer");
+    expect(entry?.headers?.["Anthropic-Version"]).toBeUndefined();
     expect(entry?.requestDefaults).toEqual({
       maxTokens: 65536,
       temperature: 0.2,
       thinkingBudgetTokens: 24576,
+      thinkingType: "adaptive",
     });
     expect(entry?.timeoutMs).toBe(900000);
+  });
+
+  it("registers GLM China on the same executor and capability surface", () => {
+    const entry = getRegistryEntry("glm-cn");
+
+    expect(entry).toBeDefined();
+    expect(entry?.id).toBe("glm-cn");
+    expect(entry?.alias).toBe("glmcn");
+    expect(entry?.format).toBe("openai");
+    expect(entry?.executor).toBe("glm");
+    expect(entry?.baseUrl).toBe("https://open.bigmodel.cn/api/coding/paas/v4/chat/completions");
+    expect(entry?.requestDefaults).toEqual({ maxTokens: 16384 });
+    expect(entry?.timeoutMs).toBe(3000000);
+    expect(getProviderModels("glmcn").map((model) => model.id)).toEqual(
+      getProviderModels("glm").map((model) => model.id)
+    );
   });
 
   it("exposes the same GLM model inventory through registry-derived model helpers", () => {
@@ -48,6 +87,17 @@ describe("GLM Coding provider registry surfaces", () => {
     expect(PROVIDER_ID_TO_ALIAS.glm).toBe("glm");
     expect(byProviderId).toEqual(byAlias);
     expect(byProviderId.map((model) => model.id)).toEqual([
+      "glm-5.3-flash",
+      "glm-5.3",
+      "glm-5.3-high",
+      "glm-5.3-low",
+      "glm-5.3-max",
+      "glm-5.3-flash-high",
+      "glm-5.3-flash-low",
+      "glm-5.3-flash-max",
+      "glm-5.2",
+      "glm-5.2-high",
+      "glm-5.2-max",
       "glm-5.1",
       "glm-5",
       "glm-5-turbo",
@@ -61,6 +111,59 @@ describe("GLM Coding provider registry surfaces", () => {
     ]);
   });
 
+  it("declares exact GLM reasoning-effort tiers across every shared GLM provider", () => {
+    const routedTiers = new Map<string, readonly string[]>([
+      ["glm-5.3-flash", ["low", "high", "max"]],
+      ["glm-5.3", ["low", "high", "max"]],
+      ["glm-5.3-high", ["high"]],
+      ["glm-5.3-low", ["low"]],
+      ["glm-5.3-max", ["max"]],
+      ["glm-5.3-flash", ["low", "high", "max"]],
+      ["glm-5.3-flash-high", ["high"]],
+      ["glm-5.3-flash-low", ["low"]],
+      ["glm-5.3-flash-max", ["max"]],
+      ["glm-5.2", ["high", "max"]],
+      ["glm-5.2-high", ["high"]],
+      ["glm-5.2-max", ["max"]],
+    ]);
+
+    for (const provider of ["glm", "glm-cn", "glmt"]) {
+      for (const model of getModelsByProviderId(provider)) {
+        expect(model.supportedThinkingEfforts, `${provider}/${model.id} effort tiers`).toEqual(
+          routedTiers.get(model.id) ?? []
+        );
+      }
+    }
+
+    for (const model of getModelsByProviderId("zcode")) {
+      expect(model.supportedThinkingEfforts, `zcode/${model.id} effort tiers`).toEqual([]);
+    }
+  });
+
+  it("registers GLM-5.2 with correct specs and effort tier aliases", () => {
+    const models = getModelsByProviderId("glm");
+    const get = (id: string) => models.find((m) => m.id === id);
+
+    // Base model
+    const base = get("glm-5.2");
+    expect(base).toBeDefined();
+    expect(base?.contextLength).toBe(1000000);
+    expect(base?.maxOutputTokens).toBe(131072);
+    expect(base?.supportsReasoning).toBe(true);
+    expect(base?.toolCalling).toBe(true);
+
+    // Effort tier aliases share the same specs
+    const high = get("glm-5.2-high");
+    expect(high).toBeDefined();
+    expect(high?.contextLength).toBe(1000000);
+    expect(high?.maxOutputTokens).toBe(131072);
+
+    const max = get("glm-5.2-max");
+    expect(max).toBeDefined();
+    expect(max?.contextLength).toBe(1000000);
+    expect(max?.maxOutputTokens).toBe(131072);
+  });
+
   it("applies doc-backed context window overrides for GLM models", () => {
     const models = getModelsByProviderId("glm");
     const get = (id: string) => models.find((m) => m.id === id);
@@ -71,19 +174,28 @@ describe("GLM Coding provider registry surfaces", () => {
     expect(get("glm-4.5v")?.contextLength).toBe(16000);
     expect(get("glm-4.5")?.contextLength).toBe(128000);
     expect(get("glm-4.5-air")?.contextLength).toBe(128000);
+    expect(get("glm-5.1")?.maxOutputTokens).toBe(131072);
+    expect(get("glm-4.6")?.maxOutputTokens).toBe(32768);
 
-    // Models inheriting the 200K provider default
-    expect(get("glm-5")?.contextLength).toBeUndefined();
-    expect(get("glm-5-turbo")?.contextLength).toBeUndefined();
-    expect(get("glm-4.7-flash")?.contextLength).toBeUndefined();
-    expect(get("glm-4.7")?.contextLength).toBeUndefined();
-    expect(get("glm-4.6")?.contextLength).toBeUndefined();
+    // Models with explicit 200K defaults to avoid null capabilities in direct routes.
+    expect(get("glm-5")?.contextLength).toBe(200000);
+    expect(get("glm-5-turbo")?.contextLength).toBe(200000);
+    expect(get("glm-4.7-flash")?.contextLength).toBe(200000);
+    expect(get("glm-4.7")?.contextLength).toBe(200000);
+    expect(get("glm-4.6")?.contextLength).toBe(200000);
   });
 
   it("keeps representative GLM Coding models tool-call capable and priced", () => {
-    expect(supportsToolCalling("glm/glm-5")).toBe(true);
-    expect(supportsToolCalling("glm/glm-4.7-flash")).toBe(true);
-    expect(supportsToolCalling("glm/glm-4.5-air")).toBe(true);
+    const models = getModelsByProviderId("glm");
+    const get = (id: string) => models.find((m) => m.id === id);
+
+    expect(get("glm-5")?.toolCalling).toBe(true);
+    expect(get("glm-5.3-flash")?.toolCalling).toBe(true);
+    expect(get("glm-4.7-flash")?.toolCalling).toBe(true);
+    expect(get("glm-4.5-air")?.toolCalling).toBe(true);
+    expect(get("glm-5.2")?.toolCalling).toBe(true);
+    expect(get("glm-5.2-high")?.toolCalling).toBe(true);
+    expect(get("glm-5.2-max")?.toolCalling).toBe(true);
 
     expect(getPricingForModel("glm", "glm-5")).toEqual({
       input: 1.0,
@@ -91,6 +203,13 @@ describe("GLM Coding provider registry surfaces", () => {
       cached: 0.2,
       reasoning: 4.8,
       cache_creation: 1.0,
+    });
+    expect(getPricingForModel("glm", "glm-5.3-flash")).toEqual({
+      input: 0.075,
+      output: 0.25,
+      cached: 0.015,
+      reasoning: 0.25,
+      cache_creation: 0.075,
     });
     expect(getPricingForModel("glm", "glm-4.7-flash")).toEqual({
       input: 0,
@@ -105,6 +224,20 @@ describe("GLM Coding provider registry surfaces", () => {
       cached: 0.03,
       reasoning: 1.1,
       cache_creation: 0.2,
+    });
+    expect(getPricingForModel("glm", "glm-5.2")).toEqual({
+      input: 1.2,
+      output: 5,
+      cached: 0.3,
+      reasoning: 5,
+      cache_creation: 1.2,
+    });
+    expect(getPricingForModel("glm", "glm-5.2-max")).toEqual({
+      input: 1.2,
+      output: 5,
+      cached: 0.3,
+      reasoning: 5,
+      cache_creation: 1.2,
     });
   });
 

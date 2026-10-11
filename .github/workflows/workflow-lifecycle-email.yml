@@ -6,7 +6,7 @@ on:
       - Build Fork Image (ghcr.io)
       - CI
       - Deploy to VPS
-      - Publish to Docker Hub
+      - Publish Container Images
       - Build Electron Desktop App
       - Sync Fork From Upstream
       - Publish to npm

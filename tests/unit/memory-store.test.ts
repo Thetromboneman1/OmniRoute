@@ -17,7 +17,7 @@ async function resetStorage() {
   for (let attempt = 0; attempt < 10; attempt++) {
     try {
       if (fs.existsSync(TEST_DATA_DIR)) {
-        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
       break;
     } catch (error: any) {
@@ -52,13 +52,31 @@ function insertMemoryRow({
   ).run(id, apiKeyId, sessionId, type, key, content, metadata, createdAt, updatedAt, expiresAt);
 }
 
+/**
+ * Drain pending setImmediate callbacks scheduled by store.createMemory/updateMemory
+ * (which fire-and-forget the vector upsert). Without this, the test runner may end
+ * before the async tasks resolve, causing "asynchronous activity after test ended"
+ * errors when the upsert later tries to touch the DB we already tore down.
+ */
+async function drainSetImmediate(rounds = 3): Promise<void> {
+  for (let i = 0; i < rounds; i++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
 test.beforeEach(async () => {
   await resetStorage();
 });
 
+test.afterEach(async () => {
+  // Allow vector upsert fire-and-forget to settle before the next test resets DATA_DIR.
+  await drainSetImmediate();
+});
+
 test.after(async () => {
+  await drainSetImmediate();
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("memory store CRUD round-trip persists to the memories table and invalidates cache on update/delete", async () => {
@@ -97,6 +115,40 @@ test("memory store CRUD round-trip persists to the memories table and invalidate
   assert.equal(await store.deleteMemory(created.id), true);
   assert.equal(await store.getMemory(created.id), null);
   assert.equal(await store.deleteMemory(created.id), false);
+});
+
+test("createMemory syncs memory_id to the SQLite rowid so FTS keyword search can JOIN (regression: silent 0-result FTS)", async () => {
+  const created = await store.createMemory({
+    apiKeyId: "key-fts",
+    sessionId: "session-fts",
+    type: MemoryType.FACTUAL,
+    key: "incident:server",
+    content:
+      "The server logs CRITICAL errors during a system reminder. Compact dashboard preferred.",
+  });
+
+  const db = core.getDbInstance();
+  const row = db
+    .prepare("SELECT id, memory_id, rowid FROM memories WHERE id = ?")
+    .get(created.id) as { id: string; memory_id: number | null; rowid: number } | undefined;
+  assert.ok(row, "stored memory must exist");
+  assert.equal(row.memory_id, row.rowid, "memory_id must be synced to the SQLite rowid on insert");
+
+  // Sanitize the MATCH query exactly like retrieval.ts does (bare tokens can
+  // crash FTS5 with syntax errors; quoted tokens are the safe AND form).
+  const safeQuery = ["server", "CRITICAL", "reminder"].map((t) => `"${t}"`).join(" ");
+  const hits = db
+    .prepare(
+      `SELECT m.id FROM memories m JOIN memory_fts f ON m.memory_id = f.rowid
+       WHERE f.memory_fts MATCH ? AND m.api_key_id = ? ORDER BY f.rank LIMIT ?`
+    )
+    .all(safeQuery, "key-fts", 10) as Array<{ id: string }>;
+  assert.ok(
+    hits.some((h) => h.id === created.id),
+    "FTS JOIN must return the freshly stored memory (memory_id must match the FTS rowid)"
+  );
+
+  assert.equal(await store.deleteMemory(created.id), true);
 });
 
 test("getMemory returns null for invalid identifiers and tolerates malformed metadata rows", async () => {
@@ -349,4 +401,15 @@ test("listMemories page parameter defaults to page 1 when omitted with limit", a
     ["pg-2"]
   );
   assert.equal(defaultPage.total, 2);
+});
+
+test("getMemoryTokensUsed sums estimated tokens, optionally scoped to an api key", async () => {
+  // Token estimate is floor((LENGTH(content) + 3) / 4) per row (SQLite integer math).
+  insertMemoryRow({ id: "tok-1", apiKeyId: "key-a", content: "aaaa" }); // (4+3)/4 = 1
+  insertMemoryRow({ id: "tok-2", apiKeyId: "key-b", content: "aaaaaaaa" }); // (8+3)/4 = 2
+
+  assert.equal(store.getMemoryTokensUsed("key-a"), 1);
+  assert.equal(store.getMemoryTokensUsed("key-b"), 2);
+  assert.equal(store.getMemoryTokensUsed(), 3); // all memories
+  assert.equal(store.getMemoryTokensUsed("missing-key"), 0);
 });

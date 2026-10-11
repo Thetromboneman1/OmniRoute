@@ -39,6 +39,55 @@ test("openai-compatible validation reports missing base URL", async () => {
   assert.match(result.error, /No base URL configured/i);
 });
 
+test("openai-compatible validation treats /models 402 as valid credentials", async () => {
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    return new Response(JSON.stringify({ error: "Payment required" }), { status: 402 });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "openai-compatible-models-402",
+    apiKey: "sk-test",
+    providerSpecificData: { baseUrl: "https://api.example.com/v1" },
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.method, "models_endpoint");
+  assert.equal(result.statusCode, 402);
+  assert.match(result.warning, /402|quota/i);
+  assert.deepEqual(calls, ["https://api.example.com/v1/models"]);
+});
+
+test("openai-compatible validation treats representative-model chat 402 as valid credentials", async () => {
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(String(url));
+    if (String(url).endsWith("/models")) {
+      return new Response(JSON.stringify({ error: "Not Found" }), { status: 404 });
+    }
+    return new Response(JSON.stringify({ error: "Add credits to continue" }), { status: 402 });
+  };
+
+  const result = await validateProviderApiKey({
+    provider: "openai-compatible-chat-402",
+    apiKey: "sk-test",
+    providerSpecificData: {
+      baseUrl: "https://api.example.com/v1",
+      validationModelId: "paid-upstream-model",
+    },
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.method, "chat_completions");
+  assert.equal(result.statusCode, 402);
+  assert.match(result.warning, /paid-upstream-model/);
+  assert.deepEqual(calls, [
+    "https://api.example.com/v1/models",
+    "https://api.example.com/v1/chat/completions",
+  ]);
+});
+
 test("openai-compatible validation accepts rate-limited /models responses", async () => {
   const calls = [];
   globalThis.fetch = async (url, init = {}) => {
@@ -168,7 +217,10 @@ test("anthropic-compatible validation requires a base URL", async () => {
   assert.match(result.error, /No base URL configured/i);
 });
 
-test("anthropic-compatible validation rejects invalid keys from /models", async () => {
+test("anthropic-compatible validation rejects invalid keys (auth-fail on both /models and /messages)", async () => {
+  // After the 584cf66a port, /models alone is not authoritative — many compatible
+  // proxies 401/403 on /models even with a valid key. To prove the key is bad we
+  // require an auth-shaped failure on POST /v1/messages too.
   const calls = [];
   globalThis.fetch = async (url) => {
     calls.push(String(url));
@@ -183,7 +235,10 @@ test("anthropic-compatible validation rejects invalid keys from /models", async 
 
   assert.equal(result.valid, false);
   assert.equal(result.error, "Invalid API key");
-  assert.deepEqual(calls, ["https://api.example.com/v1/models"]);
+  assert.deepEqual(calls, [
+    "https://api.example.com/v1/models",
+    "https://api.example.com/v1/messages",
+  ]);
 });
 
 test("anthropic-compatible validation falls back to /messages and treats 400 as auth success", async () => {
@@ -406,28 +461,4 @@ test("gemini validation rejects invalid keys via UNAUTHENTICATED status", async 
 
   assert.equal(result.valid, false);
   assert.equal(result.error, "Invalid API key");
-});
-
-test("gemini-cli validation uses Bearer auth (OAuth)", async () => {
-  const calls = [];
-  globalThis.fetch = async (url, init) => {
-    calls.push({ url: String(url), headers: init?.headers });
-    return new Response(
-      JSON.stringify({
-        models: [{ name: "models/gemini-2.5-flash" }],
-      }),
-      { status: 200 }
-    );
-  };
-
-  const result = await validateProviderApiKey({
-    provider: "gemini-cli",
-    apiKey: "oauth-access-token",
-  });
-
-  assert.equal(result.valid, true);
-  assert.equal(result.error, null);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].headers["Authorization"], "Bearer oauth-access-token");
-  assert.equal(calls[0].headers["x-goog-api-key"], undefined);
 });

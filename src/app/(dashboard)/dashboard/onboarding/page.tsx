@@ -3,9 +3,12 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { useTranslations } from "next-intl";
+import { useDisplayBaseUrl } from "@/shared/hooks";
+import { FreeProviderOnboardingCard } from "./steps/FreeProviderOnboardingCard";
+import { TierTour } from "./steps/TierTour";
 
-const STEP_IDS = ["welcome", "security", "provider", "test", "done"];
-const STEP_ICONS = ["waving_hand", "lock", "dns", "play_circle", "check_circle"];
+const STEP_IDS = ["welcome", "tiers", "security", "provider", "test", "done"];
+const STEP_ICONS = ["waving_hand", "layers", "lock", "dns", "play_circle", "check_circle"];
 
 const COMMON_PROVIDERS = [
   { id: "openai", name: "OpenAI", color: "#10A37F" },
@@ -20,14 +23,22 @@ export default function OnboardingWizard() {
   const router = useRouter();
   const t = useTranslations("onboarding");
   const tc = useTranslations("common");
+  const baseUrl = useDisplayBaseUrl();
   const [step, setStep] = useState(0);
   const [loading, setLoading] = useState(true);
-  const [apiEndpoint, setApiEndpoint] = useState("http://localhost:20128/api/v1");
+  const apiEndpoint = `${baseUrl}/api/v1`;
 
   // Security step state
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [skipSecurity, setSkipSecurity] = useState(false);
+  const [capsLockOn, setCapsLockOn] = useState(false);
+
+  // #14296: fresh Docker/NAT-forwarded installs (peer isn't 127.0.0.1) hit a
+  // 401 on the bootstrap writes below until the operator supplies the
+  // one-shot token the server printed to its log.
+  const [bootstrapToken, setBootstrapToken] = useState("");
+  const [needsBootstrapToken, setNeedsBootstrapToken] = useState(false);
 
   // Provider step state
   const [selectedProvider, setSelectedProvider] = useState(null);
@@ -41,20 +52,11 @@ export default function OnboardingWizard() {
 
   // Check if setup is already complete
   useEffect(() => {
-    const resolveApiEndpoint = (apiPort) => {
-      if (typeof window === "undefined") return;
-      const protocol = window.location.protocol;
-      const hostname = window.location.hostname;
-      const effectiveApiPort = apiPort || 20128;
-      setApiEndpoint(`${protocol}//${hostname}:${effectiveApiPort}/api/v1`);
-    };
-
     const checkSetup = async () => {
       try {
         const res = await fetch("/api/settings");
         if (res.ok) {
           const settings = await res.json();
-          resolveApiEndpoint(settings?.apiPort);
           if (settings.setupComplete) {
             router.replace("/dashboard");
             return;
@@ -87,28 +89,53 @@ export default function OnboardingWizard() {
 
   const [errorMessage, setErrorMessage] = useState("");
 
+  // #14296: attach the operator-supplied bootstrap token when we have one —
+  // required only for a non-loopback (e.g. Docker/NAT-forwarded) caller
+  // completing a fresh install; a no-op header on every other install.
+  const bootstrapHeaders = (base: Record<string, string> = {}) =>
+    bootstrapToken ? { ...base, "x-omniroute-bootstrap-token": bootstrapToken } : base;
+
+  // Returns true when the caller should stop (a bootstrap-token prompt was
+  // shown), false when the response was a "real" failure to report normally.
+  const handleBootstrapAuthFailure = (res: Response): boolean => {
+    if (res.status === 401 && !bootstrapToken) {
+      setNeedsBootstrapToken(true);
+      setErrorMessage(t("bootstrapTokenHelp"));
+      return true;
+    }
+    return false;
+  };
+
   const handleSetPassword = async () => {
+    setErrorMessage("");
     if (skipSecurity) {
       // (#574) Explicitly disable requireLogin when skipping password setup
       try {
-        await fetch("/api/settings/require-login", {
+        const res = await fetch("/api/settings/require-login", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: bootstrapHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ requireLogin: false }),
         });
-      } catch {}
+        if (!res.ok) {
+          if (!handleBootstrapAuthFailure(res)) setErrorMessage(t("failedSetPassword"));
+          return;
+        }
+      } catch {
+        setErrorMessage(t("connectionError"));
+        return;
+      }
       handleNext();
       return;
     }
     if (password !== confirmPassword) return;
-    setErrorMessage("");
     try {
       const res = await fetch("/api/settings/require-login", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: bootstrapHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ requireLogin: true, password }),
       });
       if (!res.ok) {
+        if (handleBootstrapAuthFailure(res)) return;
         const data = await res.json().catch(() => ({}));
         setErrorMessage(data.error || t("failedSetPassword"));
         return;
@@ -193,6 +220,7 @@ export default function OnboardingWizard() {
   };
 
   const handleFinish = async () => {
+    setErrorMessage("");
     try {
       // (#574) If no password was set during wizard, disable requireLogin
       // to prevent the user from being locked out on the login page
@@ -200,34 +228,45 @@ export default function OnboardingWizard() {
         .then((r) => r.json())
         .catch(() => ({}));
       if (!settings.hasPassword) {
-        await fetch("/api/settings/require-login", {
+        const requireLoginRes = await fetch("/api/settings/require-login", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: bootstrapHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ requireLogin: false }),
-        }).catch(() => {});
+        });
+        // #14296: this write used to be fire-and-forget, so a 401 from a
+        // Docker/NAT-forwarded install silently left requireLogin untouched
+        // and the wizard sailed on to setupComplete/dashboard anyway,
+        // reproducing the reported redirect loop. Surface it instead.
+        if (!requireLoginRes.ok && handleBootstrapAuthFailure(requireLoginRes)) return;
       }
 
-      await fetch("/api/settings", {
+      const patchRes = await fetch("/api/settings", {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
+        headers: bootstrapHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ setupComplete: true }),
       });
+      if (!patchRes.ok) {
+        if (handleBootstrapAuthFailure(patchRes)) return;
+        setErrorMessage(t("connectionError"));
+        return;
+      }
     } catch {
-      // Non-critical
+      setErrorMessage(t("connectionError"));
+      return;
     }
     router.push("/dashboard");
   };
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-bg">
+      <div className="min-h-screen flex items-center justify-center">
         <div className="animate-pulse text-text-muted">{tc("loading")}</div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-bg p-4">
+    <div className="min-h-screen flex items-center justify-center p-4">
       <div className="w-full max-w-lg">
         {/* Progress Indicator */}
         <div className="flex items-center justify-center gap-2 mb-8">
@@ -270,8 +309,41 @@ export default function OnboardingWizard() {
             >
               {currentStep.icon}
             </span>
-            <h2 className="text-2xl font-bold text-text-main mb-1">{currentStep.title}</h2>
+            <h2 className="text-2xl font-bold text-text-main">{currentStep.title}</h2>
+            {currentStep.id === "tiers" && (
+              <p className="mx-auto mt-2 max-w-md text-sm leading-relaxed text-text-muted text-balance">
+                {t("tier.subtitle")}
+              </p>
+            )}
           </div>
+
+          {/* #14296: fresh-install bootstrap token prompt + generic errors —
+              rendered above the step content so it applies regardless of
+              which step's write actually failed (security step or the
+              Finish/Skip-wizard buttons). */}
+          {errorMessage && (
+            <div className="mb-4 p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg text-center animate-in fade-in duration-200">
+              <p className="text-sm text-amber-400">{errorMessage}</p>
+              {needsBootstrapToken && (
+                <div className="mt-3 space-y-2">
+                  <input
+                    type="text"
+                    placeholder={t("bootstrapTokenLabel")}
+                    value={bootstrapToken}
+                    onChange={(e) => setBootstrapToken(e.target.value)}
+                    className="w-full px-4 py-2.5 bg-white/[0.04] border border-white/10 rounded-lg text-text-main text-sm placeholder:text-text-muted/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
+                  />
+                  <button
+                    onClick={isLastStep ? handleFinish : handleSetPassword}
+                    disabled={!bootstrapToken}
+                    className="px-6 py-2 bg-primary rounded-lg text-white font-medium text-sm hover:bg-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                  >
+                    {t("retry")}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Step Content */}
           <div className="min-h-[200px]">
@@ -279,7 +351,7 @@ export default function OnboardingWizard() {
             {currentStep.id === "welcome" && (
               <div className="text-center space-y-4">
                 <p className="text-text-muted">{t("welcomeDesc")}</p>
-                <div className="grid grid-cols-3 gap-3 mt-6">
+                <div className="mt-6 grid grid-cols-3 gap-3 items-stretch">
                   {[
                     { icon: "swap_horiz", label: t("multiProvider") },
                     { icon: "monitoring", label: t("usageTracking") },
@@ -287,17 +359,22 @@ export default function OnboardingWizard() {
                   ].map((f) => (
                     <div
                       key={f.icon}
-                      className="bg-white/[0.03] rounded-xl p-3 text-center border border-white/[0.06]"
+                      className="h-full bg-white/[0.03] rounded-xl p-3 text-center border border-white/[0.06]"
                     >
-                      <span className="material-symbols-outlined text-primary text-[24px] mb-1 block">
-                        {f.icon}
-                      </span>
-                      <span className="text-xs text-text-muted">{f.label}</span>
+                      <div className="flex h-full flex-col items-center justify-center">
+                        <span className="material-symbols-outlined text-primary text-[24px] mb-1 block">
+                          {f.icon}
+                        </span>
+                        <span className="text-xs text-text-muted">{f.label}</span>
+                      </div>
                     </div>
                   ))}
                 </div>
               </div>
             )}
+
+            {/* Tiers */}
+            {currentStep.id === "tiers" && <TierTour />}
 
             {/* Security */}
             {currentStep.id === "security" && (
@@ -312,6 +389,11 @@ export default function OnboardingWizard() {
                   />
                   {t("skipPassword")}
                 </label>
+                {skipSecurity && (
+                  <p className="text-xs text-amber-400 text-center animate-in fade-in duration-200">
+                    {t("securityDescSkipWarning")}
+                  </p>
+                )}
                 {!skipSecurity && (
                   <div className="space-y-3">
                     <input
@@ -319,6 +401,8 @@ export default function OnboardingWizard() {
                       placeholder={t("enterPassword")}
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
+                      onKeyDown={(e) => setCapsLockOn(e.getModifierState("CapsLock"))}
+                      onKeyUp={(e) => setCapsLockOn(e.getModifierState("CapsLock"))}
                       className="w-full px-4 py-2.5 bg-white/[0.04] border border-white/10 rounded-lg text-text-main text-sm placeholder:text-text-muted/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
                     />
                     <input
@@ -326,8 +410,18 @@ export default function OnboardingWizard() {
                       placeholder={t("confirmPasswordPlaceholder")}
                       value={confirmPassword}
                       onChange={(e) => setConfirmPassword(e.target.value)}
+                      onKeyDown={(e) => setCapsLockOn(e.getModifierState("CapsLock"))}
+                      onKeyUp={(e) => setCapsLockOn(e.getModifierState("CapsLock"))}
                       className="w-full px-4 py-2.5 bg-white/[0.04] border border-white/10 rounded-lg text-text-main text-sm placeholder:text-text-muted/50 focus:outline-none focus:ring-2 focus:ring-primary/40"
                     />
+                    {capsLockOn && (
+                      <p className="text-xs text-amber-500 dark:text-amber-400 flex items-center gap-1 animate-in fade-in duration-200">
+                        <span className="material-symbols-outlined text-[14px]" aria-hidden="true">
+                          keyboard_capslock
+                        </span>
+                        Caps Lock is on
+                      </p>
+                    )}
                     {password && confirmPassword && password !== confirmPassword && (
                       <p className="text-xs text-red-400">{t("passwordsMismatch")}</p>
                     )}
@@ -340,25 +434,40 @@ export default function OnboardingWizard() {
             {currentStep.id === "provider" && (
               <div className="space-y-4">
                 <p className="text-sm text-text-muted text-center">{t("providerDesc")}</p>
-                <div className="grid grid-cols-3 gap-2">
-                  {COMMON_PROVIDERS.map((p) => (
-                    <button
-                      key={p.id}
-                      onClick={() => {
-                        setSelectedProvider(p.id);
-                        setProviderName(p.name);
-                      }}
-                      className={`p-3 rounded-xl border text-center text-xs font-medium transition-all cursor-pointer ${
-                        selectedProvider === p.id
-                          ? "border-primary/60 bg-primary/10 text-primary"
-                          : "border-white/10 bg-white/[0.03] text-text-muted hover:border-white/20"
-                      }`}
-                    >
-                      {p.name}
-                    </button>
-                  ))}
-                </div>
-                {selectedProvider && (
+                {skipSecurity && (
+                  <div className="text-center p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg animate-in fade-in duration-200">
+                    <p className="text-sm text-amber-400">{t("providerRequiresPassword")}</p>
+                  </div>
+                )}
+                {!skipSecurity && <FreeProviderOnboardingCard />}
+                {!skipSecurity && (
+                  <div className="flex items-center gap-3 text-[11px] text-text-muted">
+                    <span className="h-px flex-1 bg-white/10" />
+                    <span>{t("freeProviders.orUseApiKey")}</span>
+                    <span className="h-px flex-1 bg-white/10" />
+                  </div>
+                )}
+                {!skipSecurity && (
+                  <div className="grid grid-cols-3 gap-2">
+                    {COMMON_PROVIDERS.map((p) => (
+                      <button
+                        key={p.id}
+                        onClick={() => {
+                          setSelectedProvider(p.id);
+                          setProviderName(p.name);
+                        }}
+                        className={`p-3 rounded-xl border text-center text-xs font-medium transition-all cursor-pointer ${
+                          selectedProvider === p.id
+                            ? "border-primary/60 bg-primary/10 text-primary"
+                            : "border-white/10 bg-white/[0.03] text-text-muted hover:border-white/20"
+                        }`}
+                      >
+                        {p.name}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {!skipSecurity && selectedProvider && (
                   <div className="space-y-3 mt-4">
                     <input
                       type="password"
@@ -463,6 +572,14 @@ export default function OnboardingWizard() {
                   {t("getStarted")}
                 </button>
               )}
+              {currentStep.id === "tiers" && (
+                <button
+                  onClick={handleNext}
+                  className="px-6 py-2.5 bg-primary rounded-lg text-white font-medium text-sm hover:bg-primary/90 transition-colors cursor-pointer"
+                >
+                  {t("continue")}
+                </button>
+              )}
               {currentStep.id === "security" && (
                 <button
                   onClick={handleSetPassword}
@@ -472,7 +589,7 @@ export default function OnboardingWizard() {
                   {skipSecurity ? t("skipAndContinue") : t("setPassword")}
                 </button>
               )}
-              {currentStep.id === "provider" && (
+              {currentStep.id === "provider" && !skipSecurity ? (
                 <button
                   onClick={handleAddProvider}
                   disabled={!selectedProvider || !providerKey}
@@ -480,7 +597,7 @@ export default function OnboardingWizard() {
                 >
                   {t("addProvider")}
                 </button>
-              )}
+              ) : null}
               {currentStep.id === "test" && (
                 <button
                   onClick={handleNext}

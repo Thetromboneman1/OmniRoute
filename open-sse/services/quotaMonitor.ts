@@ -8,7 +8,11 @@
  * Alertas deduplicados por sessão (janela de 5min).
  */
 
-import { registerQuotaFetcher, type QuotaFetcher } from "./quotaPreflight.ts";
+import {
+  registerQuotaFetcher,
+  resolveDynamicQuotaFetcher,
+  type QuotaFetcher,
+} from "./quotaPreflight.ts";
 import { getSessionInfo } from "./sessionManager.ts";
 
 export { registerQuotaFetcher };
@@ -77,7 +81,23 @@ export interface QuotaMonitorSummary {
 }
 
 const activeMonitors = new Map<string, MonitorState>();
+const MAX_ALERT_ENTRIES = 500;
 const alertSuppression = new Map<string, number>();
+
+const _alertSweep = setInterval(() => {
+  const now = Date.now();
+  for (const [key, timestamp] of alertSuppression) {
+    if (now - timestamp > ALERT_SUPPRESS_WINDOW_MS) alertSuppression.delete(key);
+  }
+  while (alertSuppression.size > MAX_ALERT_ENTRIES) {
+    const oldestKey = alertSuppression.keys().next().value;
+    if (oldestKey !== undefined) alertSuppression.delete(oldestKey);
+    else break;
+  }
+}, 60_000);
+if (typeof _alertSweep === "object" && "unref" in _alertSweep) {
+  (_alertSweep as { unref?: () => void }).unref?.();
+}
 // Registry mirror from quotaPreflight (same Map reference via re-export)
 const quotaFetcherRegistry = new Map<string, QuotaFetcher>();
 export function registerMonitorFetcher(provider: string, fetcher: QuotaFetcher): void {
@@ -99,6 +119,10 @@ function suppressedAlert(
   const key = `${sessionId}:${provider}:${accountId}`;
   const last = alertSuppression.get(key) ?? 0;
   if (Date.now() - last < ALERT_SUPPRESS_WINDOW_MS) return false;
+  if (alertSuppression.size >= MAX_ALERT_ENTRIES && !alertSuppression.has(key)) {
+    const oldestKey = alertSuppression.keys().next().value;
+    if (oldestKey !== undefined) alertSuppression.delete(oldestKey);
+  }
   alertSuppression.set(key, Date.now());
   console.warn(
     `[QuotaMonitor] session=${sessionId} ${provider}/${accountId}: ${(percentUsed * 100).toFixed(1)}% quota used`
@@ -179,7 +203,12 @@ function scheduleNextPoll(sessionId: string, intervalMs: number): void {
     }
 
     try {
-      const fetcher = quotaFetcherRegistry.get(provider);
+      let fetcher = quotaFetcherRegistry.get(provider);
+      // Dynamic fallback: for compatible-provider connections with the
+      // aggregator flag + feature flag, use the generalized New-API fetcher.
+      if (!fetcher && current.connectionSnapshot) {
+        fetcher = resolveDynamicQuotaFetcher(provider, current.connectionSnapshot);
+      }
       if (!fetcher) {
         current.status = current.lastQuotaPercent === null ? "idle" : current.status;
         scheduleNextPoll(sessionId, NORMAL_INTERVAL_MS);

@@ -1,20 +1,38 @@
 import { NextResponse } from "next/server";
-import {
-  getComboById,
-  updateCombo,
-  deleteCombo,
-  getComboByName,
-  getCombos,
-  isCloudEnabled,
-} from "@/lib/localDb";
+import { getComboById, updateCombo, deleteCombo, getComboByName, getCombos } from "@/lib/db/combos";
+import { isCloudEnabled } from "@/lib/db/settings";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { syncToCloud } from "@/lib/cloudSync";
 import { validateCompositeTiersConfig } from "@/lib/combos/compositeTiers";
 import { normalizeComboModels } from "@/lib/combos/steps";
-import { validateComboDAG } from "@omniroute/open-sse/services/combo.ts";
+import { validateComboDAG, clampComboDepth } from "@omniroute/open-sse/services/combo.ts";
+import { resolveCanonicalProviderModel } from "@omniroute/open-sse/services/model.ts";
 import { updateComboSchema } from "@/shared/validation/schemas";
+import { requiresQuotaOnlyComboRefExecute } from "@/shared/validation/schemas/combo";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { QUOTA_MODEL_PREFIX } from "@/lib/quota/quotaModelNaming";
+import { comboErrorResponse } from "@/lib/api/comboErrorResponse";
+import { ComboInvariantError } from "@/lib/combos/invariants";
+import { buildComboNameCollisionWarning } from "@/lib/combos/modelNameCollision";
+import { stripDeadComboConfigKeys } from "@/lib/combos/deadConfigKeys";
+
+// Minimal shape for the fields we read off a combo row in this route.
+// `getComboById` returns a structurally `JsonRecord`-typed object, so we
+// narrow at the call sites rather than change the DB helper's return type.
+type ComboRowShape = {
+  name: string;
+  id?: string;
+  config?: unknown;
+  models?: unknown;
+  strategy?: string;
+  isActive?: boolean;
+  allowedProviders?: string[];
+  system_message?: string;
+  tool_filter_regex?: string;
+  context_cache_protection?: boolean;
+  context_length?: number | null;
+};
 
 // GET /api/combos/[id] - Get combo by ID
 export async function GET(request, { params }) {
@@ -26,13 +44,13 @@ export async function GET(request, { params }) {
     const combo = await getComboById(id);
 
     if (!combo) {
-      return NextResponse.json({ error: "Combo not found" }, { status: 404 });
+      return comboErrorResponse("COMBO_007", 404, { id }, request);
     }
 
     return NextResponse.json(combo);
   } catch (error) {
     console.log("Error fetching combo:", error);
-    return NextResponse.json({ error: "Failed to fetch combo" }, { status: 500 });
+    return comboErrorResponse("INTERNAL_001", 500, undefined, request);
   }
 }
 
@@ -45,14 +63,11 @@ export async function PUT(request, { params }) {
   try {
     rawBody = await request.json();
   } catch {
-    return NextResponse.json(
-      {
-        error: {
-          message: "Invalid request",
-          details: [{ field: "body", message: "Invalid JSON body" }],
-        },
-      },
-      { status: 400 }
+    return comboErrorResponse(
+      "COMBO_001",
+      400,
+      { field: "body", reason: "Invalid JSON body" },
+      request
     );
   }
 
@@ -60,11 +75,31 @@ export async function PUT(request, { params }) {
     const { id } = await params;
     const validation = validateBody(updateComboSchema, rawBody);
     if (isValidationFailure(validation)) {
-      return NextResponse.json({ error: validation.error }, { status: 400 });
+      // Surface the first field-level issue so clients can highlight the
+      // offending field without parsing the full issues array (#5083 Bug 3).
+      const firstDetail = validation.error.details?.[0] ?? null;
+      return comboErrorResponse(
+        "COMBO_002",
+        400,
+        {
+          issues: validation.error,
+          firstField: firstDetail?.field ?? null,
+          firstMessage: firstDetail?.message ?? null,
+        },
+        request
+      );
     }
-    const currentCombo = await getComboById(id);
+    const currentCombo = (await getComboById(id)) as ComboRowShape | null;
     if (!currentCombo) {
-      return NextResponse.json({ error: "Combo not found" }, { status: 404 });
+      return comboErrorResponse("COMBO_007", 404, { id }, request);
+    }
+    if (currentCombo.name.startsWith(QUOTA_MODEL_PREFIX)) {
+      return comboErrorResponse(
+        "COMBO_006",
+        409,
+        { name: currentCombo.name, source: "quota-share" },
+        request
+      );
     }
     const allCombos = await getCombos();
 
@@ -72,11 +107,11 @@ export async function PUT(request, { params }) {
     const normalizedUpdate = { ...validation.data };
     if (normalizedUpdate.compressionOverride !== undefined) {
       const legacyCompressionOverride = normalizedUpdate.compressionOverride;
-      const nextConfig =
+      const nextConfig: Record<string, unknown> =
         currentCombo.config &&
         typeof currentCombo.config === "object" &&
         !Array.isArray(currentCombo.config)
-          ? { ...currentCombo.config }
+          ? { ...(currentCombo.config as Record<string, unknown>) }
           : {};
       if (legacyCompressionOverride) {
         nextConfig.compressionMode = legacyCompressionOverride;
@@ -86,31 +121,89 @@ export async function PUT(request, { params }) {
       normalizedUpdate.config = nextConfig;
       delete normalizedUpdate.compressionOverride;
     }
+    if (normalizedUpdate.config && typeof normalizedUpdate.config === "object") {
+      normalizedUpdate.config = stripDeadComboConfigKeys(normalizedUpdate.config);
+    }
 
     const body = normalizedUpdate.models
       ? {
           ...normalizedUpdate,
           models: normalizeComboModels(normalizedUpdate.models, {
-            comboName,
-            allCombos,
+            comboName: String(comboName),
+            // `allCombos` from `getCombos()` is typed as the DB-shaped record
+            // (JsonRecord & { version: 2; models: ComboStep[] }) which is
+            // structurally compatible with the local ComboCollectionLike in
+            // `normalizeComboModels` but TS does not infer the relationship.
+            allCombos: allCombos as never,
           }),
         }
       : normalizedUpdate;
+
+    if (body.overrideAllowedProviders === true) {
+      delete body.overrideAllowedProviders;
+      const currentProviders = Array.isArray(currentCombo.allowedProviders)
+        ? currentCombo.allowedProviders
+        : [];
+      // Only widen an EXISTING restriction (#13951/COMBO_008). When the combo
+      // currently has no allowedProviders restriction, currentProviders is
+      // empty and unioning it with the new step providers would synthesize a
+      // brand-new allowlist out of nothing — the opposite of "no restriction".
+      if (body.models && body.allowedProviders === undefined && currentProviders.length > 0) {
+        const stepProviders = (
+          body.models as Array<{ providerId?: string; provider?: string; model?: string }>
+        )
+          .map((m) => {
+            if (m.providerId) return m.providerId;
+            if (m.provider) return m.provider;
+            if (typeof m.model !== "string" || !m.model.includes("/")) return "";
+            const [aliasOrProvider, ...rest] = m.model.split("/");
+            return resolveCanonicalProviderModel(aliasOrProvider, rest.join("/")).provider || "";
+          })
+          .filter((p): p is string => Boolean(p));
+        body.allowedProviders = Array.from(new Set([...currentProviders, ...stepProviders]));
+      }
+    }
+
     const nextComboState = {
       ...currentCombo,
       ...body,
       name: comboName,
     };
+    if (requiresQuotaOnlyComboRefExecute(nextComboState as never)) {
+      return comboErrorResponse(
+        "COMBO_002",
+        400,
+        {
+          firstField: "config.nestedComboMode",
+          firstMessage: "Quota-only combo references require nestedComboMode execute",
+        },
+        request
+      );
+    }
     const compositeValidation = validateCompositeTiersConfig(nextComboState);
-    if (!compositeValidation.success) {
-      return NextResponse.json({ error: compositeValidation.error }, { status: 400 });
+    if (compositeValidation.success === false) {
+      const failure = compositeValidation as {
+        success: false;
+        error: { message: string; details: unknown[] };
+      };
+      return comboErrorResponse(
+        "COMBO_003",
+        400,
+        { reason: failure.error.message, details: failure.error.details },
+        request
+      );
     }
 
     // Check if name already exists (exclude current combo)
     if (body.name) {
       const existing = await getComboByName(body.name);
       if (existing && existing.id !== id) {
-        return NextResponse.json({ error: "Combo name already exists" }, { status: 400 });
+        return comboErrorResponse(
+          "COMBO_004",
+          400,
+          { name: body.name, conflictingId: existing.id },
+          request
+        );
       }
     }
 
@@ -119,10 +212,23 @@ export async function PUT(request, { params }) {
       // Update the combo in the list temporarily for validation
       const updatedCombos = allCombos.map((c) => (c.id === id ? { ...c, ...body } : c));
       if (comboName) {
+        const configuredDepth = clampComboDepth(
+          (nextComboState as { config?: { maxComboDepth?: unknown } }).config?.maxComboDepth
+        );
         try {
-          validateComboDAG(comboName, updatedCombos);
+          validateComboDAG(String(comboName), updatedCombos, new Set(), 0, configuredDepth);
         } catch (dagError) {
-          return NextResponse.json({ error: dagError.message }, { status: 400 });
+          // Sanitize the raw `dagError.message` — it can leak internal combo
+          // names. Log full error server-side for debugging, return a
+          // sanitized generic message to the client with a short reason tag.
+          console.warn("Combo DAG validation failed:", dagError);
+          const reason =
+            dagError instanceof Error && /cycle/i.test(dagError.message)
+              ? "cycle-detected"
+              : dagError instanceof Error && /depth/i.test(dagError.message)
+                ? "max-depth-exceeded"
+                : "invalid-graph";
+          return comboErrorResponse("COMBO_005", 400, { comboName, reason }, request);
         }
       }
     }
@@ -132,11 +238,24 @@ export async function PUT(request, { params }) {
     // Auto sync to Cloud if enabled
     await syncToCloudIfEnabled();
 
-    return NextResponse.json(combo);
+    // #8530: a combo renamed to a real model id is a supported pattern
+    // (#6940 — bare-model-id provider fallback), so it is never rejected.
+    // Surface it as a non-blocking warning instead of silently shadowing it.
+    const warning = comboName ? buildComboNameCollisionWarning(String(comboName)) : null;
+    return NextResponse.json(warning ? { ...combo, warning } : combo);
   } catch (error) {
+    if (error instanceof ComboInvariantError) {
+      return comboErrorResponse("COMBO_008", 400, { reason: error.message }, request);
+    }
     console.log("Error updating combo:", error);
-    return NextResponse.json({ error: "Failed to update combo" }, { status: 500 });
+    return comboErrorResponse("INTERNAL_001", 500, undefined, request);
   }
+}
+
+// PATCH /api/combos/[id] - partial update. PUT merges the body onto the stored
+// combo, so both verbs share one handler (same shape as /api/providers/[id]).
+export async function PATCH(request, ctx) {
+  return PUT(request, ctx);
 }
 
 // DELETE /api/combos/[id] - Delete combo
@@ -146,10 +265,22 @@ export async function DELETE(request, { params }) {
 
   try {
     const { id } = await params;
+    const existingCombo = (await getComboById(id)) as ComboRowShape | null;
+    if (!existingCombo) {
+      return comboErrorResponse("COMBO_007", 404, { id }, request);
+    }
+    if (existingCombo.name.startsWith(QUOTA_MODEL_PREFIX)) {
+      return comboErrorResponse(
+        "COMBO_006",
+        409,
+        { name: existingCombo.name, source: "quota-share" },
+        request
+      );
+    }
     const success = await deleteCombo(id);
 
     if (!success) {
-      return NextResponse.json({ error: "Combo not found" }, { status: 404 });
+      return comboErrorResponse("COMBO_007", 404, { id }, request);
     }
 
     // Auto sync to Cloud if enabled
@@ -158,7 +289,7 @@ export async function DELETE(request, { params }) {
     return NextResponse.json({ success: true });
   } catch (error) {
     console.log("Error deleting combo:", error);
-    return NextResponse.json({ error: "Failed to delete combo" }, { status: 500 });
+    return comboErrorResponse("INTERNAL_001", 500, undefined, request);
   }
 }
 

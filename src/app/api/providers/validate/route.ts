@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/errorSanitization.ts";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { getAuditRequestContext, logAuditEvent } from "@/lib/compliance/index";
 import { getProviderNodeById } from "@/models";
 import {
@@ -7,10 +9,13 @@ import {
   isAnthropicCompatibleProvider,
 } from "@/shared/constants/providers";
 import { validateProviderApiKey } from "@/lib/providers/validation";
-import { getProxyForLevel, resolveProxyForProvider } from "@/lib/localDb";
+import { projectProviderValidationResultForPublicResponse } from "@/lib/providers/validation/transport";
+import { getProxyForLevel } from "@/lib/db/settings";
+import { resolveProxyForProvider } from "@/lib/db/proxies";
 import { validateProviderApiKeySchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
+import { runWithProxyContextOrDirect } from "@omniroute/open-sse/utils/proxyFetch.ts";
+import { rejectRetiredCommonChatGptWebProvider } from "@/lib/providers/chatgptWebRetirementResponse";
 
 function sanitizeAuditUrl(url: string | null | undefined) {
   if (!url) return null;
@@ -24,6 +29,9 @@ function sanitizeAuditUrl(url: string | null | undefined) {
 
 // POST /api/providers/validate - Validate API key with provider
 export async function POST(request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   const auditContext = getAuditRequestContext(request);
   let rawBody;
   try {
@@ -51,8 +59,17 @@ export async function POST(request) {
       validationModelId,
       customUserAgent,
       baseUrl: bodyBaseUrl,
+      region,
+      accessKeyId,
+      sessionToken,
       cx,
+      runtimeKey,
+      tunnelId,
+      connectorName,
     } = validation.data;
+
+    const retirementResponse = rejectRetiredCommonChatGptWebProvider(provider);
+    if (retirementResponse) return retirementResponse;
 
     let providerSpecificData: any = { validationModelId };
     if (customUserAgent) {
@@ -61,9 +78,21 @@ export async function POST(request) {
     if (bodyBaseUrl) {
       providerSpecificData.baseUrl = bodyBaseUrl;
     }
+    if (region) {
+      providerSpecificData.region = region;
+    }
+    if (accessKeyId) {
+      providerSpecificData.accessKeyId = accessKeyId;
+    }
+    if (sessionToken) {
+      providerSpecificData.sessionToken = sessionToken;
+    }
     if (cx) {
       providerSpecificData.cx = cx;
     }
+    if (runtimeKey) providerSpecificData.runtimeKey = runtimeKey;
+    if (tunnelId) providerSpecificData.tunnelId = tunnelId;
+    if (connectorName) providerSpecificData.connectorName = connectorName;
 
     if (isOpenAICompatibleProvider(provider) || isAnthropicCompatibleProvider(provider)) {
       const node: any = await getProviderNodeById(provider);
@@ -96,16 +125,24 @@ export async function POST(request) {
       proxyToUse = providerProxy || globalProxy || null;
     }
 
-    const result = await runWithProxyContext(proxyToUse || null, () =>
-      validateProviderApiKey({
-        provider,
-        apiKey,
-        providerSpecificData,
-      })
+    const result = projectProviderValidationResultForPublicResponse(
+      await runWithProxyContextOrDirect(proxyToUse || null, () =>
+        validateProviderApiKey({
+          provider,
+          apiKey,
+          providerSpecificData,
+        })
+      )
     );
 
     if (result.unsupported) {
-      return NextResponse.json({ error: "Provider validation not supported" }, { status: 400 });
+      // #5565/#5567: surface `unsupported` so the dashboard can treat "validation
+      // not supported" as a non-blocking warning (allow Save) instead of a hard
+      // "Invalid" block — providers like lmarena / piapi have no live validator.
+      return NextResponse.json(
+        { error: "Provider validation not supported", unsupported: true },
+        { status: 400 }
+      );
     }
 
     if (!result.valid && typeof result.statusCode === "number") {
@@ -137,9 +174,11 @@ export async function POST(request) {
       error: result.valid ? null : result.error || "Invalid API key",
       warning: result.warning || null,
       method: result.method || null,
+      capabilities: result.capabilities || null,
+      providerSpecificData: result.providerSpecificData || null,
     });
   } catch (error) {
-    console.log("Error validating API key:", error);
+    console.log("Error validating API key:", sanitizeErrorMessage(error) || "Validation failed");
     return NextResponse.json({ error: "Validation failed" }, { status: 500 });
   }
 }

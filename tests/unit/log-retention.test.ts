@@ -16,7 +16,7 @@ const compliance = await import("../../src/lib/compliance/index.ts");
 
 function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -28,7 +28,7 @@ test.after(() => {
   resetStorage();
 });
 
-test("cleanupExpiredLogs uses separate APP and CALL retention windows", () => {
+test("cleanupExpiredLogs uses separate APP and CALL retention windows", async () => {
   compliance.initAuditLog();
   const db = core.getDbInstance();
 
@@ -117,7 +117,7 @@ test("cleanupExpiredLogs uses separate APP and CALL retention windows", () => {
     freshAppTs
   );
 
-  const result = compliance.cleanupExpiredLogs();
+  const result = await compliance.cleanupExpiredLogs();
 
   assert.equal(result.deletedUsage, 1);
   assert.equal(result.deletedCallLogs, 1);
@@ -135,7 +135,44 @@ test("cleanupExpiredLogs uses separate APP and CALL retention windows", () => {
   assert.equal((db.prepare("SELECT COUNT(*) AS cnt FROM mcp_tool_audit").get() as any).cnt, 1);
 });
 
-test("cleanupExpiredLogs enforces row count limits", () => {
+test("cleanupExpiredLogs honors the dashboard usageHistory retention when env is unset (#4354)", async () => {
+  // Operator did NOT set the retention env vars; the dashboard configured 90 days.
+  // The startup cleanup must respect the dashboard value, not the 7-day env default.
+  const savedCall = process.env.CALL_LOG_RETENTION_DAYS;
+  const savedApp = process.env.APP_LOG_RETENTION_DAYS;
+  delete process.env.CALL_LOG_RETENTION_DAYS;
+  delete process.env.APP_LOG_RETENTION_DAYS;
+  try {
+    compliance.initAuditLog();
+    const db = core.getDbInstance();
+
+    const { updateDatabaseSettings } = await import("../../src/lib/db/databaseSettings.ts");
+    updateDatabaseSettings({ retention: { usageHistory: 90, callLogs: 90 } } as any);
+
+    const oldTs = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    db.prepare(
+      "INSERT INTO usage_history (provider, model, tokens_input, tokens_output, success, latency_ms, ttft_ms, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run("openai", "old-usage", 1, 1, 1, 1, 1, oldTs);
+
+    const result = await compliance.cleanupExpiredLogs();
+
+    // 30 days < the configured 90-day dashboard retention → must be kept.
+    // With the old env-default (7d) behavior this row would be deleted.
+    assert.equal(
+      result.deletedUsage,
+      0,
+      "30-day usage_history must survive a 90-day dashboard retention"
+    );
+    assert.equal((db.prepare("SELECT COUNT(*) AS cnt FROM usage_history").get() as any).cnt, 1);
+  } finally {
+    if (savedCall !== undefined) process.env.CALL_LOG_RETENTION_DAYS = savedCall;
+    else delete process.env.CALL_LOG_RETENTION_DAYS;
+    if (savedApp !== undefined) process.env.APP_LOG_RETENTION_DAYS = savedApp;
+    else delete process.env.APP_LOG_RETENTION_DAYS;
+  }
+});
+
+test("cleanupExpiredLogs enforces row count limits", async () => {
   compliance.initAuditLog();
   const db = core.getDbInstance();
 
@@ -169,7 +206,7 @@ test("cleanupExpiredLogs enforces row count limits", () => {
   assert.equal((db.prepare("SELECT COUNT(*) AS cnt FROM call_logs").get() as any).cnt, 10);
   assert.equal((db.prepare("SELECT COUNT(*) AS cnt FROM proxy_logs").get() as any).cnt, 10);
 
-  const result = compliance.cleanupExpiredLogs();
+  const result = await compliance.cleanupExpiredLogs();
 
   assert.equal(result.trimmedCallLogs, 5);
   assert.equal(result.trimmedProxyLogs, 5);

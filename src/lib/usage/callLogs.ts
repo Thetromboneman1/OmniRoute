@@ -5,36 +5,87 @@
  * filesystem artifacts and are loaded only for explicit detail/export flows.
  */
 
-import fs from "fs";
-import path from "path";
+import fs from "node:fs";
+import path from "node:path";
 import type { RequestPipelinePayloads } from "@omniroute/open-sse/utils/requestLogger.ts";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/errorSanitization.ts";
 import { getDbInstance } from "../db/core";
 import { getRequestDetailLogByCallLogId } from "../db/detailedLogs";
 import { shouldPersistToDisk } from "./migrations";
+import { updateRequestTokensById } from "./usageHistory";
+import { getCallLogApiKeyContext } from "./callLogApiKeyContext";
+import { serializeResilienceActions, resetResilienceActions } from "./resilienceActionsContext";
+import { parseResilienceActions } from "./resilienceActionsParse";
+import {
+  seedPendingContinuationState,
+  clearPendingContinuationState,
+  type ContinuationPipeline,
+} from "../db/responsesContinuationStore";
 import {
   getLoggedInputTokens,
   getLoggedOutputTokens,
   getPromptCacheReadTokensOrNull,
   getPromptCacheCreationTokensOrNull,
   getReasoningTokensOrNull,
+  getObservedReasoning,
 } from "./tokenAccounting";
-import { isNoLog } from "../compliance";
-import { sanitizePII } from "../piiSanitizer";
-import { protectPayloadForLog, parseStoredPayload } from "../logPayloads";
-import { getCallLogMaxEntries, getCallLogRetentionDays, getCallLogsTableMaxRows } from "../logEnv";
-import { pickMaskedDisplayValue } from "@/shared/utils/maskEmail";
+import {
+  hasRenderedContent,
+  isNonTextRequest,
+  resolveUsageProvenance,
+} from "./callContentProvenance";
+import { isNoLog } from "../compliance/noLog";
+import {
+  parseStoredPayload,
+  protectErrorPayloadForLog,
+  protectPayloadForLog,
+} from "../logPayloads";
+import { pickDisplayValue } from "@/shared/utils/maskEmail";
 import {
   CALL_LOGS_DIR,
-  cleanupEmptyCallLogDirs,
-  deleteCallArtifact,
-  listCallLogArtifactFiles,
   readCallArtifact,
-  writeCallArtifact,
   type CallLogArtifact,
   type CallLogDetailState,
 } from "./callLogArtifacts";
+import { closeCallLogArtifactWriter, writeCallArtifactAsync } from "./callLogArtifactWriter";
+import {
+  toNumber,
+  toStringOrNull,
+  parseInlineError,
+  normalizeDetailState,
+  sanitizeErrorForLog,
+  toStoredErrorSummary,
+  protectPipelinePayloads,
+  buildRequestSummary,
+  classifyCallLogError,
+  toStoredErrorType,
+} from "./callLogs/format";
+import {
+  clearArtifactReference,
+  cleanupOrphanCallLogFiles,
+  cleanupOverflowCallLogFiles,
+  deleteCallLogsBefore,
+  trimCallLogsToMaxRows,
+  rotateCallLogs,
+  scheduleCallLogRotation,
+} from "./callLogRotation";
+
+// Re-exported for existing importers (usageDb.ts, compliance/index.ts, purge-logs route,
+// and the call-log rotation/cap test suite) — the implementation now lives in
+// ./callLogRotation.ts (extracted to satisfy the file-size gate, #10125).
+export {
+  cleanupOrphanCallLogFiles,
+  cleanupOverflowCallLogFiles,
+  deleteCallLogsBefore,
+  trimCallLogsToMaxRows,
+  rotateCallLogs,
+  scheduleCallLogRotation,
+};
 
 type JsonRecord = Record<string, unknown>;
+
+const pendingCallLogSaves = new Set<Promise<void>>();
+let callLogSavesClosing = false;
 
 type CallLogSummaryRow = {
   id: string;
@@ -48,11 +99,15 @@ type CallLogSummaryRow = {
   account: string | null;
   connection_id: string | null;
   duration: number | null;
+  ttft_ms: number | null;
   tokens_in: number | null;
   tokens_out: number | null;
   tokens_cache_read: number | null;
   tokens_cache_creation: number | null;
   tokens_reasoning: number | null;
+  tokens_compressed: number | null;
+  reasoning_source?: string | null;
+  reasoning_chars?: number | null;
   cache_source: string | null;
   request_type: string | null;
   source_format: string | null;
@@ -71,8 +126,18 @@ type CallLogSummaryRow = {
   has_response_body: number | null;
   has_pipeline_details: number | null;
   request_summary: string | null;
+  provider_node_name?: string | null;
   provider_node_prefix?: string | null;
+  resolved_account?: string | null;
+  correlation_id?: string | null;
+  model_pinned?: number | null;
+  session_tag?: string | null;
+  resilience_actions?: string | null;
+  has_content?: number | null;
+  usage_provenance?: string | null;
 };
+
+const RESOLVED_ACCOUNT_SQL = "COALESCE(NULLIF(pc.name, ''), NULLIF(pc.email, ''), cl.account)";
 
 type LegacyInlineRow = {
   request_body: string | null;
@@ -85,131 +150,26 @@ type DeleteResult = {
   deletedArtifacts: number;
 };
 
-let logIdCounter = 0;
-
-function asRecord(value: unknown): JsonRecord {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
-}
-
-function toNumber(value: unknown): number {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (typeof value === "string" && value.trim().length > 0) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-  return 0;
-}
-
-function toStringOrNull(value: unknown): string | null {
-  return typeof value === "string" && value.trim().length > 0 ? value : null;
-}
-
-function truncateText(value: string, maxLength: number) {
-  return value.length > maxLength ? value.slice(0, maxLength) : value;
-}
-
-function parseInlineError(value: unknown): unknown {
-  if (typeof value !== "string" || value.trim().length === 0) return null;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return value;
-  }
-}
-
-function normalizeDetailState(value: unknown): CallLogDetailState {
-  if (
-    value === "ready" ||
-    value === "missing" ||
-    value === "corrupt" ||
-    value === "legacy-inline"
-  ) {
-    return value;
-  }
-  return "none";
-}
-
-function sanitizeErrorForLog(error: unknown): unknown {
-  if (error === null || error === undefined) return null;
-  if (typeof error === "string") return sanitizePII(error).text;
-  if (error instanceof Error) {
-    return {
-      message: sanitizePII(error.message).text,
-      stack: sanitizePII(error.stack || "").text || undefined,
-      name: error.name,
-    };
-  }
-  return protectPayloadForLog(error);
-}
-
-function toStoredErrorSummary(error: unknown): string | null {
-  const sanitized = sanitizeErrorForLog(error);
-  if (sanitized === null || sanitized === undefined) return null;
-
-  if (typeof sanitized === "string") {
-    return truncateText(sanitized, 4000);
-  }
-
-  try {
-    return truncateText(JSON.stringify(sanitized), 4000);
-  } catch {
-    return truncateText(String(sanitized), 4000);
-  }
-}
-
-function protectPipelinePayloads(payloads: unknown): RequestPipelinePayloads | null {
-  if (!payloads || typeof payloads !== "object") return null;
-
-  const protectedPayloads: RequestPipelinePayloads = {};
-  for (const [key, value] of Object.entries(payloads as JsonRecord)) {
-    if (value === null || value === undefined) continue;
-
-    if (key === "streamChunks" && value && typeof value === "object") {
-      const chunks = value as Record<string, unknown>;
-      const compacted = Object.fromEntries(
-        Object.entries(chunks).filter(
-          ([, chunkValue]) => Array.isArray(chunkValue) && chunkValue.length > 0
-        )
-      );
-      if (Object.keys(compacted).length > 0) {
-        protectedPayloads.streamChunks = protectPayloadForLog(
-          compacted
-        ) as RequestPipelinePayloads["streamChunks"];
-      }
-      continue;
-    }
-
-    protectedPayloads[key as keyof RequestPipelinePayloads] = protectPayloadForLog(value) as never;
-  }
-
-  return Object.keys(protectedPayloads).length > 0 ? protectedPayloads : null;
-}
-
-function buildRequestSummary(requestType: string | null, requestBody: unknown): string | null {
-  if (requestType !== "search") return null;
-
-  const body = asRecord(requestBody);
-  if (Object.keys(body).length === 0) return null;
-
-  const summary: JsonRecord = {};
-  if (typeof body.query === "string" && body.query.trim().length > 0) {
-    summary.query = sanitizePII(body.query).text;
-  }
-
-  const filters = Object.fromEntries(
-    Object.entries(body).filter(([key]) => key !== "query" && key !== "provider")
-  );
-  if (Object.keys(filters).length > 0) {
-    summary.filters = filters;
-  }
-
-  if (Object.keys(summary).length === 0) return null;
-  return JSON.stringify(summary);
-}
+const CALL_LOG_ID_RETRY_LIMIT = 3;
 
 function generateLogId() {
-  logIdCounter++;
-  return `${Date.now()}-${logIdCounter}`;
+  return globalThis.crypto.randomUUID();
+}
+
+function isCallLogIdCollision(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = String((error as { code?: unknown }).code ?? "");
+  const msg = String((error as { message?: unknown }).message ?? "");
+  if (/SQLITE_CONSTRAINT_PRIMARYKEY/i.test(code)) return true;
+  if (/SQLITE_CONSTRAINT_UNIQUE/i.test(code) && /call_logs\.id/i.test(msg)) return true;
+  return /UNIQUE constraint failed: call_logs\.id/i.test(msg);
+}
+
+// TTFT is only meaningful when measured and non-negative; normalize anything
+// else (undefined/NaN/negative) to the column's "not tracked" state.
+function toNullableTtftMs(value: unknown): number | null {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
 }
 
 async function resolveAccountName(connectionId: string | null | undefined) {
@@ -220,12 +180,13 @@ async function resolveAccountName(connectionId: string | null | undefined) {
   }
 
   try {
-    const { getProviderConnections } = await import("@/lib/localDb");
+    const { getProviderConnections } = await import("@/lib/db/providers");
     const connections = await getProviderConnections();
     const conn = connections.find((item) => item.id === connectionId);
     if (conn) {
-      account = pickMaskedDisplayValue(
+      account = pickDisplayValue(
         [toStringOrNull(conn.name), toStringOrNull(conn.email)],
+        true,
         account
       );
     }
@@ -239,7 +200,7 @@ async function resolveAccountName(connectionId: string | null | undefined) {
 async function resolveProviderPrefix(providerId: string): Promise<string | null> {
   if (!providerId) return null;
   try {
-    const { getProviderNodeById } = await import("@/lib/localDb");
+    const { getProviderNodeById } = await import("@/lib/db/providers");
     const node = await getProviderNodeById(providerId);
     if (node && typeof node.prefix === "string" && node.prefix.trim().length > 0) {
       return node.prefix.trim();
@@ -257,7 +218,7 @@ function isCompatibleProviderId(providerId: string | null): boolean {
   );
 }
 
-function applyNodePrefix(
+export function applyNodePrefix(
   requestedModel: string | null,
   provider: string | null,
   nodePrefix: string | null
@@ -286,6 +247,7 @@ function buildArtifact(
     tokensCacheRead: number | null;
     tokensCacheCreation: number | null;
     tokensReasoning: number | null;
+    tokensCompressed: number | null;
     requestType: string | null;
     sourceFormat: string | null;
     targetFormat: string | null;
@@ -301,7 +263,7 @@ function buildArtifact(
   pipelinePayloads: RequestPipelinePayloads | null
 ): CallLogArtifact {
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     summary: {
       id: logEntry.id,
       timestamp: logEntry.timestamp,
@@ -320,6 +282,7 @@ function buildArtifact(
         cacheRead: logEntry.tokensCacheRead,
         cacheWrite: logEntry.tokensCacheCreation,
         reasoning: logEntry.tokensReasoning,
+        compressed: logEntry.tokensCompressed,
       },
       requestType: logEntry.requestType,
       sourceFormat: logEntry.sourceFormat,
@@ -337,11 +300,103 @@ function buildArtifact(
   };
 }
 
+// #6187: extract the assistant message from a chat-completion-shaped response
+// body so we can inspect its reasoning_content / <think> content.
+function extractAssistantMessage(responseBody: unknown): unknown {
+  if (!responseBody || typeof responseBody !== "object") return responseBody;
+  const choices = (responseBody as JsonRecord).choices;
+  if (Array.isArray(choices) && choices.length > 0) {
+    const first = choices[0] as JsonRecord;
+    return first?.message ?? first?.delta ?? first;
+  }
+  return responseBody;
+}
+
+// #6187: decide the reasoning SOURCE and (char-only) count recorded alongside
+// the usage-derived tokens_reasoning. Usage is authoritative when it reports
+// non-zero reasoning tokens; otherwise we fall back to observed reasoning
+// content so "reasoned but metered 0" stays distinguishable. reasoning_chars is
+// a CHARACTER count, never a token count — it must not touch cost math.
+//
+// Encrypted-reasoning observability: an opaque Responses `reasoning` item
+// (`encrypted_content` / signature / format, no readable summary) overrides
+// every other source with 'encrypted'. The sink-side scan covers non-streaming
+// snapshots and batch-completed-without-added payloads; the streaming path
+// threads the same signal via `entry.reasoningMeta` (flag + wall-clock delta).
+// NEVER inspect or persist the opaque blob itself — presence only.
+function snapshotHasOpaqueReasoningItem(body: unknown): boolean {
+  const record =
+    body !== null && typeof body === "object" && !Array.isArray(body) ? (body as JsonRecord) : null;
+  if (!record) return false;
+  const outputs: unknown[] = [];
+  if (Array.isArray(record.output)) outputs.push(...record.output);
+  const nested =
+    record.response !== null &&
+    typeof record.response === "object" &&
+    !Array.isArray(record.response)
+      ? (record.response as JsonRecord)
+      : null;
+  if (nested && Array.isArray(nested.output)) outputs.push(...nested.output);
+  return outputs.some((item) => {
+    const itemRecord =
+      item !== null && typeof item === "object" && !Array.isArray(item)
+        ? (item as JsonRecord)
+        : null;
+    if (!itemRecord || itemRecord.type !== "reasoning") return false;
+    return (
+      (typeof itemRecord.encrypted_content === "string" &&
+        itemRecord.encrypted_content.length > 0) ||
+      itemRecord.signature !== undefined ||
+      itemRecord.format !== undefined
+    );
+  });
+}
+
+function resolveReasoningObservation(
+  usageReasoning: number | null,
+  responseBody: unknown,
+  streamMeta?: { encryptedSeen?: boolean } | null
+): { source: string | null; chars: number | null } {
+  if (streamMeta?.encryptedSeen === true || snapshotHasOpaqueReasoningItem(responseBody)) {
+    return { source: "encrypted", chars: null };
+  }
+  if (usageReasoning != null && usageReasoning > 0) {
+    return { source: "usage", chars: null };
+  }
+  const observed = getObservedReasoning(extractAssistantMessage(responseBody));
+  if (observed.chars > 0) {
+    return { source: observed.source, chars: observed.chars };
+  }
+  return { source: null, chars: null };
+}
+
 function hasTable(tableName: string): boolean {
   const db = getDbInstance();
   return Boolean(
     db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName)
   );
+}
+
+function hasCallLogsColumn(columnName: string): boolean {
+  // One PRAGMA per INSERT is wasteful; the cached answer is invalidated only
+  // when a write fails with "no such column" (concurrent migration race).
+  const cached = (hasCallLogsColumn as { cache?: Map<string, boolean> }).cache;
+  if (cached?.has(columnName)) return cached.get(columnName) as boolean;
+  try {
+    const db = getDbInstance();
+    const rows = db.prepare("PRAGMA table_info(call_logs)").all() as Array<{ name?: string }>;
+    const found = rows.some((row) => row.name === columnName);
+    const map = cached ?? new Map<string, boolean>();
+    map.set(columnName, found);
+    (hasCallLogsColumn as { cache?: Map<string, boolean> }).cache = map;
+    return found;
+  } catch {
+    return false;
+  }
+}
+
+export function invalidateCallLogsColumnCache(): void {
+  (hasCallLogsColumn as { cache?: Map<string, boolean> }).cache = undefined;
 }
 
 function readLegacyLogFromDisk(entry: {
@@ -381,152 +436,38 @@ function readLegacyLogFromDisk(entry: {
       return JSON.parse(fs.readFileSync(path.join(dir, files[0]), "utf8"));
     }
   } catch (error) {
-    console.error("[callLogs] Failed to read legacy disk log:", (error as Error).message);
+    console.error(
+      "[callLogs] Failed to read legacy disk log:",
+      sanitizeErrorMessage(error) || "Legacy call log read failed"
+    );
   }
 
   return null;
 }
 
-function clearArtifactReference(relativePath: string, nextState: CallLogDetailState) {
-  const db = getDbInstance();
-  db.prepare(
-    `
-      UPDATE call_logs
-      SET detail_state = ?,
-          artifact_relpath = NULL,
-          artifact_size_bytes = NULL,
-          artifact_sha256 = NULL
-      WHERE artifact_relpath = ?
-    `
-  ).run(nextState, relativePath);
+export function resolveProviderDisplay(
+  provider: string | null,
+  nodeName: string | null,
+  nodePrefix: string | null
+): string | null {
+  const rawProvider = toStringOrNull(provider);
+  if (!rawProvider) return null;
+
+  const name = toStringOrNull(nodeName)?.trim();
+  if (name) return name;
+
+  const prefix = toStringOrNull(nodePrefix)?.trim();
+  if (prefix) return prefix;
+
+  return null;
 }
 
-function listReferencedArtifacts() {
-  const db = getDbInstance();
-  const rows = db
-    .prepare("SELECT artifact_relpath FROM call_logs WHERE artifact_relpath IS NOT NULL")
-    .all() as Array<{ artifact_relpath: string | null }>;
-
-  return new Set(
-    rows.map((row) => row.artifact_relpath).filter((value): value is string => Boolean(value))
-  );
-}
-
-function deleteCallLogRowsByIds(ids: string[]): DeleteResult {
-  if (ids.length === 0) {
-    return { deletedRows: 0, deletedArtifacts: 0 };
-  }
-
-  const db = getDbInstance();
-  const placeholders = ids.map(() => "?").join(", ");
-  const rows = db
-    .prepare(`SELECT artifact_relpath FROM call_logs WHERE id IN (${placeholders})`)
-    .all(...ids) as Array<{ artifact_relpath: string | null }>;
-
-  const result = db.prepare(`DELETE FROM call_logs WHERE id IN (${placeholders})`).run(...ids);
-  let deletedArtifacts = 0;
-  for (const row of rows) {
-    if (deleteCallArtifact(row.artifact_relpath)) {
-      deletedArtifacts++;
-    }
-  }
-  cleanupEmptyCallLogDirs();
-
-  return {
-    deletedRows: result.changes,
-    deletedArtifacts,
-  };
-}
-
-export function cleanupOrphanCallLogFiles(baseDir = CALL_LOGS_DIR) {
-  if (!baseDir || !fs.existsSync(baseDir)) return 0;
-
-  try {
-    const referenced = listReferencedArtifacts();
-    let deleted = 0;
-    for (const file of listCallLogArtifactFiles(baseDir)) {
-      if (referenced.has(file.relativePath)) continue;
-      if (deleteCallArtifact(file.relativePath)) {
-        deleted++;
-      }
-    }
-    cleanupEmptyCallLogDirs(baseDir);
-    return deleted;
-  } catch (error) {
-    console.error("[callLogs] Failed to prune orphan request artifacts:", (error as Error).message);
-    return 0;
-  }
-}
-
-export function cleanupOverflowCallLogFiles(baseDir = CALL_LOGS_DIR, maxEntries?: number) {
-  if (!baseDir || !fs.existsSync(baseDir)) return 0;
-
-  const limit = maxEntries ?? getCallLogMaxEntries();
-  if (!Number.isInteger(limit) || limit < 1) return 0;
-
-  try {
-    let deleted = 0;
-    const files = listCallLogArtifactFiles(baseDir);
-    for (const file of files.slice(limit)) {
-      if (deleteCallArtifact(file.relativePath)) {
-        clearArtifactReference(file.relativePath, "missing");
-        deleted++;
-      }
-    }
-    cleanupEmptyCallLogDirs(baseDir);
-    return deleted;
-  } catch (error) {
-    console.error(
-      "[callLogs] Failed to prune overflow request artifacts:",
-      (error as Error).message
-    );
-    return 0;
-  }
-}
-
-export function deleteCallLogsBefore(cutoff: string): DeleteResult {
-  const db = getDbInstance();
-  const ids = db
-    .prepare("SELECT id FROM call_logs WHERE timestamp < ? ORDER BY timestamp ASC")
-    .all(cutoff)
-    .map((row) => String((row as { id: string }).id));
-
-  return deleteCallLogRowsByIds(ids);
-}
-
-export function trimCallLogsToMaxRows(maxRows = getCallLogsTableMaxRows()) {
-  if (!Number.isInteger(maxRows) || maxRows < 1) {
-    return { deletedRows: 0, deletedArtifacts: 0 };
-  }
-
-  const db = getDbInstance();
-  let deletedRows = 0;
-  let deletedArtifacts = 0;
-  const batchSize = 5000;
-
-  while (true) {
-    const currentCount = db.prepare("SELECT COUNT(*) AS cnt FROM call_logs").get() as {
-      cnt: number;
-    };
-    if (currentCount.cnt <= maxRows) break;
-
-    const toDelete = Math.min(currentCount.cnt - maxRows, batchSize);
-    const ids = db
-      .prepare("SELECT id FROM call_logs ORDER BY timestamp ASC LIMIT ?")
-      .all(toDelete)
-      .map((row) => String((row as { id: string }).id));
-    const result = deleteCallLogRowsByIds(ids);
-    deletedRows += result.deletedRows;
-    deletedArtifacts += result.deletedArtifacts;
-    if (result.deletedRows === 0) break;
-  }
-
-  return { deletedRows, deletedArtifacts };
-}
+export { parseResilienceActions };
 
 function mapSummaryRow(row: CallLogSummaryRow) {
   const detailState = normalizeDetailState(row.detail_state);
   const provider = row.provider;
+  const nodeName = row.provider_node_name ?? null;
   const nodePrefix = row.provider_node_prefix ?? null;
   return {
     id: row.id,
@@ -537,17 +478,26 @@ function mapSummaryRow(row: CallLogSummaryRow) {
     model: row.model,
     requestedModel: applyNodePrefix(row.requested_model, provider, nodePrefix),
     provider,
-    account: row.account,
+    providerDisplay: resolveProviderDisplay(provider, nodeName, nodePrefix),
+    account: row.resolved_account || row.account,
     connectionId: row.connection_id,
     duration: toNumber(row.duration),
+    ttft: row.ttft_ms != null ? toNumber(row.ttft_ms) : null,
     tokens: {
       in: toNumber(row.tokens_in),
       out: toNumber(row.tokens_out),
       cacheRead: row.tokens_cache_read != null ? toNumber(row.tokens_cache_read) : null,
       cacheWrite: row.tokens_cache_creation != null ? toNumber(row.tokens_cache_creation) : null,
       reasoning: row.tokens_reasoning != null ? toNumber(row.tokens_reasoning) : null,
+      compressed: row.tokens_compressed != null ? toNumber(row.tokens_compressed) : null,
     },
     cacheSource: row.cache_source || "upstream",
+    // #6187/#13965: observed reasoning (source + CHARACTER count, never tokens) so the
+    // detail view can tell "reasoned but not metered" apart from "did not reason".
+    reasoningSource: row.reasoning_source ?? null,
+    reasoningChars: row.reasoning_chars != null ? toNumber(row.reasoning_chars) : null,
+    hasContent: row.has_content ?? null,
+    usageProvenance: row.usage_provenance ?? null,
     requestType: row.request_type,
     sourceFormat: row.source_format,
     targetFormat: row.target_format,
@@ -565,6 +515,10 @@ function mapSummaryRow(row: CallLogSummaryRow) {
     hasRequestBody: toNumber(row.has_request_body) === 1,
     hasResponseBody: toNumber(row.has_response_body) === 1,
     hasPipelineDetails: toNumber(row.has_pipeline_details) === 1,
+    correlationId: row.correlation_id || null,
+    modelPinned: toNumber(row.model_pinned) === 1,
+    sessionTag: row.session_tag || null,
+    resilienceActions: parseResilienceActions(row.resilience_actions ?? null),
   };
 }
 
@@ -596,19 +550,64 @@ function getLegacyInlineDetail(id: string) {
   };
 }
 
-export async function saveCallLog(entry: any) {
-  if (!shouldPersistToDisk) return;
-
+async function saveCallLogOperation(entry: any): Promise<void> {
   try {
-    const apiKeyId = entry.apiKeyId || null;
+    // Bind the DB instance up front, before any await (resolveAccountName,
+    // writeCallArtifactAsync). If the singleton is reset/closed while this
+    // operation awaits, the insert must target the instance this request
+    // started against — a closed handle fails into the catch below instead of
+    // silently writing into whatever database opened afterwards (#12780).
+    const db = getDbInstance();
+    const apiKeyContext = getCallLogApiKeyContext();
+    // `||` (not `??`): an empty-string apiKeyId/apiKeyName is "unattributed",
+    // same as before this fallback existed — it must not be persisted verbatim
+    // nor block the request-scoped context.
+    const apiKeyId = entry.apiKeyId || apiKeyContext?.apiKeyId || null;
+    const apiKeyName = entry.apiKeyName || apiKeyContext?.apiKeyName || null;
     const noLogEnabled = Boolean(entry.noLog) || (apiKeyId ? isNoLog(apiKeyId) : false);
 
     const protectedRequestBody = noLogEnabled ? null : protectPayloadForLog(entry.requestBody);
-    const protectedResponseBody = noLogEnabled ? null : protectPayloadForLog(entry.responseBody);
+    const responseStatus = Number(entry.status);
+    const failedResponse = Number.isFinite(responseStatus) && responseStatus >= 400;
+    const protectedResponseBody = noLogEnabled
+      ? null
+      : failedResponse
+        ? protectErrorPayloadForLog(entry.responseBody)
+        : protectPayloadForLog(entry.responseBody);
     const protectedPipelinePayloads = noLogEnabled
       ? null
-      : protectPipelinePayloads(entry.pipelinePayloads ?? entry.pipeline ?? null);
+      : protectPipelinePayloads(
+          entry.pipelinePayloads ?? entry.pipeline ?? null,
+          failedResponse ? responseStatus : undefined
+        );
     const protectedError = sanitizeErrorForLog(entry.error);
+
+    // Bridges the window before this row's own artifact write (queued below,
+    // async) lands with detail_state = 'ready': a client that fires its next
+    // turn immediately -- normal in a tight tool-calling loop -- can reach
+    // resolvePreviousResponseState before that write exists at all. Seeded
+    // synchronously, before any await, from the same protected pipeline
+    // payload the artifact will eventually hold (and the same
+    // videoContentRemoved/fail-closed rules), so it is available the instant
+    // this function is called. See responsesContinuationStore.ts.
+    if (typeof entry.responseId === "string" && entry.responseId.length > 0) {
+      seedPendingContinuationState(
+        entry.responseId,
+        apiKeyId,
+        // The store's own contract, not a looser restatement of it: the inline shape
+        // widened both fields to `unknown`, which does not assign to
+        // ContinuationPipeline's typed members (TS2345 under typecheck:core).
+        protectedPipelinePayloads as ContinuationPipeline | null,
+        Boolean(entry.videoContentRemoved)
+      );
+    }
+
+    // resilience resilience summary for this attempt (implicit ALS store opened
+    // around the attempt; null outside a store or when nothing was noted).
+    // Read BEFORE any await: the ALS context is synchronous and later awaits
+    // (resolveAccountName, artifact write) may cross async boundaries.
+    const resilienceActions = serializeResilienceActions();
+    const hasResilienceColumn = hasCallLogsColumn("resilience_actions");
 
     const account = await resolveAccountName(entry.connectionId || null);
     const rawProvider: string = entry.provider || "-";
@@ -618,33 +617,140 @@ export async function saveCallLog(entry: any) {
       const nodePrefix = await resolveProviderPrefix(rawProvider);
       resolvedRequestedModel = applyNodePrefix(rawRequestedModel, rawProvider, nodePrefix);
     }
+    // #6187: usage-derived reasoning tokens stay UNCHANGED (cost math reads this),
+    // while reasoning source/char-count are recorded separately for observability.
+    const tokensReasoning = getReasoningTokensOrNull(entry.tokens);
+    const streamReasoningMeta =
+      entry.reasoningMeta !== null && typeof entry.reasoningMeta === "object"
+        ? (entry.reasoningMeta as { encryptedSeen?: boolean; durationMs?: unknown })
+        : null;
+    const reasoningObservation = resolveReasoningObservation(
+      tokensReasoning,
+      entry.responseBody,
+      streamReasoningMeta
+    );
+    // Encrypted-reasoning observability (nullable, additive): stream-side
+    // flag+duration win when present; the sink scan above already forced
+    // source='encrypted' for opaque snapshots (duration NULL there).
+    const streamDurationRaw = streamReasoningMeta?.durationMs;
+    const streamDurationMs =
+      typeof streamDurationRaw === "number" &&
+      Number.isFinite(streamDurationRaw) &&
+      streamDurationRaw >= 0 &&
+      streamDurationRaw <= 86_400_000
+        ? Math.round(streamDurationRaw)
+        : null;
+    const reasoningEncrypted =
+      streamReasoningMeta?.encryptedSeen === true || reasoningObservation.source === "encrypted"
+        ? 1
+        : null;
+    const reasoningDurationMs =
+      reasoningObservation.source === "encrypted" ? streamDurationMs : null;
+    const readEffortValue = (body: unknown): string | null => {
+      if (body === null || typeof body !== "object" || Array.isArray(body)) return null;
+      const record = body as Record<string, unknown>;
+      const direct = record.reasoning_effort;
+      if (typeof direct === "string" && direct.trim().length > 0) return direct;
+      const nested = record.reasoning;
+      if (nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
+        const effort = (nested as Record<string, unknown>).effort;
+        if (typeof effort === "string" && effort.trim().length > 0) return effort;
+      }
+      return null;
+    };
+    const reasoningEffortRequested =
+      reasoningObservation.source === "encrypted"
+        ? readEffortValue(entry.clientRequestBody ?? entry.requestBody)
+        : null;
+    const reasoningEffortUpstream =
+      reasoningObservation.source === "encrypted"
+        ? readEffortValue(entry.upstreamRequestBody)
+        : null;
+    const errorType = toStoredErrorType(
+      classifyCallLogError(entry.status, entry.error, entry.provider)
+    );
+    // Rendered-content presence plus usage provenance: success-only, additive,
+    // nullable. A 2xx is a success even with token counts at zero, so the
+    // success bound is 200-299 (not <400).
+    const numericStatus = Number(entry.status);
+    const isSuccess = Number.isFinite(numericStatus) && numericStatus >= 200 && numericStatus < 300;
+    const clientVisibleBody =
+      entry.clientResponse ??
+      (entry.pipelinePayloads as { clientResponse?: unknown } | null | undefined)?.clientResponse ??
+      (entry.pipeline as { clientResponse?: unknown } | null | undefined)?.clientResponse ??
+      entry.responseBody;
+    const measurableContent =
+      isSuccess &&
+      !noLogEnabled &&
+      !isNonTextRequest(entry.requestType, entry.path ?? entry.method);
+    const renderedContent = measurableContent ? hasRenderedContent(clientVisibleBody) : null;
+    const hasContent = renderedContent === null ? null : renderedContent ? 1 : 0;
+    const usageProvenance = resolveUsageProvenance({
+      usageEstimated: entry.usageEstimated === true,
+      tokens: entry.tokens,
+      isSuccess,
+    });
     const logEntry = {
       id: typeof entry.id === "string" && entry.id.length > 0 ? entry.id : generateLogId(),
       timestamp: typeof entry.timestamp === "string" ? entry.timestamp : new Date().toISOString(),
       method: entry.method || "POST",
       path: entry.path || "/v1/chat/completions",
       status: entry.status || 0,
+      errorType,
       model: entry.model || "-",
       requestedModel: resolvedRequestedModel,
       provider: rawProvider,
       account,
       connectionId: entry.connectionId || null,
       duration: entry.duration || 0,
+      // #13130: TTFT (ms to first forwarded stream chunk) when the streaming
+      // pipeline measured it; null for non-streaming rows. The dashboard TPS
+      // divides by duration - ttft so queueing/prefill wait does not drag the
+      // reported generation rate down.
+      ttftMs: toNullableTtftMs(entry.ttftMs ?? entry.ttft),
       tokensIn: toNumber(getLoggedInputTokens(entry.tokens)),
       tokensOut: toNumber(getLoggedOutputTokens(entry.tokens)),
       tokensCacheRead: getPromptCacheReadTokensOrNull(entry.tokens),
       tokensCacheCreation: getPromptCacheCreationTokensOrNull(entry.tokens),
-      tokensReasoning: getReasoningTokensOrNull(entry.tokens),
+      tokensReasoning,
+      reasoningSource: reasoningObservation.source,
+      reasoningChars: reasoningObservation.chars,
+      reasoningDurationMs,
+      reasoningEffortRequested,
+      reasoningEffortUpstream,
+      reasoningEncrypted,
+      tokensCompressed: entry.tokensCompressed != null ? toNumber(entry.tokensCompressed) : null,
       cacheSource: entry.cacheSource === "semantic" ? "semantic" : "upstream",
       requestType: entry.requestType || null,
       sourceFormat: entry.sourceFormat || null,
       targetFormat: entry.targetFormat || null,
       apiKeyId,
-      apiKeyName: entry.apiKeyName || null,
+      apiKeyName,
       comboName: entry.comboName || null,
       comboStepId: toStringOrNull(entry.comboStepId),
       comboExecutionKey:
         toStringOrNull(entry.comboExecutionKey) || toStringOrNull(entry.comboStepId),
+      correlationId: entry.correlationId || null,
+      // Ms of pacing/park wait imposed before dispatch (null = none).
+      addedWaitMs:
+        typeof entry.addedWaitMs === "number" && Number.isFinite(entry.addedWaitMs)
+          ? entry.addedWaitMs
+          : null,
+      addedWaitCause: toStringOrNull(entry.addedWaitCause),
+      modelPinned: entry.modelPinned ? 1 : 0,
+      sessionTag: entry.sessionTag || null,
+      // OpenAI Responses API response id, when this attempt produced one --
+      // indexed so a later request's `previous_response_id` can resolve
+      // this row's artifact for OmniRoute-native continuation. See
+      // src/lib/db/responsesContinuationStore.ts.
+      responseId: typeof entry.responseId === "string" ? entry.responseId : null,
+      // #12150 P2 surface 2: 1 when this request's persisted client snapshot had
+      // its video transcript cues structurally redacted, so
+      // resolvePreviousResponseState refuses to rehydrate it as continuation
+      // history. See src/lib/db/responsesContinuationStore.ts.
+      videoContentRemoved: entry.videoContentRemoved ? 1 : 0,
+      hasContent,
+      usageProvenance,
     };
 
     const requestSummary = noLogEnabled
@@ -670,7 +776,7 @@ export async function saveCallLog(entry: any) {
         protectedError,
         protectedPipelinePayloads
       );
-      const artifactResult = writeCallArtifact(artifact);
+      const artifactResult = await writeCallArtifactAsync(artifact);
       if (artifactResult) {
         detailState = "ready";
         artifactRelPath = artifactResult.relPath;
@@ -681,29 +787,44 @@ export async function saveCallLog(entry: any) {
       }
     }
 
-    const db = getDbInstance();
-    db.prepare(
+    // Optional column (migration 191) — only fixed identifiers are spliced in.
+    const resilienceCol = hasResilienceColumn ? ", resilience_actions" : "";
+    const resilienceParam = hasResilienceColumn ? ", @resilienceActions" : "";
+    const insertStmt = db.prepare(
       `
       INSERT INTO call_logs (
         id, timestamp, method, path, status, model, requested_model, provider,
-        account, connection_id, duration, tokens_in, tokens_out,
-        tokens_cache_read, tokens_cache_creation, tokens_reasoning,
+        account, connection_id, duration, ttft_ms, tokens_in, tokens_out,
+        tokens_cache_read, tokens_cache_creation, tokens_reasoning, tokens_compressed,
+        reasoning_source, reasoning_chars,
+        reasoning_duration_ms, reasoning_effort_requested, reasoning_effort_upstream,
+        reasoning_encrypted,
         cache_source, request_type, source_format, target_format, api_key_id, api_key_name,
         combo_name, combo_step_id, combo_execution_key, error_summary, detail_state,
         artifact_relpath, artifact_size_bytes, artifact_sha256,
-        has_request_body, has_response_body, has_pipeline_details, request_summary
+        has_request_body, has_response_body, has_pipeline_details, request_summary,
+        correlation_id, model_pinned, session_tag, response_id, error_type,
+        video_content_removed, has_content, usage_provenance,
+        added_wait_ms, added_wait_cause${resilienceCol}
       )
       VALUES (
         @id, @timestamp, @method, @path, @status, @model, @requestedModel, @provider,
-        @account, @connectionId, @duration, @tokensIn, @tokensOut,
-        @tokensCacheRead, @tokensCacheCreation, @tokensReasoning,
+        @account, @connectionId, @duration, @ttftMs, @tokensIn, @tokensOut,
+        @tokensCacheRead, @tokensCacheCreation, @tokensReasoning, @tokensCompressed,
+        @reasoningSource, @reasoningChars,
+        @reasoningDurationMs, @reasoningEffortRequested, @reasoningEffortUpstream,
+        @reasoningEncrypted,
         @cacheSource, @requestType, @sourceFormat, @targetFormat, @apiKeyId, @apiKeyName,
         @comboName, @comboStepId, @comboExecutionKey, @errorSummary, @detailState,
         @artifactRelPath, @artifactSizeBytes, @artifactSha256,
-        @hasRequestBody, @hasResponseBody, @hasPipelineDetails, @requestSummary
+        @hasRequestBody, @hasResponseBody, @hasPipelineDetails, @requestSummary,
+        @correlationId, @modelPinned, @sessionTag, @responseId, @errorType,
+        @videoContentRemoved, @hasContent, @usageProvenance,
+        @addedWaitMs, @addedWaitCause${resilienceParam}
       )
     `
-    ).run({
+    );
+    const insertParams = {
       ...logEntry,
       errorSummary: toStoredErrorSummary(protectedError),
       detailState,
@@ -712,47 +833,131 @@ export async function saveCallLog(entry: any) {
       artifactSha256,
       hasRequestBody: protectedRequestBody !== null ? 1 : 0,
       hasResponseBody: protectedResponseBody !== null ? 1 : 0,
+      resilienceActions,
       hasPipelineDetails: protectedPipelinePayloads ? 1 : 0,
       requestSummary,
+    };
+    // #14451: a 6-char dashboard traceId (or any reused explicit id) can collide.
+    // Keep the already-written artifact path; only the SQLite primary key is regenerated.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        insertStmt.run(insertParams);
+        break;
+      } catch (error) {
+        if (!isCallLogIdCollision(error) || attempt >= CALL_LOG_ID_RETRY_LIMIT) throw error;
+        insertParams.id = generateLogId();
+      }
+    }
+    // sink note: the sink is the unique consumer — reset only after a successful
+    // INSERT, so a failed write (or a second persistence of the same
+    // attempt) keeps the summary instead of silently writing NULL.
+    resetResilienceActions();
+
+    if (detailState === "ready" && typeof logEntry.responseId === "string") {
+      // The durable row is now authoritative; drop the bridge entry instead
+      // of letting it idle until its TTL.
+      clearPendingContinuationState(logEntry.responseId);
+    }
+
+    scheduleCallLogRotation();
+  } catch (error) {
+    if (String((error as Error)?.message ?? error).includes("no such column")) {
+      invalidateCallLogsColumnCache();
+    }
+    console.error(
+      "[callLogs] Failed to save call log:",
+      sanitizeErrorMessage(error) || "Call log persistence failed"
+    );
+  }
+}
+
+export function saveCallLog(entry: any): Promise<void> {
+  // Usage is also needed by the live dashboard when disk history is disabled.
+  // Retain only counters, never the request/response bodies from this entry.
+  if (entry?.tokens && typeof entry.tokens === "object") {
+    updateRequestTokensById(entry.pendingRequestId ?? entry.id, {
+      in: getLoggedInputTokens(entry.tokens),
+      out: getLoggedOutputTokens(entry.tokens),
+      cacheRead: getPromptCacheReadTokensOrNull(entry.tokens),
+      cacheCreation: getPromptCacheCreationTokensOrNull(entry.tokens),
+      reasoning: getReasoningTokensOrNull(entry.tokens),
+      compressed: typeof entry.tokensCompressed === "number" ? entry.tokensCompressed : null,
     });
-
-    rotateCallLogs();
-  } catch (error) {
-    console.error("[callLogs] Failed to save call log:", (error as Error).message);
   }
+  if (!shouldPersistToDisk || callLogSavesClosing) return Promise.resolve();
+
+  const operation = saveCallLogOperation(entry);
+  pendingCallLogSaves.add(operation);
+  void operation.then(
+    () => pendingCallLogSaves.delete(operation),
+    () => pendingCallLogSaves.delete(operation)
+  );
+  return operation;
 }
 
-export function rotateCallLogs() {
-  if (!CALL_LOGS_DIR || !fs.existsSync(CALL_LOGS_DIR)) return;
+export async function waitForCallLogSaves(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (pendingCallLogSaves.size > 0) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return false;
 
-  try {
-    const retentionMs = getCallLogRetentionDays() * 24 * 60 * 60 * 1000;
-    const cutoff = new Date(Date.now() - retentionMs).toISOString();
-
-    deleteCallLogsBefore(cutoff);
-    trimCallLogsToMaxRows(getCallLogsTableMaxRows());
-    cleanupOverflowCallLogFiles(CALL_LOGS_DIR, getCallLogMaxEntries());
-    cleanupOrphanCallLogFiles(CALL_LOGS_DIR);
-  } catch (error) {
-    console.error("[callLogs] Failed to rotate request artifacts:", (error as Error).message);
+    let timeout: NodeJS.Timeout | undefined;
+    const settled = await Promise.race([
+      Promise.allSettled([...pendingCallLogSaves]).then(() => true),
+      new Promise<false>((resolve) => {
+        timeout = setTimeout(() => resolve(false), remainingMs);
+        timeout.unref?.();
+      }),
+    ]);
+    if (timeout) clearTimeout(timeout);
+    if (!settled) return false;
   }
+  return true;
 }
 
-if (shouldPersistToDisk) {
-  try {
-    rotateCallLogs();
-  } catch {
-    // Best-effort startup cleanup.
+export async function closeCallLogSaves(timeoutMs = 2_000): Promise<void> {
+  callLogSavesClosing = true;
+  const drained = await waitForCallLogSaves(timeoutMs);
+  if (!drained) {
+    await closeCallLogArtifactWriter(0);
   }
+
+  // The admission gate above makes this a stable snapshot. After a forced worker
+  // close, queued artifact promises have resolved fail-open and their SQLite
+  // continuations can finish before the database is closed.
+  await Promise.allSettled([...pendingCallLogSaves]);
+  await closeCallLogArtifactWriter(0);
+}
+
+if (shouldPersistToDisk && process.env.NODE_ENV !== "test") {
+  scheduleCallLogRotation();
+}
+
+/**
+ * Pushes a `column LIKE %value%` condition (mirrors the correlationId/sessionTag substring-match
+ * precedent). Extracted so getCallLogs stays under the max-lines-per-function ratchet — #8249.
+ */
+function pushLikeFilter(
+  conditions: string[],
+  params: Record<string, unknown>,
+  column: string,
+  paramKey: string,
+  value: unknown
+) {
+  if (!value) return;
+  conditions.push(`cl.${column} LIKE @${paramKey}`);
+  params[paramKey] = `%${value}%`;
 }
 
 export async function getCallLogs(filter: any = {}) {
   const db = getDbInstance();
   let sql = `
     SELECT cl.*,
-      pn.prefix AS provider_node_prefix
+      pn.name AS provider_node_name, pn.prefix AS provider_node_prefix,
+      ${RESOLVED_ACCOUNT_SQL} AS resolved_account
     FROM call_logs cl
     LEFT JOIN provider_nodes pn ON pn.id = cl.provider
+    LEFT JOIN provider_connections pc ON pc.id = cl.connection_id
   `;
   const conditions: string[] = [];
   const params: Record<string, unknown> = {};
@@ -763,7 +968,7 @@ export async function getCallLogs(filter: any = {}) {
     } else if (filter.status === "ok") {
       conditions.push("cl.status >= 200 AND cl.status < 300");
     } else {
-      const statusCode = parseInt(filter.status, 10);
+      const statusCode = Number.parseInt(filter.status, 10);
       if (!Number.isNaN(statusCode)) {
         conditions.push("cl.status = @statusCode");
         params.statusCode = statusCode;
@@ -780,24 +985,44 @@ export async function getCallLogs(filter: any = {}) {
     params.providerQ = `%${filter.provider}%`;
   }
   if (filter.account) {
-    conditions.push("cl.account LIKE @accountQ");
+    conditions.push(`(cl.account LIKE @accountQ OR ${RESOLVED_ACCOUNT_SQL} LIKE @accountQ)`);
     params.accountQ = `%${filter.account}%`;
   }
   if (filter.apiKey) {
     conditions.push("(cl.api_key_name LIKE @apiKeyQ OR cl.api_key_id LIKE @apiKeyQ)");
     params.apiKeyQ = `%${filter.apiKey}%`;
   }
+  pushLikeFilter(conditions, params, "correlation_id", "correlationId", filter.correlationId);
+  pushLikeFilter(conditions, params, "session_tag", "sessionTag", filter.sessionTag);
   if (filter.combo) {
     conditions.push("cl.combo_name IS NOT NULL");
+  }
+  if (filter.excludeTests) {
+    // Home "Recent Requests" is an allowlist of real provider inference, not a
+    // blacklist of known backend log types. Persisted provider requests enter via
+    // the public gateway namespaces (/v1/* or /api/v1/*); internal management work
+    // (connection tests, model sync, and future /api/providers/* jobs) does not.
+    // Apply this before LIMIT so backend rows can never displace real traffic.
+    conditions.push(`(cl.path LIKE '/v1/%' OR cl.path LIKE '/api/v1/%')`);
+  }
+  if (filter.since) {
+    conditions.push("cl.timestamp >= @since");
+    params.since = filter.since instanceof Date ? filter.since.toISOString() : String(filter.since);
+  }
+  if (filter.until) {
+    conditions.push("cl.timestamp <= @until");
+    params.until = filter.until instanceof Date ? filter.until.toISOString() : String(filter.until);
   }
   if (filter.search) {
     conditions.push(`(
       cl.model LIKE @searchQ OR cl.path LIKE @searchQ OR cl.account LIKE @searchQ OR
+      ${RESOLVED_ACCOUNT_SQL} LIKE @searchQ OR
       cl.requested_model LIKE @searchQ OR cl.provider LIKE @searchQ OR
       cl.api_key_name LIKE @searchQ OR cl.api_key_id LIKE @searchQ OR
       cl.combo_name LIKE @searchQ OR CAST(cl.status AS TEXT) LIKE @searchQ
       OR cl.combo_step_id LIKE @searchQ OR cl.combo_execution_key LIKE @searchQ
       OR cl.error_summary LIKE @searchQ
+      OR cl.correlation_id LIKE @searchQ
     )`);
     params.searchQ = `%${filter.search}%`;
   }
@@ -806,8 +1031,11 @@ export async function getCallLogs(filter: any = {}) {
     sql += " WHERE " + conditions.join(" AND ");
   }
 
-  const limit = filter.limit || 200;
-  sql += ` ORDER BY cl.timestamp DESC LIMIT ${limit}`;
+  const limit = Number.isInteger(filter.limit) && filter.limit > 0 ? filter.limit : 200;
+  const offset = Number.isInteger(filter.offset) && filter.offset > 0 ? filter.offset : 0;
+  sql += ` ORDER BY cl.timestamp DESC LIMIT @__limit OFFSET @__offset`;
+  params.__limit = limit;
+  params.__offset = offset;
 
   const rows = db.prepare(sql).all(params) as CallLogSummaryRow[];
   return rows.map(mapSummaryRow);
@@ -818,14 +1046,15 @@ export async function getCallLogById(id: string) {
   const row = db
     .prepare(
       `SELECT cl.*,
-        pn.prefix AS provider_node_prefix
+        pn.name AS provider_node_name,
+        pn.prefix AS provider_node_prefix,
+        ${RESOLVED_ACCOUNT_SQL} AS resolved_account
        FROM call_logs cl
        LEFT JOIN provider_nodes pn ON pn.id = cl.provider
+       LEFT JOIN provider_connections pc ON pc.id = cl.connection_id
        WHERE cl.id = ?`
     )
-    .get(id) as
-    | CallLogSummaryRow
-    | undefined;
+    .get(id) as CallLogSummaryRow | undefined;
   if (!row) return null;
 
   const entry = mapSummaryRow(row);
@@ -843,6 +1072,7 @@ export async function getCallLogById(id: string) {
         error: artifactResult.artifact.error ?? entry.error,
         pipelinePayloads: artifactResult.artifact.pipeline ?? buildLegacyPipelinePayloads(id),
         hasPipelineDetails: Boolean(artifactResult.artifact.pipeline) || entry.hasPipelineDetails,
+        active: false,
       };
     }
 
@@ -866,6 +1096,7 @@ export async function getCallLogById(id: string) {
         ...legacyInline,
         pipelinePayloads: legacyPipeline,
         hasPipelineDetails: Boolean(legacyPipeline) || entry.hasPipelineDetails,
+        active: false,
       };
     }
   }
@@ -882,6 +1113,7 @@ export async function getCallLogById(id: string) {
       error: legacyDisk.error ?? entry.error,
       pipelinePayloads: legacyPipeline,
       hasPipelineDetails: Boolean(legacyPipeline) || entry.hasPipelineDetails,
+      active: false,
     };
   }
 
@@ -895,6 +1127,7 @@ export async function getCallLogById(id: string) {
     error: entry.error,
     pipelinePayloads: legacyPipeline,
     hasPipelineDetails: Boolean(legacyPipeline) || entry.hasPipelineDetails,
+    active: false,
   };
 }
 
@@ -911,4 +1144,43 @@ export async function exportCallLogsSince(since: string) {
     if (log) logs.push(log);
   }
   return logs;
+}
+
+/**
+ * Total number of call_logs rows with timestamp >= `since` — a cheap
+ * aggregate query, no row hydration. Used by /api/logs/export to report
+ * `totalAvailable` without paying the cost of hydrating every row (#13123).
+ */
+export function countCallLogsSince(since: string): number {
+  const db = getDbInstance();
+  const row = db
+    .prepare("SELECT COUNT(*) AS count FROM call_logs WHERE timestamp >= ?")
+    .get(since) as { count: number };
+  return row.count;
+}
+
+/**
+ * Streams up to `limit` hydrated call logs with timestamp >= `since`, most
+ * recent first, one at a time. Only fetches the id list eagerly (small — just
+ * strings) and bounds it with SQL LIMIT; each full log entry (which can
+ * include large request/response artifacts via `getCallLogById`) is only
+ * hydrated and held in memory long enough to be yielded (#13123: the previous
+ * `exportCallLogsSince()` + slice-after-fetch approach hydrated and buffered
+ * every matching row — including rows beyond the cap — before the row cap
+ * was ever applied, which is what left the peak V8 heap unchanged).
+ */
+export async function* iterateCallLogsSince(
+  since: string,
+  limit: number
+): AsyncGenerator<unknown, void, void> {
+  const db = getDbInstance();
+  const ids = db
+    .prepare("SELECT id FROM call_logs WHERE timestamp >= ? ORDER BY timestamp DESC LIMIT ?")
+    .all(since, limit)
+    .map((row) => String((row as { id: string }).id));
+
+  for (const id of ids) {
+    const log = await getCallLogById(id);
+    if (log) yield log;
+  }
 }

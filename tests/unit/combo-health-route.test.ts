@@ -18,7 +18,7 @@ const { normalizeComboStep } = await import("../../src/lib/combos/steps.ts");
 async function resetStorage() {
   comboMetrics.resetAllComboMetrics();
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -29,7 +29,7 @@ test.beforeEach(async () => {
 test.after(() => {
   comboMetrics.resetAllComboMetrics();
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("combo health route exposes step-level target health for structured combos", async () => {
@@ -263,4 +263,67 @@ test("combo health route prefers historical call log target metrics over volatil
       },
     ]
   );
+});
+
+test("combo health route aggregates target history without changing latest target status", async () => {
+  const comboInput = {
+    name: "combo-health-aggregate-history",
+    strategy: "priority",
+    models: [
+      {
+        kind: "model",
+        providerId: "openai",
+        model: "openai/gpt-4o-mini",
+        connectionId: "conn-openai-aggregate",
+        label: "Aggregate Account",
+      },
+    ],
+  };
+
+  const combo = await combosDb.createCombo(comboInput);
+  const step = normalizeComboStep(comboInput.models[0], {
+    comboName: comboInput.name,
+    index: 0,
+  });
+  const timestamps = [
+    new Date(Date.now() - 3 * 60 * 1000).toISOString(),
+    new Date(Date.now() - 2 * 60 * 1000).toISOString(),
+    new Date(Date.now() - 1 * 60 * 1000).toISOString(),
+  ];
+
+  for (const [index, status] of [200, 503, 200].entries()) {
+    await callLogs.saveCallLog({
+      id: `combo-aggregate-${index}`,
+      timestamp: timestamps[index],
+      method: "POST",
+      path: "/v1/chat/completions",
+      status,
+      model: "openai/gpt-4o-mini",
+      requestedModel: comboInput.name,
+      provider: "openai",
+      connectionId: "conn-openai-aggregate",
+      duration: [100, 300, 200][index],
+      comboName: comboInput.name,
+      comboStepId: step.id,
+      comboExecutionKey: step.id,
+    });
+  }
+  core
+    .getDbInstance()
+    .prepare("UPDATE call_logs SET duration = NULL WHERE id = ?")
+    .run("combo-aggregate-1");
+
+  const response = await route.GET(
+    new Request(`http://localhost/api/usage/combo-health?range=24h&comboId=${combo.id}`)
+  );
+  const body = (await response.json()) as any;
+  const [target] = body.combos[0].targetHealth;
+
+  assert.equal(response.status, 200);
+  assert.equal(target.executionKey, step.id);
+  assert.equal(target.requests, 3);
+  assert.equal(target.successRate, 67);
+  assert.equal(target.avgLatencyMs, 150);
+  assert.equal(target.lastStatus, "ok");
+  assert.equal(target.lastUsedAt, timestamps[2]);
 });

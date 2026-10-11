@@ -16,16 +16,32 @@ import {
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 
 interface TooltipProps {
   children: ReactNode;
-  content?: string;
+  content?: ReactNode;
   position?: "top" | "bottom" | "left" | "right";
   className?: string;
+  tooltipClassName?: string;
   delayMs?: number;
+  /**
+   * Issue #2352: Render the tooltip in a React portal so it escapes the
+   * stacking context of any ancestor with `overflow:hidden` / `overflow:auto`
+   * (modals, scroll containers). Without this, long labels next to a modal
+   * edge are clipped. Defaults to `true` because the previous absolute
+   * positioning has been the cause of every "tooltip cut off" report.
+   */
+  usePortal?: boolean;
+  /**
+   * Allow the tooltip text to wrap onto multiple lines instead of forcing a
+   * single-line `whitespace-nowrap` layout. Use when the label is long.
+   */
+  multiline?: boolean;
 }
 
 interface AriaDescribedElement {
@@ -37,11 +53,16 @@ export default function Tooltip({
   content,
   position = "top",
   className = "",
+  tooltipClassName = "",
   delayMs = 200,
+  usePortal = true,
+  multiline = false,
 }: TooltipProps) {
   const [visible, setVisible] = useState(false);
   const tooltipId = useId();
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wrapperRef = useRef<HTMLSpanElement | null>(null);
+  const tooltipRef = useRef<HTMLDivElement | null>(null);
 
   const show = useCallback(() => {
     clearTimeout(timeoutRef.current);
@@ -58,6 +79,55 @@ export default function Tooltip({
       clearTimeout(timeoutRef.current);
     };
   }, []);
+
+  // Position the portal-rendered tooltip relative to the trigger by writing
+  // directly to the DOM ref instead of round-tripping through React state.
+  // Touching .style here is the canonical React-portal positioning pattern
+  // and avoids the cascading-render warning we'd get from setCoords inside
+  // a layout effect.
+  useLayoutEffect(() => {
+    if (!visible || !usePortal) return;
+    const wrap = wrapperRef.current;
+    const tt = tooltipRef.current;
+    if (!wrap || !tt) return;
+    const rect = wrap.getBoundingClientRect();
+    const tRect = tt.getBoundingClientRect();
+    let top = 0;
+    let left = 0;
+    switch (position) {
+      case "bottom":
+        top = rect.bottom + 8;
+        left = rect.left + rect.width / 2 - tRect.width / 2;
+        break;
+      case "left":
+        top = rect.top + rect.height / 2 - tRect.height / 2;
+        left = rect.left - tRect.width - 8;
+        break;
+      case "right":
+        top = rect.top + rect.height / 2 - tRect.height / 2;
+        left = rect.right + 8;
+        break;
+      case "top":
+      default:
+        top = rect.top - tRect.height - 8;
+        left = rect.left + rect.width / 2 - tRect.width / 2;
+        break;
+    }
+    // Clamp horizontally inside the viewport so a trigger near the right
+    // edge does not produce a tooltip that bleeds off the screen.
+    const margin = 8;
+    const maxLeft = window.innerWidth - tRect.width - margin;
+    const minLeft = margin;
+    if (left > maxLeft) left = maxLeft;
+    if (left < minLeft) left = minLeft;
+
+    // Lock position immediately without any slide/flying animation from (0,0).
+    tt.style.transition = "none";
+    tt.style.top = `${top}px`;
+    tt.style.left = `${left}px`;
+    tt.style.visibility = "visible";
+    tt.style.opacity = "1";
+  }, [visible, usePortal, position, content]);
 
   const positionClasses = {
     top: "bottom-full left-1/2 -translate-x-1/2 mb-2",
@@ -82,8 +152,36 @@ export default function Tooltip({
     </span>
   );
 
+  const widthClass = multiline ? "max-w-xs whitespace-normal break-words" : "whitespace-nowrap";
+  const baseTooltipClass = `z-50 px-3 py-2 text-xs font-medium text-white bg-[#10141e]/95 rounded-lg shadow-xl pointer-events-none transition-opacity duration-150 motion-reduce:transition-none border border-white/10 backdrop-blur-sm ${tooltipClassName}`;
+
+  const portalEnabled = usePortal && typeof window !== "undefined";
+
+  const tooltipEl =
+    visible && content ? (
+      <div
+        ref={tooltipRef}
+        id={tooltipId}
+        role="tooltip"
+        className={
+          portalEnabled
+            ? `fixed ${baseTooltipClass} ${widthClass}`
+            : `absolute ${baseTooltipClass} ${widthClass} ${positionClasses[position] || positionClasses.top}`
+        }
+        // For portal-rendered tooltips, mount hidden with opacity 0 at origin so
+        // layout effect sets the exact viewport coordinates before revealing it.
+        // This prevents the tooltip from flying or sliding in from top-left.
+        style={
+          portalEnabled ? { top: -9999, left: -9999, visibility: "hidden", opacity: 0 } : undefined
+        }
+      >
+        {content}
+      </div>
+    ) : null;
+
   return (
     <span
+      ref={wrapperRef}
       className={`relative inline-flex ${className}`}
       onMouseEnter={show}
       onMouseLeave={hide}
@@ -94,15 +192,7 @@ export default function Tooltip({
       }}
     >
       {trigger}
-      {visible && content && (
-        <span
-          id={tooltipId}
-          role="tooltip"
-          className={`absolute z-50 px-2.5 py-1.5 text-xs font-medium text-white bg-gray-900/95 rounded-md shadow-lg whitespace-nowrap pointer-events-none animate-in fade-in duration-150 motion-reduce:transition-none motion-reduce:animate-none border border-white/10 ${positionClasses[position] || positionClasses.top}`}
-        >
-          {content}
-        </span>
-      )}
+      {portalEnabled && tooltipEl ? createPortal(tooltipEl, document.body) : tooltipEl}
     </span>
   );
 }

@@ -1,7 +1,11 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
+import { useTranslations } from "next-intl";
 import { Card } from "@/shared/components";
+import { useDisplayBaseUrl } from "@/shared/hooks";
+import VscodeTokenAliasCard from "./VscodeTokenAliasCard";
+import { matchesSearch } from "@/shared/utils/turkishText";
 
 /* ─── Types ──────────────────────────────────────────── */
 interface Endpoint {
@@ -13,7 +17,11 @@ interface Endpoint {
   security: boolean;
   parameters: any[];
   requestBody: boolean;
+  exampleBody?: any;
   responses: string[];
+  loopbackOnly?: boolean;
+  alwaysProtected?: boolean;
+  internal?: boolean;
 }
 
 interface CatalogData {
@@ -22,19 +30,6 @@ interface CatalogData {
   tags: { name: string; description?: string }[];
   endpoints: Endpoint[];
   schemas: string[];
-}
-
-interface WebhookItem {
-  id: string;
-  url: string;
-  events: string[];
-  secret: string | null;
-  enabled: boolean;
-  description: string;
-  created_at: string;
-  last_triggered_at: string | null;
-  last_status: number | null;
-  failure_count: number;
 }
 
 interface TryItResult {
@@ -54,42 +49,67 @@ const METHOD_COLORS: Record<string, string> = {
   DELETE: "bg-red-500/15 text-red-500 border-red-500/30",
 };
 
-const WEBHOOK_EVENTS = [
-  "request.completed",
-  "request.failed",
-  "provider.error",
-  "provider.recovered",
-  "quota.exceeded",
-  "combo.switched",
-];
-
 /* ─── Main Component ─────────────────────────────────── */
 export default function ApiEndpointsTab() {
+  const t = useTranslations("endpoint");
+  const baseUrl = useDisplayBaseUrl();
+
+  function EndpointBadges({ ep }: { ep: Endpoint }) {
+    return (
+      <div className="flex items-center gap-1 shrink-0">
+        {ep.loopbackOnly && (
+          <span
+            className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-500 border border-blue-500/30"
+            title={t("badgeLoopbackTooltip")}
+          >
+            {t("badgeLocal")}
+          </span>
+        )}
+        {ep.alwaysProtected && (
+          <span
+            className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-red-500/15 text-red-500 border border-red-500/30"
+            title={t("badgeAlwaysProtectedTooltip")}
+          >
+            {t("badgeProtected")}
+          </span>
+        )}
+        {ep.internal && (
+          <span
+            className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-gray-500/15 text-gray-400 border border-gray-500/30"
+            title={t("badgeInternalTooltip")}
+          >
+            {t("badgeInternal")}
+          </span>
+        )}
+      </div>
+    );
+  }
+
   const [catalog, setCatalog] = useState<CatalogData | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [section, setSection] = useState<"catalog" | "webhooks">("catalog");
   const [search, setSearch] = useState("");
   const [expandedEndpoint, setExpandedEndpoint] = useState<string | null>(null);
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
+  const [showInternal, setShowInternal] = useState(false);
+  const [securityTier, setSecurityTier] = useState<
+    "all" | "public" | "auth" | "loopback" | "always-protected"
+  >("all");
 
   // Try It state
   const [tryingEndpoint, setTryingEndpoint] = useState<string | null>(null);
   const [tryBody, setTryBody] = useState("");
   const [tryResult, setTryResult] = useState<TryItResult | null>(null);
   const [trying, setTrying] = useState(false);
+  const [availableApiKeys, setAvailableApiKeys] = useState<Array<{ id: string; key: string }>>([]);
+  const [selectedApiKeyId, setSelectedApiKeyId] = useState<string>("");
+  const [revealedApiKeys, setRevealedApiKeys] = useState<Record<string, string>>({});
+  const [apiKeyLoadError, setApiKeyLoadError] = useState<string | null>(null);
+  const [manualApiKey, setManualApiKey] = useState("");
+  const [useManualKey, setUseManualKey] = useState(false);
+  const selectedApiKey = availableApiKeys.find((apiKey) => apiKey.id === selectedApiKeyId) || null;
 
-  // Webhooks state
-  const [webhooks, setWebhooks] = useState<WebhookItem[]>([]);
-  const [webhooksLoading, setWebhooksLoading] = useState(false);
-  const [showAddWebhook, setShowAddWebhook] = useState(false);
-  const [whUrl, setWhUrl] = useState("");
-  const [whEvents, setWhEvents] = useState<string[]>(["*"]);
-  const [whDesc, setWhDesc] = useState("");
-  const [testingWebhookId, setTestingWebhookId] = useState<string | null>(null);
-
-  // Load catalog
-  const loadCatalog = async () => {
+  const loadCatalog = useCallback(async () => {
     try {
       const res = await fetch("/api/openapi/spec");
       if (res.ok) {
@@ -100,13 +120,13 @@ export default function ApiEndpointsTab() {
       const message =
         body && typeof body.error === "string"
           ? body.error
-          : `API catalog request failed with HTTP ${res.status}`;
+          : t("catalogLoadFailed", { status: res.status });
       return { data: null, error: message };
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Failed to load API catalog";
+      const message = error instanceof Error ? error.message : t("catalogLoadFailedGeneric");
       return { data: null, error: message };
     }
-  };
+  }, [t]);
 
   useEffect(() => {
     let cancelled = false;
@@ -120,54 +140,66 @@ export default function ApiEndpointsTab() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [loadCatalog]);
 
-  // Load webhooks
-  const fetchWebhooksData = async (): Promise<WebhookItem[]> => {
-    try {
-      const res = await fetch("/api/webhooks");
-      if (res.ok) {
-        const data = await res.json();
-        return data.webhooks || [];
-      }
-    } catch {}
-    return [];
-  };
-
-  const loadWebhooks = async () => {
-    setWebhooksLoading(true);
-    const data = await fetchWebhooksData();
-    setWebhooks(data);
-    setWebhooksLoading(false);
-  };
-
+  // Load API keys for Try It functionality. The list endpoint returns masked
+  // keys; the selected key is revealed only when sending a Try It request.
   useEffect(() => {
-    if (section !== "webhooks") return;
     let cancelled = false;
-    fetchWebhooksData().then((data) => {
-      if (!cancelled) {
-        setWebhooks(data);
-        setWebhooksLoading(false);
-      }
-    });
+    fetch("/api/keys?limit=100", { credentials: "same-origin" })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(t("apiKeysLoadFailed", { status: res.status }));
+        return res.json();
+      })
+      .then((data) => {
+        if (cancelled) return;
+        const rows = Array.isArray(data?.keys) ? data.keys : Array.isArray(data) ? data : [];
+        const keys = rows
+          .filter((k) => k?.id && k.isActive !== false && k.isBanned !== true)
+          .map((k) => ({ id: String(k.id), key: String(k.key || k.id) }));
+        setAvailableApiKeys(keys);
+        setApiKeyLoadError(null);
+        if (keys.length > 0) {
+          setSelectedApiKeyId((current) => current || keys[0].id);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setAvailableApiKeys([]);
+          setApiKeyLoadError(
+            error instanceof Error ? error.message : t("apiKeysLoadFailedGeneric")
+          );
+        }
+      });
     return () => {
       cancelled = true;
     };
-  }, [section]);
+  }, [t]);
 
   // Filter endpoints
   const filteredEndpoints = useMemo(() => {
     if (!catalog) return [];
     return catalog.endpoints.filter((ep) => {
-      const matchesSearch =
+      // Keep the internal-endpoint visibility toggle + security-tier filter
+      // (from release) while using the locale-aware matchesSearch helper. The
+      // local var is matchesEndpoint (not matchesSearch) to avoid shadowing the
+      // imported helper used in its own initializer.
+      if (!showInternal && ep.internal) return false;
+      const matchesEndpoint =
         !search ||
-        ep.path.toLowerCase().includes(search.toLowerCase()) ||
-        ep.summary.toLowerCase().includes(search.toLowerCase()) ||
-        ep.tags.some((t) => t.toLowerCase().includes(search.toLowerCase()));
+        matchesSearch(ep.path, search) ||
+        matchesSearch(ep.summary, search) ||
+        ep.tags.some((t) => matchesSearch(t, search));
       const matchesTag = !selectedTag || ep.tags.includes(selectedTag);
-      return matchesSearch && matchesTag;
+      const matchesTier =
+        securityTier === "all" ||
+        (securityTier === "loopback" && ep.loopbackOnly) ||
+        (securityTier === "always-protected" && ep.alwaysProtected) ||
+        (securityTier === "auth" && ep.security && !ep.loopbackOnly && !ep.alwaysProtected) ||
+        (securityTier === "public" && !ep.security && !ep.loopbackOnly && !ep.alwaysProtected);
+      return matchesEndpoint && matchesTag && matchesTier;
     });
-  }, [catalog, search, selectedTag]);
+  }, [catalog, search, selectedTag, showInternal, securityTier]);
 
   // Group by tag
   const groupedEndpoints = useMemo(() => {
@@ -186,6 +218,13 @@ export default function ApiEndpointsTab() {
   }, [catalog]);
 
   // Try It handler
+  // Generate example body from OpenAPI schema
+  const generateExampleBody = (ep: Endpoint): string => {
+    if (ep.method === "GET") return "";
+    if (ep.exampleBody) return JSON.stringify(ep.exampleBody, null, 2);
+    return "{\n  \n}";
+  };
+
   const handleTryIt = async (ep: Endpoint) => {
     const key = `${ep.method}:${ep.path}`;
     if (tryingEndpoint === key) {
@@ -195,26 +234,71 @@ export default function ApiEndpointsTab() {
     }
     setTryingEndpoint(key);
     setTryResult(null);
-    setTryBody(ep.method === "GET" ? "" : "{\n  \n}");
+    setTryBody(generateExampleBody(ep));
+  };
+
+  const revealSelectedApiKey = async () => {
+    if (!selectedApiKey) return "";
+    if (revealedApiKeys[selectedApiKey.id]) return revealedApiKeys[selectedApiKey.id];
+
+    const res = await fetch(`/api/keys/${encodeURIComponent(selectedApiKey.id)}/reveal`, {
+      credentials: "same-origin",
+    });
+    if (!res.ok) {
+      throw new Error(
+        res.status === 403
+          ? t("apiKeyRevealDisabled")
+          : t("apiKeyRevealFailed", { status: res.status })
+      );
+    }
+    const data = await res.json();
+    if (!data?.key || typeof data.key !== "string") {
+      throw new Error(t("apiKeyRevealInvalid"));
+    }
+    setRevealedApiKeys((current) => ({ ...current, [selectedApiKey.id]: data.key }));
+    return data.key;
   };
 
   const executeTryIt = async (ep: Endpoint) => {
     setTrying(true);
     try {
+      const headers: Record<string, string> = {};
+
+      // Add Authorization header if endpoint requires auth
+      if (ep.security) {
+        let apiKeyForRequest = "";
+        if (useManualKey) {
+          apiKeyForRequest = manualApiKey;
+        } else if (selectedApiKey) {
+          apiKeyForRequest = await revealSelectedApiKey();
+        }
+
+        if (apiKeyForRequest) {
+          headers["Authorization"] = `Bearer ${apiKeyForRequest}`;
+        } else {
+          throw new Error(t("apiKeyRequired"));
+        }
+      }
+
       const res = await fetch("/api/openapi/try", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           method: ep.method,
-          path: ep.path.replace("/api/", "/"),
+          path: ep.path,
+          headers,
           body: tryBody ? JSON.parse(tryBody) : undefined,
         }),
       });
       if (res.ok) setTryResult(await res.json());
+      else {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || t("requestFailed", { status: res.status }));
+      }
     } catch (err: any) {
       setTryResult({
         status: 0,
-        statusText: "Error",
+        statusText: t("errorStatus"),
         headers: {},
         body: { error: err.message },
         latencyMs: 0,
@@ -224,64 +308,17 @@ export default function ApiEndpointsTab() {
     setTrying(false);
   };
 
-  // Webhook handlers
-  const addWebhook = async () => {
-    if (!whUrl.trim()) return;
-    try {
-      await fetch("/api/webhooks", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: whUrl, events: whEvents, description: whDesc }),
-      });
-      setWhUrl("");
-      setWhEvents(["*"]);
-      setWhDesc("");
-      setShowAddWebhook(false);
-      await loadWebhooks();
-    } catch {}
-  };
-
-  const toggleWebhook = async (wh: WebhookItem) => {
-    try {
-      await fetch(`/api/webhooks/${wh.id}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: !wh.enabled }),
-      });
-      setWebhooks((prev) => prev.map((w) => (w.id === wh.id ? { ...w, enabled: !w.enabled } : w)));
-    } catch {}
-  };
-
-  const deleteWebhook = async (id: string) => {
-    if (!confirm("Delete this webhook?")) return;
-    try {
-      await fetch(`/api/webhooks/${id}`, { method: "DELETE" });
-      setWebhooks((prev) => prev.filter((w) => w.id !== id));
-    } catch {}
-  };
-
-  const testWebhook = async (id: string) => {
-    setTestingWebhookId(id);
-    try {
-      await fetch(`/api/webhooks/${id}/test`, { method: "POST" });
-      await loadWebhooks();
-    } catch {}
-    setTestingWebhookId(null);
-  };
-
   if (loading) {
     return (
-      <div className="p-6 max-w-6xl mx-auto">
-        <div className="animate-pulse space-y-4">
-          <div className="h-8 bg-white/5 rounded-lg w-1/3" />
-          <div className="h-64 bg-white/5 rounded-xl" />
-        </div>
+      <div className="animate-pulse space-y-4">
+        <div className="h-8 bg-white/5 rounded-lg w-1/3" />
+        <div className="h-64 bg-white/5 rounded-xl" />
       </div>
     );
   }
 
   return (
-    <div className="p-6 max-w-6xl mx-auto space-y-5">
+    <div className="space-y-5">
       {/* Header with spec info */}
       {catalog && (
         <Card className="p-5">
@@ -298,7 +335,10 @@ export default function ApiEndpointsTab() {
                   </span>
                 </div>
                 <p className="text-xs text-text-muted mt-0.5">
-                  {catalog.endpoints.length} endpoints across {allTags.length} categories
+                  {t("catalogStats", {
+                    endpoints: catalog.endpoints.length,
+                    categories: allTags.length,
+                  })}
                 </p>
               </div>
             </div>
@@ -327,56 +367,40 @@ export default function ApiEndpointsTab() {
         </Card>
       )}
 
-      {/* Section tabs */}
-      <div className="flex gap-1 p-1 rounded-xl bg-black/5 dark:bg-white/[0.03] w-fit">
-        {[
-          { id: "catalog" as const, label: "API Catalog", icon: "menu_book" },
-          { id: "webhooks" as const, label: "Webhooks", icon: "webhook" },
-        ].map((tab) => (
-          <button
-            key={tab.id}
-            onClick={() => setSection(tab.id)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg transition-all
-              ${
-                section === tab.id
-                  ? "bg-white dark:bg-white/10 text-text-main shadow-sm"
-                  : "text-text-muted hover:text-text-main"
-              }`}
-          >
-            <span className="material-symbols-outlined text-[14px]">{tab.icon}</span>
-            {tab.label}
-          </button>
-        ))}
-      </div>
-
       {/* ═══ API CATALOG ═══ */}
-      {section === "catalog" && !catalog && (
-        <Card className="p-6">
-          <div className="flex items-start gap-3">
-            <div className="flex size-10 items-center justify-center rounded-lg bg-red-500/10">
-              <span className="material-symbols-outlined text-[20px] text-red-500">error</span>
-            </div>
-            <div>
-              <h3 className="text-sm font-semibold text-text-main">API catalog unavailable</h3>
-              <p className="text-xs text-text-muted mt-1">
-                {catalogError || "The OpenAPI specification could not be loaded."}
-              </p>
-              <a
-                href="/api/openapi/spec"
-                target="_blank"
-                rel="noopener"
-                className="inline-flex items-center gap-1 mt-3 px-2.5 py-1.5 text-xs font-medium rounded-lg
+      {!catalog && (
+        <>
+          <Card className="p-6">
+            <div className="flex items-start gap-3">
+              <div className="flex size-10 items-center justify-center rounded-lg bg-red-500/10">
+                <span className="material-symbols-outlined text-[20px] text-red-500">error</span>
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold text-text-main">
+                  {t("apiEndpointsCatalogUnavailable")}
+                </h3>
+                <p className="text-xs text-text-muted mt-1">
+                  {catalogError || t("catalogUnavailableDescription")}
+                </p>
+                <a
+                  href="/api/openapi/spec"
+                  target="_blank"
+                  rel="noopener"
+                  className="inline-flex items-center gap-1 mt-3 px-2.5 py-1.5 text-xs font-medium rounded-lg
                            bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
-              >
-                <span className="material-symbols-outlined text-[14px]">open_in_new</span>
-                Open JSON response
-              </a>
+                >
+                  <span className="material-symbols-outlined text-[14px]">open_in_new</span>
+                  {t("openJsonResponse")}
+                </a>
+              </div>
             </div>
-          </div>
-        </Card>
+          </Card>
+
+          <VscodeTokenAliasCard variant="catalog" />
+        </>
       )}
 
-      {section === "catalog" && catalog && (
+      {catalog && (
         <>
           {/* Search & filter */}
           <div className="flex items-center gap-2">
@@ -387,7 +411,7 @@ export default function ApiEndpointsTab() {
               <input
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search endpoints..."
+                placeholder={t("apiEndpointsSearchPlaceholder")}
                 className="w-full pl-9 pr-3 py-2 text-xs rounded-lg border border-black/10 dark:border-white/10
                            bg-white dark:bg-black/20 focus:outline-none focus:ring-1 focus:ring-primary"
               />
@@ -402,7 +426,7 @@ export default function ApiEndpointsTab() {
                       : "bg-black/5 dark:bg-white/5 text-text-muted hover:text-text-main"
                   }`}
               >
-                All
+                {t("all")}
               </button>
               {allTags.slice(0, 8).map((tag) => (
                 <button
@@ -420,11 +444,50 @@ export default function ApiEndpointsTab() {
               ))}
               {allTags.length > 8 && (
                 <span className="px-2 py-1 text-[10px] text-text-muted">
-                  +{allTags.length - 8} more
+                  {t("more", { count: allTags.length - 8 })}
                 </span>
               )}
             </div>
+            {/* Security tier filter */}
+            <div className="flex items-center gap-1 ml-1 border-l border-black/10 dark:border-white/10 pl-2 flex-wrap">
+              {(["all", "auth", "loopback", "always-protected", "public"] as const).map((tier) => (
+                <button
+                  key={tier}
+                  onClick={() => setSecurityTier(tier)}
+                  className={`px-2 py-1 text-[10px] font-medium rounded-md transition-colors
+                    ${
+                      securityTier === tier
+                        ? "bg-primary/10 text-primary"
+                        : "bg-black/5 dark:bg-white/5 text-text-muted hover:text-text-main"
+                    }`}
+                >
+                  {tier === "all"
+                    ? t("tierAll")
+                    : tier === "auth"
+                      ? t("tierAuth")
+                      : tier === "loopback"
+                        ? t("tierLoopback")
+                        : tier === "always-protected"
+                          ? t("tierAlwaysProtected")
+                          : t("tierPublic")}
+                </button>
+              ))}
+              <button
+                onClick={() => setShowInternal(!showInternal)}
+                className={`px-2 py-1 text-[10px] font-medium rounded-md transition-colors ml-1
+                  ${
+                    showInternal
+                      ? "bg-amber-500/10 text-amber-500"
+                      : "bg-black/5 dark:bg-white/5 text-text-muted hover:text-text-main"
+                  }`}
+                title={t("showInternalTooltip")}
+              >
+                {showInternal ? t("hideInternal") : t("showInternal")}
+              </button>
+            </div>
           </div>
+
+          <VscodeTokenAliasCard variant="catalog" />
 
           {/* Endpoint groups */}
           {Object.entries(groupedEndpoints).map(([tag, endpoints]) => (
@@ -464,10 +527,11 @@ export default function ApiEndpointsTab() {
                         <span className="text-[11px] text-text-muted hidden sm:inline truncate max-w-[200px]">
                           {ep.summary}
                         </span>
+                        <EndpointBadges ep={ep} />
                         {ep.security && (
                           <span
                             className="material-symbols-outlined text-[12px] text-amber-500"
-                            title="Requires auth"
+                            title={t("apiEndpointsRequiresAuth")}
                           >
                             lock
                           </span>
@@ -494,7 +558,7 @@ export default function ApiEndpointsTab() {
                                     <span className="material-symbols-outlined text-[12px] text-amber-500">
                                       lock
                                     </span>
-                                    Bearer Auth
+                                    {t("bearerAuth")}
                                   </span>
                                 )}
                                 {ep.requestBody && (
@@ -502,11 +566,11 @@ export default function ApiEndpointsTab() {
                                     <span className="material-symbols-outlined text-[12px]">
                                       description
                                     </span>
-                                    Request Body
+                                    {t("requestBody")}
                                   </span>
                                 )}
                                 <span className="flex items-center gap-1">
-                                  Responses: {ep.responses.join(", ")}
+                                  {t("responses")}: {ep.responses.join(", ")}
                                 </span>
                               </div>
                             </div>
@@ -526,18 +590,18 @@ export default function ApiEndpointsTab() {
                               <span className="material-symbols-outlined text-[12px]">
                                 {isTrying ? "close" : "play_arrow"}
                               </span>
-                              {isTrying ? "Close" : "Try It"}
+                              {isTrying ? t("close") : t("tryIt")}
                             </button>
                           </div>
 
                           {/* curl example */}
                           <div className="rounded-lg bg-black/5 dark:bg-black/30 p-3">
                             <p className="text-[9px] font-semibold text-text-muted uppercase tracking-wider mb-1">
-                              Example
+                              {t("example")}
                             </p>
                             <code className="text-[11px] font-mono text-text-main break-all">
-                              curl -X {ep.method} http://localhost:20128
-                              {ep.path.replace("/api/", "/")}
+                              curl -X {ep.method} {baseUrl}
+                              {ep.path}
                               {ep.security ? ' -H "Authorization: Bearer YOUR_KEY"' : ""}
                               {ep.requestBody
                                 ? " -H \"Content-Type: application/json\" -d '{...}'"
@@ -548,15 +612,61 @@ export default function ApiEndpointsTab() {
                           {/* Try It panel */}
                           {isTrying && (
                             <div className="rounded-lg border border-primary/20 bg-primary/[0.02] p-3 space-y-3">
+                              {ep.security && (
+                                <div>
+                                  <div className="flex items-center justify-between mb-1">
+                                    <label className="text-[9px] font-semibold text-text-muted uppercase tracking-wider">
+                                      {t("apiKey")}
+                                    </label>
+                                    <button
+                                      type="button"
+                                      onClick={() => setUseManualKey(!useManualKey)}
+                                      className="text-[9px] text-primary hover:underline"
+                                    >
+                                      {useManualKey ? t("switchToSelection") : t("enterManually")}
+                                    </button>
+                                  </div>
+
+                                  {useManualKey ? (
+                                    <input
+                                      type="password"
+                                      value={manualApiKey}
+                                      onChange={(e) => setManualApiKey(e.target.value)}
+                                      placeholder={t("pasteApiKey")}
+                                      className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-black/10
+                                               dark:border-white/10 bg-white dark:bg-black/30 focus:outline-none
+                                               focus:ring-1 focus:ring-primary"
+                                    />
+                                  ) : availableApiKeys.length > 0 ? (
+                                    <select
+                                      value={selectedApiKeyId}
+                                      onChange={(e) => setSelectedApiKeyId(e.target.value)}
+                                      className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-black/10
+                                               dark:border-white/10 bg-white dark:bg-black/30 focus:outline-none
+                                               focus:ring-1 focus:ring-primary"
+                                    >
+                                      {availableApiKeys.map((apiKey) => (
+                                        <option key={apiKey.id} value={apiKey.id}>
+                                          {apiKey.key}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  ) : (
+                                    <p className="text-[11px] text-amber-500">
+                                      {apiKeyLoadError || t("noActiveApiKeys")}
+                                    </p>
+                                  )}
+                                </div>
+                              )}
                               {ep.method !== "GET" && (
                                 <div>
                                   <label className="text-[9px] font-semibold text-text-muted uppercase tracking-wider">
-                                    Request Body (JSON)
+                                    {t("requestBodyJson")}
                                   </label>
                                   <textarea
                                     value={tryBody}
                                     onChange={(e) => setTryBody(e.target.value)}
-                                    rows={4}
+                                    rows={8}
                                     className="w-full mt-1 px-3 py-2 text-xs font-mono rounded-lg border border-black/10
                                              dark:border-white/10 bg-white dark:bg-black/30 focus:outline-none
                                              focus:ring-1 focus:ring-primary resize-none"
@@ -573,7 +683,7 @@ export default function ApiEndpointsTab() {
                                 <span className="material-symbols-outlined text-[14px]">
                                   {trying ? "hourglass_empty" : "send"}
                                 </span>
-                                {trying ? "Sending..." : "Send Request"}
+                                {trying ? t("sending") : t("sendRequest")}
                               </button>
 
                               {tryResult && (
@@ -615,7 +725,7 @@ export default function ApiEndpointsTab() {
               <span className="material-symbols-outlined text-[32px] text-text-muted">
                 search_off
               </span>
-              <p className="text-sm text-text-muted mt-2">No endpoints match your filter</p>
+              <p className="text-sm text-text-muted mt-2">{t("apiEndpointsNoMatch")}</p>
             </Card>
           )}
 
@@ -627,7 +737,7 @@ export default function ApiEndpointsTab() {
                   data_object
                 </span>
                 <h3 className="text-xs font-semibold uppercase tracking-wider text-text-muted">
-                  Data Schemas
+                  {t("dataSchemas")}
                 </h3>
                 <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-black/5 dark:bg-white/5 text-text-muted">
                   {catalog.schemas.length}
@@ -645,232 +755,6 @@ export default function ApiEndpointsTab() {
               </div>
             </Card>
           )}
-        </>
-      )}
-
-      {/* ═══ WEBHOOKS ═══ */}
-      {section === "webhooks" && (
-        <>
-          <Card className="p-4">
-            <div className="flex items-center justify-between mb-3">
-              <div className="flex items-center gap-2">
-                <span className="material-symbols-outlined text-primary text-[18px]">webhook</span>
-                <div>
-                  <h3 className="text-sm font-semibold">Event Webhooks</h3>
-                  <p className="text-[11px] text-text-muted">
-                    Receive HTTP callbacks when events occur in OmniRoute
-                  </p>
-                </div>
-              </div>
-              {!showAddWebhook && (
-                <button
-                  onClick={() => setShowAddWebhook(true)}
-                  className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-lg
-                             bg-primary/10 text-primary hover:bg-primary/20 transition-colors"
-                >
-                  <span className="material-symbols-outlined text-[14px]">add</span>
-                  Add Webhook
-                </button>
-              )}
-            </div>
-
-            {/* Add webhook form */}
-            {showAddWebhook && (
-              <div className="mb-4 p-3 rounded-lg border border-primary/20 bg-primary/[0.03] space-y-2">
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  <div>
-                    <label className="text-[10px] font-medium text-text-muted uppercase tracking-wider">
-                      Webhook URL
-                    </label>
-                    <input
-                      value={whUrl}
-                      onChange={(e) => setWhUrl(e.target.value)}
-                      placeholder="https://example.com/webhook"
-                      className="w-full mt-0.5 px-2.5 py-1.5 text-xs rounded-lg border border-black/10 dark:border-white/10
-                                 bg-white dark:bg-black/20 focus:outline-none focus:ring-1 focus:ring-primary"
-                    />
-                  </div>
-                  <div>
-                    <label className="text-[10px] font-medium text-text-muted uppercase tracking-wider">
-                      Description
-                    </label>
-                    <input
-                      value={whDesc}
-                      onChange={(e) => setWhDesc(e.target.value)}
-                      placeholder="Production monitoring"
-                      className="w-full mt-0.5 px-2.5 py-1.5 text-xs rounded-lg border border-black/10 dark:border-white/10
-                                 bg-white dark:bg-black/20 focus:outline-none focus:ring-1 focus:ring-primary"
-                    />
-                  </div>
-                </div>
-                <div>
-                  <label className="text-[10px] font-medium text-text-muted uppercase tracking-wider">
-                    Events
-                  </label>
-                  <div className="flex flex-wrap gap-1.5 mt-1">
-                    <button
-                      onClick={() => setWhEvents(["*"])}
-                      className={`px-2 py-0.5 text-[10px] font-medium rounded transition-colors
-                        ${
-                          whEvents.includes("*")
-                            ? "bg-primary/10 text-primary"
-                            : "bg-black/5 dark:bg-white/5 text-text-muted"
-                        }`}
-                    >
-                      All events
-                    </button>
-                    {WEBHOOK_EVENTS.map((ev) => (
-                      <button
-                        key={ev}
-                        onClick={() => {
-                          if (whEvents.includes("*")) {
-                            setWhEvents([ev]);
-                          } else if (whEvents.includes(ev)) {
-                            setWhEvents(whEvents.filter((e) => e !== ev));
-                          } else {
-                            setWhEvents([...whEvents, ev]);
-                          }
-                        }}
-                        className={`px-2 py-0.5 text-[10px] font-medium rounded transition-colors
-                          ${
-                            whEvents.includes(ev) || whEvents.includes("*")
-                              ? "bg-primary/10 text-primary"
-                              : "bg-black/5 dark:bg-white/5 text-text-muted"
-                          }`}
-                      >
-                        {ev}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-                <div className="flex gap-2 mt-2">
-                  <button
-                    onClick={addWebhook}
-                    disabled={!whUrl.trim()}
-                    className="px-3 py-1 text-xs font-medium rounded-lg bg-primary text-white
-                               hover:bg-primary/90 disabled:opacity-40 transition-colors"
-                  >
-                    Save
-                  </button>
-                  <button
-                    onClick={() => setShowAddWebhook(false)}
-                    className="px-3 py-1 text-xs font-medium rounded-lg
-                               bg-black/5 dark:bg-white/5 hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* Webhooks list */}
-            {webhooksLoading ? (
-              <div className="text-xs text-text-muted py-4 text-center">Loading...</div>
-            ) : webhooks.length === 0 ? (
-              <div className="text-center py-6">
-                <span className="material-symbols-outlined text-[32px] text-text-muted">
-                  webhook
-                </span>
-                <p className="text-xs text-text-muted mt-2">
-                  No webhooks configured. Add one to receive event notifications.
-                </p>
-              </div>
-            ) : (
-              <div className="space-y-2">
-                {webhooks.map((wh) => (
-                  <div
-                    key={wh.id}
-                    className={`flex items-center justify-between px-3 py-2.5 rounded-lg border transition-colors
-                      ${
-                        wh.enabled
-                          ? "border-black/10 dark:border-white/10 bg-white/50 dark:bg-white/[0.02]"
-                          : "border-black/5 dark:border-white/5 opacity-50"
-                      }`}
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <code className="text-xs font-mono text-text-main truncate">{wh.url}</code>
-                        {wh.failure_count > 0 && (
-                          <span className="text-[9px] px-1 py-0.5 rounded bg-red-500/10 text-red-500">
-                            {wh.failure_count} failures
-                          </span>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-2 mt-0.5">
-                        {wh.description && (
-                          <span className="text-[10px] text-text-muted">{wh.description}</span>
-                        )}
-                        <span className="text-[9px] text-text-muted">
-                          Events: {wh.events.join(", ")}
-                        </span>
-                        {wh.last_triggered_at && (
-                          <span className="text-[9px] text-text-muted">
-                            Last: {new Date(wh.last_triggered_at).toLocaleString()}
-                            {wh.last_status ? ` (${wh.last_status})` : ""}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-1 shrink-0 ml-2">
-                      <button
-                        onClick={() => testWebhook(wh.id)}
-                        disabled={testingWebhookId === wh.id}
-                        className="p-1 rounded hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
-                        title="Send test event"
-                      >
-                        <span
-                          className={`material-symbols-outlined text-[14px] ${testingWebhookId === wh.id ? "animate-spin text-primary" : "text-text-muted"}`}
-                        >
-                          {testingWebhookId === wh.id ? "sync" : "send"}
-                        </span>
-                      </button>
-                      <button
-                        onClick={() => toggleWebhook(wh)}
-                        className="p-1 rounded hover:bg-black/5 dark:hover:bg-white/5 transition-colors"
-                        title={wh.enabled ? "Disable" : "Enable"}
-                      >
-                        <span
-                          className={`material-symbols-outlined text-[14px] ${wh.enabled ? "text-emerald-500" : "text-text-muted"}`}
-                        >
-                          {wh.enabled ? "toggle_on" : "toggle_off"}
-                        </span>
-                      </button>
-                      <button
-                        onClick={() => deleteWebhook(wh.id)}
-                        className="p-1 rounded hover:bg-red-500/10 transition-colors"
-                        title="Delete"
-                      >
-                        <span className="material-symbols-outlined text-[14px] text-red-500">
-                          delete
-                        </span>
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </Card>
-
-          {/* Webhook signature info */}
-          <Card className="p-4">
-            <div className="flex items-center gap-2 mb-2">
-              <span className="material-symbols-outlined text-[14px] text-amber-500">vpn_key</span>
-              <h3 className="text-xs font-semibold">Webhook Signatures</h3>
-            </div>
-            <p className="text-[11px] text-text-muted mb-2">
-              Each webhook delivery includes an{" "}
-              <code className="px-1 py-0.5 rounded bg-black/5 dark:bg-white/5">
-                X-Webhook-Signature
-              </code>{" "}
-              header signed with HMAC-SHA256 using the webhook secret. Verify the signature to
-              ensure the payload is authentic.
-            </p>
-            <div className="rounded-lg bg-black/5 dark:bg-black/30 p-3">
-              <code className="text-[10px] font-mono text-text-main">
-                {`const crypto = require('crypto');\nconst sig = 'sha256=' + crypto.createHmac('sha256', secret).update(body).digest('hex');\nif (sig !== req.headers['x-webhook-signature']) throw new Error('Invalid signature');`}
-              </code>
-            </div>
-          </Card>
         </>
       )}
     </div>

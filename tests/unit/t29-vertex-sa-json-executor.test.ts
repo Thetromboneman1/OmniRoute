@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const { VertexExecutor } = await import("../../open-sse/executors/vertex.ts");
+const { VertexExecutor, parseSAFromApiKey } = await import("../../open-sse/executors/vertex.ts");
 
 const MIN_SA_JSON = JSON.stringify({
   project_id: "vertex-project-123",
@@ -22,7 +22,7 @@ test("T29: Vertex executor builds regional Gemini URL from Service Account proje
 
 test("T29: Vertex executor routes partner models to global openapi endpoint", () => {
   const executor = new VertexExecutor();
-  const url = executor.buildUrl("deepseek-v3.2", false, 0, {
+  const url = executor.buildUrl("deepseek-ai/deepseek-v3.2-maas", false, 0, {
     apiKey: MIN_SA_JSON,
     providerSpecificData: { region: "us-central1" },
   });
@@ -55,17 +55,44 @@ test("T29: Vertex executor headers include Bearer token and SSE Accept when stre
   assert.equal(headers.Accept, "text/event-stream");
 });
 
-test("T29: Vertex executor rejects invalid Service Account JSON clearly", async () => {
+test("T29: Vertex executor rejects incomplete Service Account JSON clearly", async () => {
   const executor = new VertexExecutor();
 
+  // A JSON object (not an opaque Express key) that is missing client_email/private_key must still
+  // fail clearly when the executor tries to mint a JWT from it.
   await assert.rejects(
     () =>
       executor.execute({
         model: "gemini-2.5-flash",
         body: { contents: [] },
         stream: false,
-        credentials: { apiKey: "not-json" },
+        credentials: { apiKey: JSON.stringify({ project_id: "p" }) },
       }),
-    /Service Account JSON/i
+    /missing required fields/i
+  );
+});
+
+test("T29: Vertex distinguishes OAuth client JSON from a Service Account key", () => {
+  assert.throws(
+    () =>
+      parseSAFromApiKey(
+        JSON.stringify({ web: { client_id: "example.apps.googleusercontent.com" } })
+      ),
+    /OAuth client JSON is not a Service Account key/i
+  );
+});
+
+test("T29: Vertex executor routes a non-JSON Express API key to the project-less publisher endpoint", () => {
+  const executor = new VertexExecutor();
+  const stream = executor.buildUrl("gemini-2.5-flash", true, 0, { apiKey: "express-key-123" });
+  const nonStream = executor.buildUrl("gemini-2.5-flash", false, 0, { apiKey: "express-key-123" });
+
+  assert.equal(
+    stream,
+    "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=express-key-123"
+  );
+  assert.equal(
+    nonStream,
+    "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-flash:generateContent?key=express-key-123"
   );
 });

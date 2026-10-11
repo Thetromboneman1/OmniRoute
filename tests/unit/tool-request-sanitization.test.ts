@@ -10,6 +10,31 @@ const {
 } = await import("../../open-sse/translator/helpers/schemaCoercion.ts");
 const { translateRequest } = await import("../../open-sse/translator/index.ts");
 const { FORMATS } = await import("../../open-sse/translator/formats.ts");
+const { clearModelsDevCapabilities, saveModelsDevCapabilities } =
+  await import("../../src/lib/modelsDevSync.ts");
+
+function buildCapability(overrides = {}) {
+  return {
+    tool_call: null,
+    reasoning: null,
+    attachment: null,
+    structured_output: null,
+    temperature: null,
+    modalities_input: "[]",
+    modalities_output: "[]",
+    knowledge_cutoff: null,
+    release_date: null,
+    last_updated: null,
+    status: null,
+    family: null,
+    open_weights: null,
+    limit_context: null,
+    limit_input: null,
+    limit_output: null,
+    interleaved_field: null,
+    ...overrides,
+  };
+}
 
 test("tool sanitization: coerces numeric JSON Schema fields recursively", () => {
   const schema = {
@@ -159,18 +184,33 @@ test("tool sanitization: injects empty reasoning_content only for DeepSeek tool-
     },
   ];
 
-  const deepseekMessages = injectEmptyReasoningContentForToolCalls(messages, "deepseek");
-  const openaiMessages = injectEmptyReasoningContentForToolCalls(messages, "openai");
+  const deepseekMessages = injectEmptyReasoningContentForToolCalls(
+    messages,
+    "deepseek",
+    "deepseek-v4-flash"
+  );
+  const openaiMessages = injectEmptyReasoningContentForToolCalls(messages, "openai", "gpt-4o");
 
   assert.equal(deepseekMessages[1].reasoning_content, "");
   assert.equal(openaiMessages[1].reasoning_content, undefined);
 });
 
-test("translateRequest injects reasoning_content for DeepSeek assistant tool calls", () => {
+test("translateRequest omits reasoning_content for DeepSeek assistant tool calls on cache miss", () => {
+  clearModelsDevCapabilities();
+  saveModelsDevCapabilities({
+    deepseek: {
+      "deepseek-v4-flash": buildCapability({
+        interleaved_field: "reasoning_content",
+        reasoning: true,
+        tool_call: true,
+      }),
+    },
+  });
+
   const translated = translateRequest(
     FORMATS.OPENAI,
     FORMATS.OPENAI,
-    "deepseek-reasoner",
+    "deepseek-v4-flash",
     {
       messages: [
         { role: "user", content: "hello" },
@@ -188,5 +228,10 @@ test("translateRequest injects reasoning_content for DeepSeek assistant tool cal
     "deepseek"
   );
 
-  assert.equal(translated.messages[1].reasoning_content, "");
+  // #9573/#9610: the former NON_ANTHROPIC_THINKING_PLACEHOLDER injection was the root
+  // cause of the echo → empty-stop bug (the model continued its chain of thought from
+  // the placeholder and re-poisoned cache + history). On a cache miss the field is now
+  // omitted; DeepSeek's 400 is specific to an empty string, not an absent field.
+  assert.equal(translated.messages[1].reasoning_content, undefined);
+  clearModelsDevCapabilities();
 });

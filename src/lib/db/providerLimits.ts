@@ -1,3 +1,7 @@
+import {
+  sanitizeProviderBillingStatus,
+  type ProviderBillingStatus,
+} from "@/shared/utils/providerBilling";
 import { getDbInstance, isBuildPhase, isCloud } from "./core";
 
 type JsonRecord = Record<string, unknown>;
@@ -20,10 +24,13 @@ interface KeyValueRow {
 
 export interface ProviderLimitsCacheEntry {
   quotas: JsonRecord | null;
+  modelQuotas?: JsonRecord;
   plan: unknown;
   message: string | null;
   fetchedAt: string;
   source?: string | null;
+  bankedResetCredits?: number;
+  billing?: ProviderBillingStatus;
 }
 
 const PROVIDER_LIMITS_CACHE_NAMESPACE = "providerLimitsCache";
@@ -40,6 +47,12 @@ function toRecord(value: unknown): JsonRecord | null {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : null;
 }
 
+function sanitizeCacheEntryForStorage(entry: ProviderLimitsCacheEntry): ProviderLimitsCacheEntry {
+  const { billing: rawBilling, ...rest } = entry;
+  const billing = sanitizeProviderBillingStatus(rawBilling);
+  return billing ? { ...rest, billing } : rest;
+}
+
 function normalizeCacheEntry(value: unknown): ProviderLimitsCacheEntry | null {
   const record = toRecord(value);
   if (!record) return null;
@@ -48,12 +61,19 @@ function normalizeCacheEntry(value: unknown): ProviderLimitsCacheEntry | null {
     typeof record.fetchedAt === "string" && record.fetchedAt.trim() ? record.fetchedAt : null;
   if (!fetchedAt) return null;
 
+  const bankedResetCredits = Number(record.bankedResetCredits);
+  const billing = sanitizeProviderBillingStatus(record.billing);
+  const modelQuotas = toRecord(record.modelQuotas);
+
   return {
     quotas: toRecord(record.quotas),
+    ...(modelQuotas ? { modelQuotas } : {}),
     plan: record.plan ?? null,
     message: typeof record.message === "string" ? record.message : null,
     fetchedAt,
     source: typeof record.source === "string" ? record.source : null,
+    ...(Number.isFinite(bankedResetCredits) ? { bankedResetCredits } : {}),
+    ...(billing ? { billing } : {}),
   };
 }
 
@@ -88,14 +108,15 @@ export function setProviderLimitsCache(
   connectionId: string,
   entry: ProviderLimitsCacheEntry
 ): ProviderLimitsCacheEntry {
-  if (isBuildPhase || isCloud) return entry;
+  const sanitized = sanitizeCacheEntryForStorage(entry);
+  if (isBuildPhase || isCloud) return sanitized;
   const db = getDbInstance() as unknown as DbLike;
   db.prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)").run(
     PROVIDER_LIMITS_CACHE_NAMESPACE,
     connectionId,
-    JSON.stringify(entry)
+    JSON.stringify(sanitized)
   );
-  return entry;
+  return sanitized;
 }
 
 export function setProviderLimitsCacheBatch(
@@ -109,7 +130,11 @@ export function setProviderLimitsCacheBatch(
   const tx = db.transaction(
     (items: Array<{ connectionId: string; entry: ProviderLimitsCacheEntry }>) => {
       for (const item of items) {
-        insert.run(PROVIDER_LIMITS_CACHE_NAMESPACE, item.connectionId, JSON.stringify(item.entry));
+        insert.run(
+          PROVIDER_LIMITS_CACHE_NAMESPACE,
+          item.connectionId,
+          JSON.stringify(sanitizeCacheEntryForStorage(item.entry))
+        );
       }
     }
   );

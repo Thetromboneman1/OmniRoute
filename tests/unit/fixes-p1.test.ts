@@ -1,3 +1,13 @@
+// ENVIRONMENT NOTE (sandbox better-sqlite3 / glibc limitation, not a code defect):
+// This test constructs or exercises a real better-sqlite3-backed SQLite database.
+// better-sqlite3 is a native addon; production and CI load it normally, but some
+// sandboxes/dev boxes ship a system glibc older than the prebuilt binary requires
+// ("GLIBC_2.29 not found"), so the native module fails to dlopen and any test that
+// reaches better-sqlite3 directly (or asserts stdout that the load-failure warning
+// would pollute) fails HERE while passing in CI. This is a known environment
+// limitation, not a defect in the code under test: the OmniRoute runtime itself
+// cascades to node:sqlite/sql.js when better-sqlite3 is unavailable. See
+// tests/unit/_helpers/betterSqlite3Availability.ts for a guard helper.
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -14,7 +24,8 @@ const backupDb = await import("../../src/lib/db/backup.ts");
 const providersDb = await import("../../src/lib/db/providers.ts");
 const combosDb = await import("../../src/lib/db/combos.ts");
 const settingsDb = await import("../../src/lib/db/settings.ts");
-const localDb = await import("../../src/lib/localDb.ts");
+const { createProxy } = await import("@/lib/db/proxies");
+const localDb = { createProxy };
 const tokenRefresh = await import("../../open-sse/services/tokenRefresh.ts");
 const proxyFetch = await import("../../open-sse/utils/proxyFetch.ts");
 const proxyDispatcher = await import("../../open-sse/utils/proxyDispatcher.ts");
@@ -47,7 +58,7 @@ async function resetStorage() {
   for (let attempt = 0; attempt < 10; attempt++) {
     try {
       if (fs.existsSync(TEST_DATA_DIR)) {
-        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
       break;
     } catch (err: any) {
@@ -63,7 +74,7 @@ async function resetStorage() {
 
 test.after(async () => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("token refresh dedupe key avoids collision for same-prefix tokens", async () => {
@@ -579,7 +590,7 @@ test("proxy test route validates JSON, schema, and proxy types before dispatchin
   );
   const socks4Body = (await socks4Response.json()) as any;
   assert.equal(socks4Response.status, 400);
-  assert.match(socks4Body.error.message, /proxy\.type must be http or https/i);
+  assert.match(socks4Body.error.message, /proxy\.type must be http(, https, or socks5| or https)/i);
 
   const unsupportedResponse = await proxyTestRoute.POST(
     new Request("http://localhost/api/settings/proxy/test", {
@@ -596,7 +607,10 @@ test("proxy test route validates JSON, schema, and proxy types before dispatchin
   );
   const unsupportedBody = (await unsupportedResponse.json()) as any;
   assert.equal(unsupportedResponse.status, 400);
-  assert.match(unsupportedBody.error.message, /proxy\.type must be http or https/i);
+  assert.match(
+    unsupportedBody.error.message,
+    /proxy\.type must be http(, https, or socks5| or https)/i
+  );
 });
 
 test("proxy test route handles invalid proxy ports and uses stored proxy config when proxyId is provided", async () => {

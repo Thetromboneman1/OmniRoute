@@ -1,11 +1,38 @@
-import { PROVIDER_MODELS } from "@/shared/constants/models";
+import { PROVIDER_MODELS, PROVIDER_ID_TO_ALIAS } from "@/shared/constants/models";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import {
   getAllCustomModels,
   getAllSyncedAvailableModels,
   getSyncedAvailableModels,
 } from "@/lib/db/models";
+import { getProviderConnections } from "@/lib/db/providers";
 import { getResolvedModelCapabilities } from "@/lib/modelCapabilities";
 import { getSyncedCapabilities } from "@/lib/modelsDevSync";
+import { mergeCustomModelMetadata } from "@/lib/providers/modelMetadataPrecedence";
+
+/**
+ * Build the set of provider keys (raw id + alias) that have at least one active/validated
+ * connection. Mirrors the active-provider filter used by the OpenAI-format /v1/models
+ * catalog so /v1beta/models only lists models the user can actually call (#2483).
+ */
+async function getActiveProviderKeys(): Promise<Set<string>> {
+  const keys = new Set<string>();
+  try {
+    const connections = await getProviderConnections();
+    for (const conn of connections) {
+      if (conn.isActive === false) continue;
+      const provider = conn.provider;
+      if (!provider) continue;
+      keys.add(provider);
+      const alias = (PROVIDER_ID_TO_ALIAS as Record<string, string>)[provider];
+      if (alias) keys.add(alias);
+    }
+  } catch (e) {
+    // DB unavailable — return empty set (safe default: list nothing provider-gated)
+    console.error("[v1beta/models] Could not fetch provider connections:", e);
+  }
+  return keys;
+}
 
 /**
  * Handle CORS preflight
@@ -27,13 +54,20 @@ export async function GET() {
   try {
     getSyncedCapabilities();
     const models = [];
+    const existingNames = new Set<string>();
+
+    // Only list models whose provider has an active/validated connection (#2483).
+    const activeKeys = await getActiveProviderKeys();
 
     // Built-in models (hardcoded defaults)
     for (const [provider, providerModels] of Object.entries(PROVIDER_MODELS)) {
+      if (!activeKeys.has(provider)) continue;
       for (const model of providerModels) {
+        const name = `models/${provider}/${model.id}`;
+        if (existingNames.has(name)) continue;
         const resolved = getResolvedModelCapabilities({ provider, model: model.id });
         models.push({
-          name: `models/${provider}/${model.id}`,
+          name,
           displayName: model.name || model.id,
           description: `${provider} model: ${model.name || model.id}`,
           supportedGenerationMethods: ["generateContent"],
@@ -41,6 +75,7 @@ export async function GET() {
           outputTokenLimit: resolved.maxOutputTokens || 8192,
           ...(resolved.supportsThinking === true ? { thinking: true } : {}),
         });
+        existingNames.add(name);
       }
     }
 
@@ -55,14 +90,21 @@ export async function GET() {
       }
     }
     try {
-      const syncedGeminiModels = await getSyncedAvailableModels("gemini");
+      const syncedGeminiModels = activeKeys.has("gemini")
+        ? await getSyncedAvailableModels("gemini")
+        : [];
       for (const m of syncedGeminiModels) {
         models.push({
           name: `models/gemini/${m.id}`,
           displayName: m.name || m.id,
           ...(typeof m.description === "string" ? { description: m.description } : {}),
           supportedGenerationMethods: ["generateContent"],
-          inputTokenLimit: typeof m.inputTokenLimit === "number" ? m.inputTokenLimit : 128000,
+          inputTokenLimit:
+            typeof m.inputTokenLimit === "number"
+              ? m.inputTokenLimit
+              : typeof m.contextWindow === "number"
+                ? m.contextWindow
+                : 128000,
           outputTokenLimit: typeof m.outputTokenLimit === "number" ? m.outputTokenLimit : 8192,
           ...(m.supportsThinking === true ? { thinking: true } : {}),
         });
@@ -71,13 +113,12 @@ export async function GET() {
       console.error("[v1beta/models] Error fetching synced Gemini models:", err);
     }
 
-    const existingNames = new Set(models.map((model) => (model as any).name));
-
     // Synced/imported models for non-Gemini providers
     try {
       const syncedModelsMap = await getAllSyncedAvailableModels();
       for (const [providerId, syncedModels] of Object.entries(syncedModelsMap)) {
         if (providerId === "gemini") continue;
+        if (!activeKeys.has(providerId)) continue;
         if (!Array.isArray(syncedModels)) continue;
         for (const m of syncedModels) {
           if (!m || typeof m.id !== "string") continue;
@@ -95,7 +136,9 @@ export async function GET() {
             inputTokenLimit:
               typeof m.inputTokenLimit === "number"
                 ? m.inputTokenLimit
-                : resolved.maxInputTokens || resolved.contextWindow || 128000,
+                : typeof m.contextWindow === "number"
+                  ? m.contextWindow
+                  : resolved.maxInputTokens || resolved.contextWindow || 128000,
             outputTokenLimit:
               typeof m.outputTokenLimit === "number"
                 ? m.outputTokenLimit
@@ -118,6 +161,7 @@ export async function GET() {
         if (!Array.isArray(rawModels)) continue;
         // Skip Gemini — handled by syncedAvailableModels above
         if (providerId === "gemini") continue;
+        if (!activeKeys.has(providerId)) continue;
         for (const model of rawModels) {
           if (!model || typeof model !== "object" || typeof (model as any).id !== "string")
             continue;
@@ -128,8 +172,7 @@ export async function GET() {
             model: String(m.id),
           });
           const name = `models/${providerId}/${m.id}`;
-          if (existingNames.has(name)) continue;
-          models.push({
+          const customEntry = {
             name,
             displayName: m.name || m.id,
             ...(typeof m.description === "string" ? { description: m.description } : {}),
@@ -137,15 +180,25 @@ export async function GET() {
             inputTokenLimit:
               typeof m.inputTokenLimit === "number"
                 ? m.inputTokenLimit
-                : resolved.maxInputTokens || resolved.contextWindow || 128000,
+                : typeof m.contextWindow === "number"
+                  ? m.contextWindow
+                  : resolved.maxInputTokens || resolved.contextWindow || 128000,
             outputTokenLimit:
               typeof m.outputTokenLimit === "number"
                 ? m.outputTokenLimit
                 : resolved.maxOutputTokens || 8192,
-            ...(m.supportsThinking === true || resolved.supportsThinking === true
-              ? { thinking: true }
-              : {}),
-          });
+            ...(typeof m.supportsThinking === "boolean"
+              ? { thinking: m.supportsThinking }
+              : resolved.supportsThinking === true
+                ? { thinking: true }
+                : {}),
+          };
+          const existingIndex = models.findIndex((entry) => entry.name === name);
+          if (existingIndex !== -1) {
+            models[existingIndex] = mergeCustomModelMetadata(models[existingIndex], customEntry);
+            continue;
+          }
+          models.push(customEntry);
           existingNames.add(name);
         }
       }
@@ -156,6 +209,6 @@ export async function GET() {
     return Response.json({ models });
   } catch (error: any) {
     console.log("Error fetching models:", error);
-    return Response.json({ error: { message: error.message } }, { status: 500 });
+    return Response.json({ error: { message: sanitizeErrorMessage(error) } }, { status: 500 });
   }
 }

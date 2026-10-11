@@ -148,6 +148,26 @@ describe("Integration: strategySelector → aggressive pipeline", () => {
     assert.equal(systemMsg!.content, "You are a helpful coding assistant.");
   });
 
+  it("compressAggressive preserves duplicate system prompts during lite fallback", () => {
+    const messages = [
+      { role: "system", content: "Policy exact. Keep exact." },
+      { role: "system", content: "Policy exact. Keep exact." },
+      { role: "user", content: "Short" },
+    ];
+
+    const result = compressAggressive(messages, {
+      preserveSystemPrompt: true,
+      minSavingsThreshold: 0.9,
+      summarizerEnabled: false,
+      maxTokensPerMessage: 999999,
+    });
+
+    assert.deepEqual(
+      result.messages.filter((message) => message.role === "system"),
+      messages.filter((message) => message.role === "system")
+    );
+  });
+
   it("compressAggressive downgrade chain works when aggressive fails", () => {
     // Empty messages should trigger downgrade gracefully
     const result = compressAggressive([]);
@@ -166,7 +186,18 @@ describe("Integration: strategySelector → aggressive pipeline", () => {
       aggressive: DEFAULT_AGGRESSIVE_CONFIG,
     };
 
-    const mode = selectCompressionStrategy(config, null, 0);
+    // #14529: aggressive is lossy — it is selected when the request opts in, and header-less
+    // requests get the safe stacked pair instead.
+    const mode = selectCompressionStrategy(
+      config,
+      null,
+      0,
+      undefined,
+      undefined,
+      {},
+      "allow-lossy"
+    );
     assert.equal(mode, "aggressive");
+    assert.equal(selectCompressionStrategy(config, null, 0), "stacked");
   });
 });

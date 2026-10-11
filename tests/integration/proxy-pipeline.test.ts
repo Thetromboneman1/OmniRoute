@@ -8,23 +8,18 @@
  * @module tests/integration/proxy-pipeline.test.ts
  */
 
-import { describe, it, beforeEach, afterEach } from "node:test";
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createChatPipelineHarness } from "./_chatPipelineHarness.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..", "..");
 
 function readSrc(relPath) {
   const full = join(ROOT, "src", relPath);
-  if (!existsSync(full)) return null;
-  return readFileSync(full, "utf8");
-}
-
-function readOpenSse(relPath) {
-  const full = join(ROOT, "open-sse", relPath);
   if (!existsSync(full)) return null;
   return readFileSync(full, "utf8");
 }
@@ -36,7 +31,7 @@ function readOpenSse(relPath) {
 describe("Chat Pipeline — handleSingleModelChat decomposition", () => {
   const src = readSrc("sse/handlers/chat.ts");
   const helpersSrc = readSrc("sse/handlers/chatHelpers.ts");
-  const coreSrc = readOpenSse("handlers/chatCore.ts");
+  const dispatchSrc = readSrc("sse/handlers/chatDispatch.ts");
 
   it("should define resolveModelOrError helper", () => {
     assert.ok(helpersSrc, "chatHelpers.ts should exist");
@@ -51,29 +46,99 @@ describe("Chat Pipeline — handleSingleModelChat decomposition", () => {
     assert.match(helpersSrc, /function\s+executeChatWithBreaker/);
   });
 
-  it("should keep cost accounting in the core chat pipeline", () => {
-    assert.ok(coreSrc, "open-sse/handlers/chatCore.ts should exist");
-    assert.match(coreSrc, /calculateCost\(/);
-    assert.match(coreSrc, /recordCost\(/);
-  });
-
   it("handleSingleModelChat should use resolveModelOrError", () => {
     // Extract handleSingleModelChat body
-    assert.match(src, /resolveModelOrError\(modelStr/);
+    assert.match(src, /resolveModelOrError\(\s*modelStr/);
   });
 
   it("handleSingleModelChat should use checkPipelineGates", () => {
     assert.match(src, /checkPipelineGates\(provider/);
   });
 
-  it("handleSingleModelChat should use executeChatWithBreaker", () => {
-    assert.match(src, /executeChatWithBreaker\(/);
+  // O breaker deixou de ser chamado direto por handleSingleModelChat: a chamada foi
+  // extraida para o seam chatDispatch.ts (dispatchChatWithAffinityEviction). O
+  // invariante que este teste protege continua o mesmo — todo dispatch de chat passa
+  // pelo circuit breaker — mas agora precisa ser verificado nos DOIS saltos, senao a
+  // extracao poderia remover o breaker do caminho sem nenhum teste reclamar.
+  it("handleSingleModelChat should dispatch through the breaker seam", () => {
+    assert.match(src, /dispatchChatWithAffinityEviction\(/);
+    assert.ok(dispatchSrc, "src/sse/handlers/chatDispatch.ts should exist");
+    assert.match(dispatchSrc, /executeChatWithBreaker\(/);
+  });
+});
+
+describe("Chat Pipeline — cost accounting", () => {
+  let harness: Awaited<ReturnType<typeof createChatPipelineHarness>>;
+  let costRules: typeof import("../../src/domain/costRules.ts");
+  const originalFetch = globalThis.fetch;
+
+  before(async () => {
+    globalThis.fetch = async () => {
+      throw new Error("Unexpected network request in cost accounting test");
+    };
+    harness = await createChatPipelineHarness("proxy-cost-accounting");
+    costRules = await import("../../src/domain/costRules.ts");
+    await harness.seedConnection("openai");
   });
 
-  it("chatCore should record cost for both non-streaming and streaming responses", () => {
-    assert.match(coreSrc, /if \(apiKeyInfo\?\.id && estimatedCost > 0\)/);
-    assert.match(coreSrc, /if \(apiKeyInfo\?\.id && streamUsage\)/);
+  after(async () => {
+    try {
+      if (harness) {
+        const { flushProxyLogsSync } = await import("../../src/lib/proxyLogger.ts");
+        flushProxyLogsSync();
+        await harness.cleanup();
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
+
+  for (const stream of [false, true]) {
+    it(`records exactly one positive cost for a completed ${stream ? "SSE" : "JSON"} chat`, async (t) => {
+      const key = await harness.seedApiKey({ name: `cost-${stream ? "sse" : "json"}` });
+      const usage = { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 };
+      t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        assert.equal(url.origin, "https://api.openai.com");
+        assert.equal(url.pathname, "/v1/chat/completions");
+        if (!stream) return harness.buildOpenAIResponse("cost recorded", "gpt-4o-mini", usage);
+        const chunk = {
+          id: "chatcmpl-cost-stream",
+          object: "chat.completion.chunk",
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, delta: { content: "cost recorded" }, finish_reason: null }],
+        };
+        const final = {
+          ...chunk,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage,
+        };
+        return new Response(
+          `data: ${JSON.stringify(chunk)}\n\ndata: ${JSON.stringify(final)}\n\ndata: [DONE]\n\n`,
+          { headers: { "Content-Type": "text/event-stream" } }
+        );
+      });
+      const response = await harness.handleChat(
+        harness.buildRequest({
+          authKey: key.key,
+          body: {
+            model: "openai/gpt-4o-mini",
+            messages: [{ role: "user", content: `account this ${stream ? "stream" : "response"}` }],
+            stream,
+          },
+        })
+      );
+      assert.equal(response.status, 200);
+      assert.match(await response.text(), /cost recorded/);
+      const summary = await harness.waitFor(() => {
+        const current = costRules.getCostSummary(key.id);
+        return current.totalEntries > 0 ? current : null;
+      });
+      assert.ok(summary, "completed chat must appear in the key's public cost summary");
+      assert.equal(summary.totalEntries, 1, "one completion must not be billed twice");
+      assert.ok(summary.dailyTotal > 0, "nonzero usage must carry a positive cost");
+    });
+  }
 });
 
 describe("Chat Pipeline — combo fallback support", () => {
@@ -106,7 +171,9 @@ describe("Chat Pipeline — circuit breaker integration", () => {
   });
 
   it("should reject requests when circuit is open via structured provider breaker response", () => {
-    assert.match(helpersSrc, /providerCircuitOpenResponse\(provider,\s*retryAfterSec\)/);
+    // #15001 (#14960) added a third argument — the breaker's classified failure kind —
+    // so the call is now `providerCircuitOpenResponse(provider, retryAfterSec, <kind>)`.
+    assert.match(helpersSrc, /providerCircuitOpenResponse\(provider,\s*retryAfterSec[,)]/);
   });
 });
 
@@ -171,134 +238,119 @@ describe("DI Container — container.ts", () => {
 });
 
 // ═══════════════════════════════════════════════════
-// 3. Plugin Architecture (L-8)
+// 3. Plugin Architecture (L-8) — hooks.ts registry
 // ═══════════════════════════════════════════════════
 
-describe("Plugin Architecture — plugins/index.ts", () => {
-  let plugins;
+describe("Plugin Architecture — plugins/hooks.ts", () => {
+  let hooks;
 
   beforeEach(async () => {
-    plugins = await import("../../src/lib/plugins/index.ts");
-    plugins.resetPlugins();
+    hooks = await import("../../src/lib/plugins/hooks.ts");
+    hooks.resetHooks();
   });
 
   afterEach(() => {
-    plugins.resetPlugins();
+    hooks.resetHooks();
   });
 
-  it("should register and list plugins", () => {
-    plugins.registerPlugin({
-      name: "test-logger",
-      priority: 10,
-      onRequest: () => {},
-    });
-
-    const list = plugins.listPlugins();
+  it("should register hooks for events", () => {
+    hooks.registerHook("onRequest", "test-logger", () => {}, 10);
+    const list = hooks.getHooks("onRequest");
     assert.equal(list.length, 1);
-    assert.equal(list[0].name, "test-logger");
+    assert.equal(list[0].pluginName, "test-logger");
     assert.equal(list[0].priority, 10);
-    assert.deepEqual(list[0].hooks, ["onRequest"]);
   });
 
-  it("should sort plugins by priority", () => {
-    plugins.registerPlugin({ name: "low", priority: 200 });
-    plugins.registerPlugin({ name: "high", priority: 1 });
-    plugins.registerPlugin({ name: "mid", priority: 50 });
+  it("should sort hooks by priority", () => {
+    hooks.registerHook("onRequest", "low", () => {}, 200);
+    hooks.registerHook("onRequest", "high", () => {}, 1);
+    hooks.registerHook("onRequest", "mid", () => {}, 50);
 
-    const list = plugins.listPlugins();
+    const list = hooks.getHooks("onRequest");
     assert.deepEqual(
-      list.map((p) => p.name),
+      list.map((r) => r.pluginName),
       ["high", "mid", "low"]
     );
   });
 
-  it("should run onRequest hooks in order", async () => {
+  it("should run onRequest hooks in priority order", async () => {
     const order = [];
-    plugins.registerPlugin({
-      name: "first",
-      priority: 1,
-      onRequest: () => {
+    hooks.registerHook(
+      "onRequest",
+      "first",
+      () => {
         order.push("first");
       },
-    });
-    plugins.registerPlugin({
-      name: "second",
-      priority: 2,
-      onRequest: () => {
+      1
+    );
+    hooks.registerHook(
+      "onRequest",
+      "second",
+      () => {
         order.push("second");
       },
-    });
+      2
+    );
 
     const ctx = { requestId: "r1", body: {}, model: "test", metadata: {} };
-    await plugins.runOnRequest(ctx);
+    await hooks.runOnRequest(ctx);
     assert.deepEqual(order, ["first", "second"]);
   });
 
-  it("should support request blocking", async () => {
-    plugins.registerPlugin({
-      name: "blocker",
-      priority: 1,
-      onRequest: () => ({ blocked: true, response: { error: "denied" } }),
-    });
-    plugins.registerPlugin({
-      name: "never-runs",
-      priority: 2,
-      onRequest: () => {
+  it("should support request blocking via emitHookBlocking", async () => {
+    hooks.registerHook(
+      "onRequest",
+      "blocker",
+      () => ({
+        blocked: true,
+        response: { error: "denied" },
+      }),
+      1
+    );
+    hooks.registerHook(
+      "onRequest",
+      "never-runs",
+      () => {
         throw new Error("should not run");
       },
-    });
+      2
+    );
 
     const ctx = { requestId: "r2", body: {}, model: "test", metadata: {} };
-    const result = await plugins.runOnRequest(ctx);
+    const result = await hooks.emitHookBlocking("onRequest", ctx);
     assert.equal(result.blocked, true);
     assert.deepEqual(result.response, { error: "denied" });
   });
 
-  it("should enable/disable plugins at runtime", () => {
-    plugins.registerPlugin({
-      name: "toggle-me",
-      onRequest: () => {},
-    });
-
-    assert.ok(plugins.setPluginEnabled("toggle-me", false));
-    const list = plugins.listPlugins();
-    assert.equal(list[0].enabled, false);
-  });
-
-  it("should unregister plugins", () => {
-    plugins.registerPlugin({ name: "removable" });
-    assert.equal(plugins.listPlugins().length, 1);
-    assert.ok(plugins.unregisterPlugin("removable"));
-    assert.equal(plugins.listPlugins().length, 0);
+  it("should unregister all hooks for a plugin", () => {
+    hooks.registerHook("onRequest", "removable", () => {});
+    hooks.registerHook("onResponse", "removable", () => {});
+    assert.equal(hooks.getHooks("onRequest").length, 1);
+    hooks.unregisterHooks("removable");
+    assert.equal(hooks.getHooks("onRequest").length, 0);
+    assert.equal(hooks.getHooks("onResponse").length, 0);
   });
 
   it("should run onResponse hooks", async () => {
-    plugins.registerPlugin({
-      name: "response-modifier",
-      onResponse: (_ctx, response) => ({ ...response, modified: true }),
-    });
+    hooks.registerHook("onResponse", "response-modifier", (payload) => ({
+      response: { ...payload.response, modified: true },
+    }));
 
     const ctx = { requestId: "r3", body: {}, model: "test", metadata: {} };
-    const result = await plugins.runOnResponse(ctx, { data: "original" });
+    const result = await hooks.runOnResponse(ctx, { data: "original" });
     assert.equal(result.modified, true);
     assert.equal(result.data, "original");
   });
 
-  it("should run onError hooks and allow recovery", async () => {
-    plugins.registerPlugin({
-      name: "error-handler",
-      onError: (_ctx, _error) => ({ recovered: true }),
+  it("should fire onError hooks", async () => {
+    let caught = false;
+    hooks.registerHook("onError", "error-handler", () => {
+      caught = true;
     });
 
     const ctx = { requestId: "r4", body: {}, model: "test", metadata: {} };
-    const result = await plugins.runOnError(ctx, new Error("test error"));
-    assert.deepEqual(result, { recovered: true });
-  });
-
-  it("should return null from onError if no recovery", async () => {
-    const ctx = { requestId: "r5", body: {}, model: "test", metadata: {} };
-    const result = await plugins.runOnError(ctx, new Error("unhandled"));
-    assert.equal(result, null);
+    await hooks.runOnError(ctx, new Error("test error"));
+    assert.equal(caught, true);
   });
 });
 

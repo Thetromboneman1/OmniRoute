@@ -1,29 +1,45 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const { buildComboTestRequestBody, extractComboTestResponseText } =
-  await import("../../src/lib/combos/testHealth.ts");
+const {
+  buildComboTestRequestBody,
+  extractComboTestResponseText,
+  extractComboTestStreamResult,
+  extractComboTestStreamText,
+} = await import("../../src/lib/combos/testHealth.ts");
 
-test("combo test helper builds a realistic smoke payload", () => {
-  const originalRandom = Math.random;
-  let callCount = 0;
-  let body;
-  try {
-    Math.random = () => {
-      callCount += 1;
-      return callCount === 1 ? 0.4680222223 : 0.2677;
-    };
-
-    body = buildComboTestRequestBody("openrouter/openai/gpt-5.4");
-  } finally {
-    Math.random = originalRandom;
-  }
+test("combo test helper builds a short smoke payload", () => {
+  const body = buildComboTestRequestBody("openrouter/openai/gpt-5.4");
 
   assert.equal(body.model, "openrouter/openai/gpt-5.4");
-  assert.equal(body.messages[0].content, "Calculate 52122+34093, and reply with the result only.");
-  assert.equal(body.max_tokens, 2048);
+  assert.equal(body.messages[0].content, "Reply with exactly: pong");
+  assert.equal(body.max_tokens, 64);
   assert.equal("temperature" in body, false);
   assert.equal(body.stream, false);
+});
+
+test("combo test helper builds a small streaming model probe", () => {
+  const body = buildComboTestRequestBody("nvidia/z-ai/glm-5.2", false, { stream: true });
+  assert.equal(body.stream, true);
+  assert.equal(body.max_tokens, 64);
+});
+
+test("combo test helper ignores keepalives and extracts streamed model content", () => {
+  const text = extractComboTestStreamText(
+    ': keepalive\n\ndata: {"choices":[{"delta":{"content":"O"}}]}\n\n' +
+      'data: {"choices":[{"delta":{"content":"K"}}]}\n\ndata: [DONE]\n\n'
+  );
+  assert.equal(text, "OK");
+});
+
+test("combo test helper preserves streamed upstream errors", () => {
+  const result = extractComboTestStreamResult(
+    'data: {"error":{"message":"Rate limit exceeded","code":"429"}}\n\n'
+  );
+  assert.deepEqual(result, {
+    text: "",
+    error: { message: "Rate limit exceeded", statusCode: 429 },
+  });
 });
 
 test("combo test helper extracts text from chat-completions responses", () => {

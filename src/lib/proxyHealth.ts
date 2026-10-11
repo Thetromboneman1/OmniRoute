@@ -10,10 +10,22 @@
  */
 
 import { createConnection } from "node:net";
+import { stripIpv6Brackets } from "@omniroute/open-sse/utils/proxyFamily";
+import {
+  hasProxyRefusals,
+  noteProxyRecovered,
+  noteProxyRefusal,
+  proxyEgressKey,
+} from "@omniroute/open-sse/utils/proxyRefusalMemory";
+import { isProxySkipRecentlyFailedEnabled } from "@/shared/utils/featureFlags";
 
 // Configurable via env vars
 const FAST_FAIL_TIMEOUT_MS = parseInt(process.env.PROXY_FAST_FAIL_TIMEOUT_MS ?? "2000", 10);
 const HEALTH_CACHE_TTL_MS = parseInt(process.env.PROXY_HEALTH_CACHE_TTL_MS ?? "30000", 10);
+const UNHEALTHY_CACHE_TTL_MS = parseInt(
+  process.env.PROXY_HEALTH_UNHEALTHY_CACHE_TTL_MS ?? "2000",
+  10
+);
 
 interface ProxyHealthEntry {
   healthy: boolean;
@@ -23,6 +35,23 @@ interface ProxyHealthEntry {
 
 // In-memory cache: proxyUrl → health entry
 const proxyHealthCache = new Map<string, ProxyHealthEntry>();
+const proxyHealthInflight = new Map<string, Promise<boolean>>();
+
+type TcpCheck = (host: string, port: number, timeoutMs: number) => Promise<boolean>;
+let tcpCheckImpl: TcpCheck = tcpCheck;
+
+// Feed a real probe verdict to proxy selection (PROXY_SKIP_RECENTLY_FAILED, default on): a proxy
+// that refused the TCP connection is set aside by pools and account rotation, and taken back
+// as soon as it answers again. With the flag off nothing is ever written.
+function noteProbeVerdict(proxyUrl: string, healthy: boolean): void {
+  if (healthy) {
+    if (hasProxyRefusals()) noteProxyRecovered(proxyEgressKey(proxyUrl), "proxy_unreachable");
+    return;
+  }
+  if (isProxySkipRecentlyFailedEnabled()) {
+    noteProxyRefusal(proxyEgressKey(proxyUrl), "proxy_unreachable");
+  }
+}
 
 /**
  * T14: Perform a fast TCP check to see if a proxy host:port is reachable.
@@ -56,7 +85,7 @@ export async function isProxyReachable(
     return false;
   }
 
-  const host = url.hostname;
+  const host = stripIpv6Brackets(url.hostname);
   const port = parseInt(url.port || defaultPortForScheme(url.protocol), 10);
 
   if (!host || isNaN(port)) {
@@ -68,9 +97,30 @@ export async function isProxyReachable(
     return false;
   }
 
-  const healthy = await tcpCheck(host, port, timeoutMs);
-  proxyHealthCache.set(proxyUrl, { healthy, checkedAt: Date.now(), ttlMs: cacheTtlMs });
-  return healthy;
+  const existingProbe = proxyHealthInflight.get(proxyUrl);
+  if (existingProbe) {
+    return existingProbe;
+  }
+
+  const probe = tcpCheckImpl(host, port, timeoutMs).then((healthy) => {
+    // Before the cache write, so the verdict's TTL starts after the (flag-gated) note.
+    noteProbeVerdict(proxyUrl, healthy);
+    proxyHealthCache.set(proxyUrl, {
+      healthy,
+      checkedAt: Date.now(),
+      ttlMs: healthy ? cacheTtlMs : Math.min(cacheTtlMs, UNHEALTHY_CACHE_TTL_MS),
+    });
+    return healthy;
+  });
+
+  proxyHealthInflight.set(proxyUrl, probe);
+  try {
+    return await probe;
+  } finally {
+    if (proxyHealthInflight.get(proxyUrl) === probe) {
+      proxyHealthInflight.delete(proxyUrl);
+    }
+  }
 }
 
 /**
@@ -89,6 +139,7 @@ export function getCachedProxyHealth(proxyUrl: string): boolean | null {
  */
 export function invalidateProxyHealth(proxyUrl: string): void {
   proxyHealthCache.delete(proxyUrl);
+  proxyHealthInflight.delete(proxyUrl);
 }
 
 /**
@@ -118,7 +169,12 @@ function defaultPortForScheme(protocol: string): string {
     case "socks5":
     case "socks5h":
       return "1080";
+    // #14157: the WHATWG URL parser drops the port when it equals the scheme
+    // default, so `http://host:80` reaches this fallback with port === "".
+    // The default http proxy port is 80; probing 8080 fast-failed every
+    // default-port http proxy and pushed healthy connections into cooldown.
     case "http":
+      return "80";
     default:
       return "8080";
   }
@@ -137,4 +193,8 @@ function tcpCheck(host: string, port: number, timeoutMs: number): Promise<boolea
       resolve(false);
     });
   });
+}
+
+export function __setProxyHealthTcpCheckForTesting(check: TcpCheck | null): void {
+  tcpCheckImpl = check ?? tcpCheck;
 }

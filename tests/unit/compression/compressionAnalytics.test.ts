@@ -11,6 +11,8 @@ const core = await import("../../../src/lib/db/core.ts");
 core.resetDbInstance();
 const { insertCompressionAnalyticsRow, getCompressionAnalyticsSummary } =
   await import("../../../src/lib/db/compressionAnalytics.ts");
+const { attachCompressionUsageReceipt } =
+  await import("../../../src/lib/db/compressionAnalytics.ts");
 const { getDbInstance } = core;
 
 describe("compressionAnalytics", () => {
@@ -40,7 +42,7 @@ describe("compressionAnalytics", () => {
 
   after(() => {
     core.closeDbInstance();
-    rmSync(tmpDir, { recursive: true, force: true });
+    rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   it("empty table returns zeroed summary", () => {
@@ -51,9 +53,29 @@ describe("compressionAnalytics", () => {
       avgSavingsPct: 0,
       avgDurationMs: 0,
       byMode: {},
+      byEngine: {},
+      byCompressionCombo: {},
       byProvider: {},
-      last24h: [],
+      last24h: summary.last24h,
+      totalSkipped: 0,
+      bySkipReason: {},
+      validationFallbacks: 0,
+      realUsage: {
+        requestsWithReceipts: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        estimatedUsdSaved: 0,
+        bySource: {},
+      },
+      mcpDescriptionCompression: {
+        snapshots: 0,
+        estimatedTokensSaved: 0,
+      },
     });
+    assert.equal(summary.last24h.length, 24);
   });
 
   it("insert single row does not throw", () => {
@@ -67,6 +89,37 @@ describe("compressionAnalytics", () => {
     assert.doesNotThrow(() => insertCompressionAnalyticsRow(row));
     const summary = getCompressionAnalyticsSummary();
     assert.equal(summary.totalRequests, 1);
+  });
+
+  it("stores all RTK raw output pointers when provided", () => {
+    insertCompressionAnalyticsRow({
+      timestamp: new Date().toISOString(),
+      mode: "rtk",
+      original_tokens: 1000,
+      compressed_tokens: 500,
+      tokens_saved: 500,
+      rtk_raw_output_pointer: "raw_1",
+      rtk_raw_output_bytes: 100,
+      rtk_raw_output_pointers: JSON.stringify(["raw_1", "raw_2"]),
+      rtk_raw_output_total_bytes: 250,
+    });
+
+    const db = getDbInstance();
+    const row = db
+      .prepare(
+        "SELECT rtk_raw_output_pointer, rtk_raw_output_bytes, rtk_raw_output_pointers, rtk_raw_output_total_bytes FROM compression_analytics LIMIT 1"
+      )
+      .get() as {
+      rtk_raw_output_pointer: string;
+      rtk_raw_output_bytes: number;
+      rtk_raw_output_pointers: string;
+      rtk_raw_output_total_bytes: number;
+    };
+
+    assert.equal(row.rtk_raw_output_pointer, "raw_1");
+    assert.equal(row.rtk_raw_output_bytes, 100);
+    assert.equal(row.rtk_raw_output_pointers, JSON.stringify(["raw_1", "raw_2"]));
+    assert.equal(row.rtk_raw_output_total_bytes, 250);
   });
 
   it("summary counts correctly after multiple inserts", () => {
@@ -248,5 +301,154 @@ describe("compressionAnalytics", () => {
       assert(typeof bucket.count === "number");
       assert(typeof bucket.tokensSaved === "number");
     });
+  });
+
+  it("attaches real usage receipts to the latest compression row", () => {
+    insertCompressionAnalyticsRow({
+      timestamp: new Date().toISOString(),
+      mode: "standard",
+      original_tokens: 1000,
+      compressed_tokens: 700,
+      tokens_saved: 300,
+      request_id: "req-receipt",
+    });
+    attachCompressionUsageReceipt(
+      "req-receipt",
+      {
+        prompt_tokens: 710,
+        completion_tokens: 42,
+        total_tokens: 752,
+        prompt_tokens_details: { cached_tokens: 100, cache_creation_tokens: 12 },
+      },
+      "provider"
+    );
+    const summary = getCompressionAnalyticsSummary();
+    assert.equal(summary.realUsage.requestsWithReceipts, 1);
+    assert.equal(summary.realUsage.promptTokens, 710);
+    assert.equal(summary.realUsage.completionTokens, 42);
+    assert.equal(summary.realUsage.totalTokens, 752);
+    assert.equal(summary.realUsage.cacheReadTokens, 100);
+    assert.equal(summary.realUsage.cacheWriteTokens, 12);
+    assert.equal(summary.realUsage.bySource.provider, 1);
+  });
+
+  it("aggregates estimated USD savings separately from token estimates", () => {
+    insertCompressionAnalyticsRow({
+      timestamp: new Date().toISOString(),
+      mode: "standard",
+      original_tokens: 1000,
+      compressed_tokens: 700,
+      tokens_saved: 300,
+      request_id: "req-usd",
+      estimated_usd_saved: 0.0015,
+    });
+    attachCompressionUsageReceipt("req-usd", { prompt_tokens: 700, total_tokens: 700 }, "provider");
+
+    const summary = getCompressionAnalyticsSummary();
+    assert.equal(summary.realUsage.requestsWithReceipts, 1);
+    assert.equal(summary.realUsage.estimatedUsdSaved, 0.0015);
+  });
+
+  it("summarizes validation fallback and output mode rows", () => {
+    insertCompressionAnalyticsRow({
+      timestamp: new Date().toISOString(),
+      mode: "output-caveman",
+      original_tokens: 900,
+      compressed_tokens: 900,
+      tokens_saved: 0,
+      request_id: "req-output",
+      validation_fallback: true,
+      output_mode: "full",
+    });
+    attachCompressionUsageReceipt(
+      "req-output",
+      { prompt_tokens: 900, completion_tokens: 120, total_tokens: 1020 },
+      "provider"
+    );
+
+    const summary = getCompressionAnalyticsSummary();
+    assert.equal(summary.validationFallbacks, 1);
+    assert.equal(summary.byMode["output-caveman"].count, 1);
+    assert.equal(summary.realUsage.requestsWithReceipts, 1);
+    assert.equal(summary.realUsage.totalTokens, 1020);
+  });
+
+  it("summarizes MCP description estimates without counting them as provider receipts", () => {
+    insertCompressionAnalyticsRow({
+      timestamp: new Date().toISOString(),
+      mode: "mcp-description",
+      engine: "mcp-description",
+      original_tokens: 20,
+      compressed_tokens: 12,
+      tokens_saved: 8,
+      mcp_description_tokens_saved: 8,
+    });
+
+    const summary = getCompressionAnalyticsSummary();
+    assert.equal(summary.mcpDescriptionCompression.snapshots, 1);
+    assert.equal(summary.mcpDescriptionCompression.estimatedTokensSaved, 8);
+    assert.equal(summary.realUsage.requestsWithReceipts, 0);
+    assert.equal(summary.realUsage.bySource.mcp_metadata_estimate, undefined);
+  });
+
+  // #4268: attempted-but-no-op runs are recorded with skip_reason so Stacked is
+  // visible even when it saves nothing, while saving aggregates stay net-saving-only.
+  it("records skipped (no-op) runs separately without polluting saving aggregates", () => {
+    // One real saving run...
+    insertCompressionAnalyticsRow({
+      timestamp: new Date().toISOString(),
+      mode: "stacked",
+      original_tokens: 1000,
+      compressed_tokens: 600,
+      tokens_saved: 400,
+    });
+    // ...and two no-op stacked attempts (saved nothing).
+    insertCompressionAnalyticsRow({
+      timestamp: new Date().toISOString(),
+      mode: "stacked",
+      original_tokens: 500,
+      compressed_tokens: 500,
+      tokens_saved: 0,
+      skip_reason: "no_savings",
+    });
+    insertCompressionAnalyticsRow({
+      timestamp: new Date().toISOString(),
+      mode: "stacked",
+      original_tokens: 800,
+      compressed_tokens: 800,
+      tokens_saved: 0,
+      skip_reason: "no_savings",
+    });
+
+    const summary = getCompressionAnalyticsSummary();
+
+    // Saving aggregates count the net-saving run ONLY (skip rows excluded).
+    assert.equal(summary.totalRequests, 1, "totalRequests must exclude skip rows");
+    assert.equal(summary.totalTokensSaved, 400);
+    assert.equal(summary.byMode.stacked.count, 1, "byMode count excludes skip rows");
+    assert.equal(summary.byMode.stacked.tokensSaved, 400);
+
+    // ...but the skips are now visible instead of dropped.
+    assert.equal(summary.byMode.stacked.skipped, 2, "skipped attempts surfaced per mode");
+    assert.equal(summary.totalSkipped, 2);
+    assert.equal(summary.bySkipReason.no_savings, 2);
+  });
+
+  it("a mode with only no-op runs still appears (count 0, skipped > 0)", () => {
+    insertCompressionAnalyticsRow({
+      timestamp: new Date().toISOString(),
+      mode: "stacked",
+      original_tokens: 300,
+      compressed_tokens: 300,
+      tokens_saved: 0,
+      skip_reason: "no_savings",
+    });
+
+    const summary = getCompressionAnalyticsSummary();
+    assert.equal(summary.totalRequests, 0, "no net-saving runs");
+    assert.ok(summary.byMode.stacked, "stacked must appear even with only skip rows");
+    assert.equal(summary.byMode.stacked.count, 0);
+    assert.equal(summary.byMode.stacked.skipped, 1);
+    assert.equal(summary.totalSkipped, 1);
   });
 });

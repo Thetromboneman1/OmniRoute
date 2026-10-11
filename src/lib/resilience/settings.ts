@@ -1,80 +1,67 @@
-import { DEFAULT_API_LIMITS, PROVIDER_PROFILES } from "@omniroute/open-sse/config/constants";
+import {
+  DEFAULT_API_LIMITS,
+  PROVIDER_PROFILES,
+  STREAM_THROUGHPUT_WATCHDOG,
+} from "@omniroute/open-sse/config/constants";
 
-type JsonRecord = Record<string, unknown>;
-type AuthCategory = "oauth" | "apikey";
+import type { JsonRecord, ResilienceSettings, ResilienceSettingsPatch } from "./settings/types";
+import {
+  asRecord,
+  toInteger,
+  resolveStreamRecoveryDefaults,
+  normalizeLegacyConnectionCooldownProfile,
+  normalizeRequestQueueSettings,
+  normalizeConnectionCooldownProfile,
+  normalizeProviderBreakerProfile,
+  normalizeWaitForCooldownSettings,
+  normalizeComboCooldownWaitSettings,
+  normalizeQuotaShareConcurrencyLimitSettings,
+  normalizeProviderCooldownSettings,
+  normalizeQuotaPreflightSettings,
+  normalizeStreamRecoverySettings,
+  normalizeProviderQuotaOverrides,
+  normalizeCredentialHealthCheckSettings,
+} from "./settings/normalize";
 
-export interface RequestQueueSettings {
-  autoEnableApiKeyProviders: boolean;
-  requestsPerMinute: number;
-  minTimeBetweenRequestsMs: number;
-  concurrentRequests: number;
-  maxWaitMs: number;
-}
-
-export interface ConnectionCooldownProfileSettings {
-  baseCooldownMs: number;
-  useUpstreamRetryHints: boolean;
-  maxBackoffSteps: number;
-}
-
-export interface ProviderBreakerProfileSettings {
-  failureThreshold: number;
-  resetTimeoutMs: number;
-}
-
-export interface WaitForCooldownSettings {
-  enabled: boolean;
-  maxRetries: number;
-  maxRetryWaitSec: number;
-  maxRetryWaitMs: number;
-}
-
-export interface ResilienceSettings {
-  requestQueue: RequestQueueSettings;
-  connectionCooldown: Record<AuthCategory, ConnectionCooldownProfileSettings>;
-  providerBreaker: Record<AuthCategory, ProviderBreakerProfileSettings>;
-  waitForCooldown: WaitForCooldownSettings;
-}
-
-export interface ResilienceSettingsPatch {
-  requestQueue?: Partial<RequestQueueSettings>;
-  connectionCooldown?: Partial<Record<AuthCategory, Partial<ConnectionCooldownProfileSettings>>>;
-  providerBreaker?: Partial<Record<AuthCategory, Partial<ProviderBreakerProfileSettings>>>;
-  waitForCooldown?: Partial<WaitForCooldownSettings>;
-}
-
-function asRecord(value: unknown): JsonRecord {
-  return value && typeof value === "object" && !Array.isArray(value) ? (value as JsonRecord) : {};
-}
-
-function toInteger(
-  value: unknown,
-  fallback: number,
-  options: { min?: number; max?: number } = {}
-): number {
-  const min = options.min ?? 0;
-  const max = options.max ?? Number.MAX_SAFE_INTEGER;
-  const parsed =
-    typeof value === "number"
-      ? value
-      : typeof value === "string" && value.trim().length > 0
-        ? Number(value)
-        : Number.NaN;
-
-  if (!Number.isFinite(parsed)) {
-    return fallback;
-  }
-
-  return Math.min(max, Math.max(min, Math.trunc(parsed)));
-}
-
-function toBoolean(value: unknown, fallback: boolean): boolean {
-  return typeof value === "boolean" ? value : fallback;
-}
+// Re-export the settings shape (moved to ./settings/types) so this module's
+// public API is unchanged.
+export type {
+  RequestQueueSettings,
+  ConnectionCooldownProfileSettings,
+  ProviderBreakerProfileSettings,
+  WaitForCooldownSettings,
+  ComboCooldownWaitSettings,
+  QuotaShareConcurrencyLimitSettings,
+  ProviderCooldownSettings,
+  QuotaPreflightSettings,
+  StreamRecoverySettings,
+  StreamThroughputWatchdogSettings,
+  ProviderQuotaOverrideSettings,
+  CredentialHealthCheckSettings,
+  ResilienceSettings,
+  ResilienceSettingsPatch,
+} from "./settings/types";
 
 export const DEFAULT_REQUEST_QUEUE_MAX_WAIT_MS = (() => {
-  const parsed = Number(process.env.RATE_LIMIT_MAX_WAIT_MS || "120000");
-  return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : 120000;
+  const parsed = Number(process.env.RATE_LIMIT_MAX_WAIT_MS || "30000");
+  return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : 30000;
+})();
+
+// Limiter-managed execution backstop (Bottleneck `expiration`). Deliberately
+// separate from the queue-wait budget: non-incremental gateways (Console Go /
+// Command Code) buffer whole generations before first bytes, so legitimate
+// executions run minutes. Default 10 min; the backstop only catches executors
+// without their own upstream timeout.
+export const DEFAULT_REQUEST_QUEUE_EXECUTION_MAX_WAIT_MS = (() => {
+  const parsed = Number(process.env.RATE_LIMIT_EXECUTION_MAX_WAIT_MS || "600000");
+  return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : 600000;
+})();
+
+// Issue #6593: opt-in admission cap on the local rate-limit queue depth.
+// Default 0 = disabled (unbounded queue, today's behavior unchanged).
+export const DEFAULT_REQUEST_QUEUE_MAX_DEPTH = (() => {
+  const parsed = Number(process.env.RATE_LIMIT_MAX_QUEUE_DEPTH || "0");
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.trunc(parsed) : 0;
 })();
 
 export const DEFAULT_RESILIENCE_SETTINGS: ResilienceSettings = {
@@ -83,7 +70,10 @@ export const DEFAULT_RESILIENCE_SETTINGS: ResilienceSettings = {
     requestsPerMinute: DEFAULT_API_LIMITS.requestsPerMinute,
     minTimeBetweenRequestsMs: DEFAULT_API_LIMITS.minTimeBetweenRequests,
     concurrentRequests: DEFAULT_API_LIMITS.concurrentRequests,
+    globalConcurrentRequests: 0,
     maxWaitMs: DEFAULT_REQUEST_QUEUE_MAX_WAIT_MS,
+    executionMaxWaitMs: DEFAULT_REQUEST_QUEUE_EXECUTION_MAX_WAIT_MS,
+    maxQueueDepth: DEFAULT_REQUEST_QUEUE_MAX_DEPTH,
   },
   connectionCooldown: {
     oauth: {
@@ -100,145 +90,112 @@ export const DEFAULT_RESILIENCE_SETTINGS: ResilienceSettings = {
   providerBreaker: {
     oauth: {
       failureThreshold: PROVIDER_PROFILES.oauth.circuitBreakerThreshold,
+      degradationThreshold: PROVIDER_PROFILES.oauth.degradationThreshold,
       resetTimeoutMs: PROVIDER_PROFILES.oauth.circuitBreakerReset,
     },
     apikey: {
       failureThreshold: PROVIDER_PROFILES.apikey.circuitBreakerThreshold,
+      degradationThreshold: PROVIDER_PROFILES.apikey.degradationThreshold,
       resetTimeoutMs: PROVIDER_PROFILES.apikey.circuitBreakerReset,
     },
   },
+  // Wait at most 90s for a single connection cooldown (covers Gemini-class
+  // TPM/RPM windows, which report ~60s retry-after live), at most 5 retry
+  // cycles, never more than 300s (5 min) total (#7360 follow-up — raised now
+  // that withEarlyStreamKeepalive gives streaming clients an immediate
+  // synthetic keep-alive, eliminating the client-side first-byte-timeout risk
+  // a long wait used to carry). Applies to direct (non-combo) model requests.
   waitForCooldown: {
     enabled: true,
-    maxRetries: 3,
-    maxRetryWaitSec: 30,
-    maxRetryWaitMs: 30000,
+    maxRetries: 5,
+    maxRetryWaitSec: 90,
+    maxRetryWaitMs: 90000,
+    budgetMs: 300000,
+  },
+  // Wait at most 90s for a single short transient cooldown (covers Gemini-class
+  // TPM/RPM windows, which report ~60s retry-after live — #7360), at most 5
+  // redispatch cycles, never more than 300s (5 min) total. Active for every
+  // combo strategy when enabled, and only for transient (non quota_exhausted)
+  // reasons.
+  comboCooldownWait: {
+    enabled: true,
+    maxWaitMs: 90000,
+    maxAttempts: 5,
+    budgetMs: 300000,
+  },
+  // FASE 2.1: serialize concurrent quota-share requests per connection when the
+  // connection sets a max_concurrent cap, so a subscription account is not
+  // flooded past its concurrency ceiling. Kill-switch only (default on); the cap
+  // comes from each connection's max_concurrent.
+  quotaShareConcurrencyLimit: {
+    enabled: true,
+  },
+  providerCooldown: {
+    minRetryCooldownMs: Number(process.env.PROVIDER_COOLDOWN_MIN_MS || "5000"),
+    maxRetryCooldownMs: Number(process.env.PROVIDER_COOLDOWN_MAX_MS || "300000"),
+    // Opt-in (default OFF): this global cross-request cooldown overlaps the
+    // existing Connection Cooldown / Provider Circuit Breaker layers, so it is
+    // disabled by default and must be explicitly enabled by the operator until
+    // its interaction with those layers is validated in production.
+    enabled: ["true", "1", "on"].includes(
+      (process.env.PROVIDER_COOLDOWN_ENABLED || "").trim().toLowerCase()
+    ),
+  },
+  quotaPreflight: {
+    // Opt-in (default OFF): the auto-routing hard cutoff drops low-quota candidates
+    // before scoring, overlapping the existing soft quota penalty + connection
+    // cooldown, so it must be explicitly enabled by the operator until its
+    // interaction with the scorer is validated in production.
+    enabled: ["true", "1", "on"].includes(
+      (process.env.QUOTA_PREFLIGHT_CUTOFF_ENABLED || "").trim().toLowerCase()
+    ),
+    // Remaining-% semantics. 2 = "stop when only 2% remaining" (= 98% used).
+    // Uniform across all providers and windows; operators set per-window
+    // overrides per connection via the Cutoff modal in Dashboard › Limits,
+    // or per-(provider, window) globally via the providerWindowDefaults map
+    // below (no factory seeds — keep behavior consistent across providers).
+    defaultThresholdPercent: 2,
+    warnThresholdPercent: 20,
+    providerWindowDefaults: {},
+  },
+  streamRecovery: {
+    // Opt-in (default OFF): the holdback that powers transparent early-retry adds
+    // up to STREAM_RECOVERY.HOLDBACK_MS of time-to-first-token latency on every
+    // streaming request, so it must be explicitly enabled by the operator.
+    enabled: ["true", "1", "on"].includes(
+      (process.env.STREAM_RECOVERY_ENABLED || "").trim().toLowerCase()
+    ),
+    // Opt-in (default OFF): mid-stream continuation re-requests after a post-commit cut.
+    continueMidStream: ["true", "1", "on"].includes(
+      (process.env.STREAM_RECOVERY_MIDSTREAM_ENABLED || "").trim().toLowerCase()
+    ),
+    throughputWatchdog: {
+      enabled: ["true", "1", "on"].includes(
+        (process.env.STREAM_THROUGHPUT_WATCHDOG_ENABLED || "").trim().toLowerCase()
+      ),
+      warmupMs: STREAM_THROUGHPUT_WATCHDOG.WARMUP_MS,
+      windowMs: STREAM_THROUGHPUT_WATCHDOG.WINDOW_MS,
+      minUsefulBytesPerSecond: STREAM_THROUGHPUT_WATCHDOG.MIN_USEFUL_BYTES_PER_SECOND,
+      minUsefulBytes: STREAM_THROUGHPUT_WATCHDOG.MIN_USEFUL_BYTES,
+    },
+  },
+  // #6846 Phase 1: empty by default — nvidia (and any future header-less
+  // provider registered in providerDefaultRateLimit.ts) uses its static
+  // default until an operator adds an override here.
+  providerQuotaOverrides: {},
+  // Global default cadence for the background credential health check sweep.
+  // 60 minutes: the sweep makes a real upstream probe against EVERY active
+  // connection, so the previous 5-minute default cost 12 requests/hour per
+  // connection. 0 disables the sweep entirely. Per-connection overrides win.
+  credentialHealthCheck: {
+    intervalMinutes: 60,
   },
 };
-
-function normalizeRequestQueueSettings(
-  next: unknown,
-  fallback: RequestQueueSettings
-): RequestQueueSettings {
-  const record = asRecord(next);
-  const requestsPerMinute = toInteger(record.requestsPerMinute, fallback.requestsPerMinute, {
-    min: 1,
-    max: 1_000_000,
-  });
-  const minTimeBetweenRequestsMs = toInteger(
-    record.minTimeBetweenRequestsMs,
-    fallback.minTimeBetweenRequestsMs,
-    { min: 0, max: 60 * 60 * 1000 }
-  );
-  const concurrentRequests = toInteger(record.concurrentRequests, fallback.concurrentRequests, {
-    min: 1,
-    max: 10_000,
-  });
-  const maxWaitMs = toInteger(record.maxWaitMs, fallback.maxWaitMs, {
-    min: 1,
-    max: 24 * 60 * 60 * 1000,
-  });
-
-  return {
-    autoEnableApiKeyProviders: toBoolean(
-      record.autoEnableApiKeyProviders,
-      fallback.autoEnableApiKeyProviders
-    ),
-    requestsPerMinute,
-    minTimeBetweenRequestsMs,
-    concurrentRequests,
-    maxWaitMs,
-  };
-}
-
-function normalizeConnectionCooldownProfile(
-  next: unknown,
-  fallback: ConnectionCooldownProfileSettings
-): ConnectionCooldownProfileSettings {
-  const record = asRecord(next);
-  return {
-    baseCooldownMs: toInteger(record.baseCooldownMs, fallback.baseCooldownMs, {
-      min: 0,
-      max: 24 * 60 * 60 * 1000,
-    }),
-    useUpstreamRetryHints: toBoolean(record.useUpstreamRetryHints, fallback.useUpstreamRetryHints),
-    maxBackoffSteps: toInteger(record.maxBackoffSteps, fallback.maxBackoffSteps, {
-      min: 0,
-      max: 32,
-    }),
-  };
-}
-
-function normalizeLegacyConnectionCooldownProfile(
-  next: unknown,
-  fallback: ConnectionCooldownProfileSettings
-): ConnectionCooldownProfileSettings {
-  const record = asRecord(next);
-  const transientCooldown = toInteger(record.transientCooldown, fallback.baseCooldownMs, {
-    min: 0,
-    max: 24 * 60 * 60 * 1000,
-  });
-  const legacyRateLimitCooldown = toInteger(record.rateLimitCooldown, transientCooldown, {
-    min: 0,
-    max: 24 * 60 * 60 * 1000,
-  });
-  const useUpstreamRetryHints =
-    typeof record.rateLimitCooldown === "number"
-      ? record.rateLimitCooldown === 0
-      : fallback.useUpstreamRetryHints;
-
-  return {
-    baseCooldownMs: useUpstreamRetryHints
-      ? transientCooldown
-      : Math.max(transientCooldown, legacyRateLimitCooldown),
-    useUpstreamRetryHints,
-    maxBackoffSteps: toInteger(record.maxBackoffLevel, fallback.maxBackoffSteps, {
-      min: 0,
-      max: 32,
-    }),
-  };
-}
-
-function normalizeProviderBreakerProfile(
-  next: unknown,
-  fallback: ProviderBreakerProfileSettings
-): ProviderBreakerProfileSettings {
-  const record = asRecord(next);
-  return {
-    failureThreshold: toInteger(record.failureThreshold, fallback.failureThreshold, {
-      min: 1,
-      max: 1000,
-    }),
-    resetTimeoutMs: toInteger(record.resetTimeoutMs, fallback.resetTimeoutMs, {
-      min: 1000,
-      max: 24 * 60 * 60 * 1000,
-    }),
-  };
-}
-
-function normalizeWaitForCooldownSettings(
-  next: unknown,
-  fallback: WaitForCooldownSettings
-): WaitForCooldownSettings {
-  const record = asRecord(next);
-  const maxRetryWaitSec = toInteger(record.maxRetryWaitSec, fallback.maxRetryWaitSec, {
-    min: 0,
-    max: 300,
-  });
-  const maxRetries = toInteger(record.maxRetries, fallback.maxRetries, { min: 0, max: 10 });
-  const enabled =
-    toBoolean(record.enabled, fallback.enabled) && maxRetries > 0 && maxRetryWaitSec > 0;
-
-  return {
-    enabled,
-    maxRetries,
-    maxRetryWaitSec,
-    maxRetryWaitMs: maxRetryWaitSec * 1000,
-  };
-}
 
 function buildLegacyFallback(settings: JsonRecord): ResilienceSettings {
   const profiles = asRecord(settings.providerProfiles);
   const defaults = asRecord(settings.rateLimitDefaults);
+  const streamRecoveryDefaults = resolveStreamRecoveryDefaults();
 
   const oauthLegacy = asRecord(profiles.oauth);
   const apikeyLegacy = asRecord(profiles.apikey);
@@ -272,7 +229,11 @@ function buildLegacyFallback(settings: JsonRecord): ResilienceSettings {
         DEFAULT_RESILIENCE_SETTINGS.requestQueue.concurrentRequests,
         { min: 1, max: 10_000 }
       ),
+      globalConcurrentRequests:
+        DEFAULT_RESILIENCE_SETTINGS.requestQueue.globalConcurrentRequests,
       maxWaitMs: DEFAULT_RESILIENCE_SETTINGS.requestQueue.maxWaitMs,
+      executionMaxWaitMs: DEFAULT_RESILIENCE_SETTINGS.requestQueue.executionMaxWaitMs,
+      maxQueueDepth: DEFAULT_RESILIENCE_SETTINGS.requestQueue.maxQueueDepth,
     },
     connectionCooldown: {
       oauth: normalizeLegacyConnectionCooldownProfile(
@@ -291,6 +252,8 @@ function buildLegacyFallback(settings: JsonRecord): ResilienceSettings {
           DEFAULT_RESILIENCE_SETTINGS.providerBreaker.oauth.failureThreshold,
           { min: 1, max: 1000 }
         ),
+        degradationThreshold:
+          DEFAULT_RESILIENCE_SETTINGS.providerBreaker.oauth.degradationThreshold,
         resetTimeoutMs: toInteger(
           oauthLegacy.circuitBreakerReset,
           DEFAULT_RESILIENCE_SETTINGS.providerBreaker.oauth.resetTimeoutMs,
@@ -303,6 +266,8 @@ function buildLegacyFallback(settings: JsonRecord): ResilienceSettings {
           DEFAULT_RESILIENCE_SETTINGS.providerBreaker.apikey.failureThreshold,
           { min: 1, max: 1000 }
         ),
+        degradationThreshold:
+          DEFAULT_RESILIENCE_SETTINGS.providerBreaker.apikey.degradationThreshold,
         resetTimeoutMs: toInteger(
           apikeyLegacy.circuitBreakerReset,
           DEFAULT_RESILIENCE_SETTINGS.providerBreaker.apikey.resetTimeoutMs,
@@ -315,8 +280,42 @@ function buildLegacyFallback(settings: JsonRecord): ResilienceSettings {
       maxRetries: waitMaxRetries,
       maxRetryWaitSec: waitMaxRetrySec,
       maxRetryWaitMs: waitMaxRetrySec * 1000,
+      budgetMs: Math.max(
+        waitMaxRetrySec * 1000,
+        DEFAULT_RESILIENCE_SETTINGS.waitForCooldown.budgetMs
+      ),
     },
+    comboCooldownWait: DEFAULT_RESILIENCE_SETTINGS.comboCooldownWait,
+    quotaShareConcurrencyLimit: DEFAULT_RESILIENCE_SETTINGS.quotaShareConcurrencyLimit,
+    providerCooldown: DEFAULT_RESILIENCE_SETTINGS.providerCooldown,
+    quotaPreflight: DEFAULT_RESILIENCE_SETTINGS.quotaPreflight,
+    streamRecovery: streamRecoveryDefaults,
+    providerQuotaOverrides: DEFAULT_RESILIENCE_SETTINGS.providerQuotaOverrides,
+    credentialHealthCheck: DEFAULT_RESILIENCE_SETTINGS.credentialHealthCheck,
   };
+}
+
+/**
+ * True when the operator has an explicit stream-recovery configuration —
+ * either a DB/settings override (`resilienceSettings.streamRecovery.enabled`
+ * present as a boolean) or a non-empty `STREAM_RECOVERY_ENABLED` env var.
+ *
+ * `ResilienceSettings` has no `isExplicit`/`source` field to distinguish
+ * "default off" from "operator explicitly turned it off", so callers that
+ * need to respect an explicit operator choice (e.g. the agent-goal-policy
+ * override in chatCore.ts) must check this before layering any heuristic
+ * on top of `resolveResilienceSettings(...).streamRecovery.enabled`.
+ */
+export function isStreamRecoveryExplicitlyConfigured(
+  settings: Record<string, unknown> | null | undefined
+): boolean {
+  const record = asRecord(settings);
+  const current = asRecord(record.resilienceSettings);
+  const streamRecoveryRecord = asRecord(current.streamRecovery);
+  if (typeof streamRecoveryRecord.enabled === "boolean") {
+    return true;
+  }
+  return (process.env.STREAM_RECOVERY_ENABLED || "").trim().length > 0;
 }
 
 export function resolveResilienceSettings(
@@ -352,6 +351,34 @@ export function resolveResilienceSettings(
       current.waitForCooldown,
       fallback.waitForCooldown
     ),
+    comboCooldownWait: normalizeComboCooldownWaitSettings(
+      current.comboCooldownWait,
+      fallback.comboCooldownWait
+    ),
+    quotaShareConcurrencyLimit: normalizeQuotaShareConcurrencyLimitSettings(
+      current.quotaShareConcurrencyLimit,
+      fallback.quotaShareConcurrencyLimit
+    ),
+    providerCooldown: normalizeProviderCooldownSettings(
+      current.providerCooldown,
+      fallback.providerCooldown
+    ),
+    quotaPreflight: normalizeQuotaPreflightSettings(
+      current.quotaPreflight,
+      fallback.quotaPreflight
+    ),
+    streamRecovery: normalizeStreamRecoverySettings(
+      current.streamRecovery,
+      fallback.streamRecovery
+    ),
+    providerQuotaOverrides: normalizeProviderQuotaOverrides(
+      current.providerQuotaOverrides,
+      fallback.providerQuotaOverrides
+    ),
+    credentialHealthCheck: normalizeCredentialHealthCheckSettings(
+      current.credentialHealthCheck,
+      fallback.credentialHealthCheck
+    ),
   };
 }
 
@@ -385,6 +412,28 @@ export function mergeResilienceSettings(
       updates.waitForCooldown,
       current.waitForCooldown
     ),
+    comboCooldownWait: normalizeComboCooldownWaitSettings(
+      updates.comboCooldownWait,
+      current.comboCooldownWait
+    ),
+    quotaShareConcurrencyLimit: normalizeQuotaShareConcurrencyLimitSettings(
+      updates.quotaShareConcurrencyLimit,
+      current.quotaShareConcurrencyLimit
+    ),
+    providerCooldown: normalizeProviderCooldownSettings(
+      updates.providerCooldown,
+      current.providerCooldown
+    ),
+    quotaPreflight: normalizeQuotaPreflightSettings(updates.quotaPreflight, current.quotaPreflight),
+    streamRecovery: normalizeStreamRecoverySettings(updates.streamRecovery, current.streamRecovery),
+    providerQuotaOverrides: normalizeProviderQuotaOverrides(
+      updates.providerQuotaOverrides,
+      current.providerQuotaOverrides
+    ),
+    credentialHealthCheck: normalizeCredentialHealthCheckSettings(
+      updates.credentialHealthCheck,
+      current.credentialHealthCheck
+    ),
   };
 }
 
@@ -398,6 +447,7 @@ export function buildLegacyResilienceCompat(settings: ResilienceSettings) {
           : settings.connectionCooldown.oauth.baseCooldownMs,
         maxBackoffLevel: settings.connectionCooldown.oauth.maxBackoffSteps,
         circuitBreakerThreshold: settings.providerBreaker.oauth.failureThreshold,
+        degradationThreshold: settings.providerBreaker.oauth.degradationThreshold,
         circuitBreakerReset: settings.providerBreaker.oauth.resetTimeoutMs,
       },
       apikey: {
@@ -407,6 +457,7 @@ export function buildLegacyResilienceCompat(settings: ResilienceSettings) {
           : settings.connectionCooldown.apikey.baseCooldownMs,
         maxBackoffLevel: settings.connectionCooldown.apikey.maxBackoffSteps,
         circuitBreakerThreshold: settings.providerBreaker.apikey.failureThreshold,
+        degradationThreshold: settings.providerBreaker.apikey.degradationThreshold,
         circuitBreakerReset: settings.providerBreaker.apikey.resetTimeoutMs,
       },
     },

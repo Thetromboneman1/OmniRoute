@@ -11,7 +11,7 @@
  */
 
 import { getDbInstance } from "./db/core";
-import { invalidateDbCache } from "./db/readCache";
+import { invalidateDbCache, getModelCatalogCacheVersion } from "./db/readCache";
 import { backupDbFile } from "./db/backup";
 
 // ─── Types ───────────────────────────────────────────────
@@ -21,6 +21,20 @@ type PricingEntry = {
   output: number;
   cached?: number;
   cache_creation?: number;
+  mode?: string;
+  // Non-token pricing dimensions (absolute USD, NOT scaled ×1e6).
+  input_cost_per_second?: number;
+  output_cost_per_second?: number;
+  input_cost_per_image?: number;
+  output_cost_per_image?: number;
+  input_cost_per_pixel?: number;
+  output_cost_per_pixel?: number;
+  input_cost_per_character?: number;
+  output_cost_per_character?: number;
+  input_cost_per_video_per_second?: number;
+  output_cost_per_video_per_second?: number;
+  search_unit_cost?: number;
+  ocr_cost_per_page?: number;
 };
 
 type PricingModels = Record<string, PricingEntry>;
@@ -33,6 +47,19 @@ interface LiteLLMModelInfo {
   cache_creation_input_token_cost?: number;
   litellm_provider?: string;
   mode?: string;
+  // Non-token pricing dimensions (absolute USD, NOT scaled ×1e6).
+  input_cost_per_second?: number;
+  output_cost_per_second?: number;
+  input_cost_per_image?: number;
+  output_cost_per_image?: number;
+  input_cost_per_pixel?: number;
+  output_cost_per_pixel?: number;
+  input_cost_per_character?: number;
+  output_cost_per_character?: number;
+  input_cost_per_video_per_second?: number;
+  output_cost_per_video_per_second?: number;
+  search_unit_cost?: number;
+  ocr_cost_per_page?: number;
 }
 
 interface SyncStatus {
@@ -75,17 +102,38 @@ const LITELLM_PRICING_URL =
 const LITELLM_PROVIDER_MAP: Record<string, string[]> = {
   openai: ["openai", "cx"],
   anthropic: ["anthropic", "cc"],
-  vertex_ai: ["gemini", "gemini-cli"],
+  vertex_ai: ["gemini"],
   "vertex_ai-anthropic_models": ["anthropic"],
-  google: ["gemini", "gemini-cli"],
-  deepseek: ["if"],
+  google: ["gemini"],
+  // Registry ALIAS, not registry id — pricingSync writes/reads are keyed by
+  // alias everywhere else (see getPricingForModel(provider, model) callers).
+  // Four of these previously used the provider's `id` string, which is not a
+  // valid pricing-lookup key for that provider and, worse, for `deepseek` a
+  // real (but wrong) alias existed under that string — silently routing
+  // DeepSeek's synced pricing onto Qoder (open-sse/config/providers/registry/
+  // qoder/index.ts, alias "if", an unrelated third-party API) instead of
+  // DeepSeek (alias "ds"). `bedrock`/`bedrock_converse` and `cloudflare`
+  // pointed at their provider's `id` ("kiro", "cloudflare-ai") rather than
+  // its `alias` ("kr", "cf") — not wrong-provider, just a dead key nothing
+  // downstream ever looks up, so those two providers silently never received
+  // synced pricing at all.
+  deepseek: ["ds"],
   groq: ["groq"],
   together_ai: ["openrouter"],
-  bedrock: ["kiro"],
+  bedrock: ["kr"],
   fireworks_ai: ["fireworks"],
   cerebras: ["cerebras"],
   nvidia_nim: ["nvidia"],
   siliconflow: ["siliconflow"],
+  "vertex_ai-language_models": ["gemini"],
+  "vertex_ai-mistral_models": ["mistral"],
+  gemini: ["gemini"],
+  bedrock_converse: ["kr"],
+  cloudflare: ["cf"],
+  // stability-ai has no chat-completions registry entry (image-only:
+  // open-sse/config/providers/registry/stability-ai/imageModels.ts) — left
+  // as-is rather than guessed at; not the same bug shape as the three above.
+  stability: ["stability-ai"],
 };
 
 // ─── Periodic sync state ─────────────────────────────────
@@ -118,18 +166,34 @@ export async function fetchLiteLLMPricing(): Promise<Record<string, LiteLLMModel
 /**
  * Transform LiteLLM raw data → OmniRoute PricingByProvider format.
  *
- * Conversion: cost_per_token × 1_000_000 → $/1M tokens (OmniRoute format)
- * Filters: only chat/completion modes (skip image/audio/embedding)
+ * Conversion: cost_per_token × 1_000_000 → $/1M tokens (OmniRoute format).
+ * Ingests both chat (token) AND non-token modes (image / audio / rerank /
+ * video / embedding). Token pricing is scaled to $/1M; non-token fields
+ * (per-image, per-second, per-character, search-unit, …) are carried through
+ * verbatim as absolute USD.
  */
 export function transformToOmniRoute(raw: Record<string, LiteLLMModelInfo>): PricingByProvider {
   const result: PricingByProvider = {};
 
   for (const [modelKey, info] of Object.entries(raw)) {
-    // Skip non-chat models
-    if (info.mode && !["chat", "completion"].includes(info.mode)) continue;
+    const NON_TOKEN_FIELDS = [
+      "input_cost_per_second",
+      "output_cost_per_second",
+      "input_cost_per_image",
+      "output_cost_per_image",
+      "input_cost_per_pixel",
+      "output_cost_per_pixel",
+      "input_cost_per_character",
+      "output_cost_per_character",
+      "input_cost_per_video_per_second",
+      "output_cost_per_video_per_second",
+      "search_unit_cost",
+      "ocr_cost_per_page",
+    ] as const;
 
-    // Must have at least input pricing
-    if (!info.input_cost_per_token && info.input_cost_per_token !== 0) continue;
+    const hasToken = info.input_cost_per_token != null || info.output_cost_per_token != null;
+    const hasNonToken = NON_TOKEN_FIELDS.some((f) => info[f] != null);
+    if (!hasToken && !hasNonToken) continue;
 
     const inputCost = (info.input_cost_per_token || 0) * 1_000_000;
     const outputCost = (info.output_cost_per_token || 0) * 1_000_000;
@@ -138,6 +202,7 @@ export function transformToOmniRoute(raw: Record<string, LiteLLMModelInfo>): Pri
       input: Math.round(inputCost * 1000) / 1000,
       output: Math.round(outputCost * 1000) / 1000,
     };
+    if (info.mode) entry.mode = info.mode;
 
     if (info.cache_read_input_token_cost != null) {
       entry.cached = Math.round(info.cache_read_input_token_cost * 1_000_000 * 1000) / 1000;
@@ -145,6 +210,11 @@ export function transformToOmniRoute(raw: Record<string, LiteLLMModelInfo>): Pri
     if (info.cache_creation_input_token_cost != null) {
       entry.cache_creation =
         Math.round(info.cache_creation_input_token_cost * 1_000_000 * 1000) / 1000;
+    }
+
+    for (const f of NON_TOKEN_FIELDS) {
+      const v = info[f];
+      if (typeof v === "number" && Number.isFinite(v)) entry[f] = v;
     }
 
     // Extract model name (strip provider prefix from key)
@@ -177,10 +247,27 @@ function toRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
+// getSyncedPricing() re-ran the SELECT + JSON.parse of the pricing_synced
+// blobs on every call — resolveCatalogPricing() calls it per model lookup, so
+// each call rebuilt a fresh object and findInsensitive() (WeakMap keyed by
+// object identity) rebuilt its lowercase index per lookup, emitting hundreds
+// of 'case-insensitive key collision' warnings per second and pinning CPU.
+// Memoized here, invalidated via the same modelCatalogCacheVersion signal
+// saveSyncedPricing/clearSyncedPricing already bump through
+// invalidateDbCache("pricing") — mirrors getModelsDevPricing() in
+// modelsDevSync.ts.
+let pricingMemo: PricingByProvider | null = null;
+let pricingMemoVersion = -1; // -1: never equals a real cacheVersion (starts at 0), guarantees a miss on the first call
+
 /**
  * Read synced pricing from `pricing_synced` namespace.
  */
 export function getSyncedPricing(): PricingByProvider {
+  const currentVersion = getModelCatalogCacheVersion();
+  if (pricingMemo !== null && pricingMemoVersion === currentVersion) {
+    return pricingMemo;
+  }
+
   const db = getDbInstance();
   const rows = db
     .prepare("SELECT key, value FROM key_value WHERE namespace = 'pricing_synced'")
@@ -197,6 +284,8 @@ export function getSyncedPricing(): PricingByProvider {
       console.warn(`[PRICING_SYNC] Corrupted data for provider "${key}", skipping`);
     }
   }
+  pricingMemo = synced;
+  pricingMemoVersion = currentVersion;
   return synced;
 }
 
@@ -228,6 +317,51 @@ export function clearSyncedPricing(): void {
   db.prepare("DELETE FROM key_value WHERE namespace = 'pricing_synced'").run();
   backupDbFile("pre-write");
   invalidateDbCache("pricing");
+}
+
+// ─── DB: Sync status namespace ───────────────────────────
+//
+// Persisted separately from `pricing_synced` because Next.js standalone
+// builds load this module from independent webpack chunks (e.g. the
+// instrumentation hook vs an API route handler) — each gets its OWN
+// top-level module state. Module-level vars (`lastSyncTime`,
+// `lastSyncModelCount`) are therefore invisible across those instances;
+// persisting them to the DB lets any instance read the real status.
+
+const SYNC_STATUS_NAMESPACE = "pricing_sync_status";
+const SYNC_STATUS_KEY = "last_sync";
+
+function readPersistedSyncStatus(): { lastSyncTime: string; lastSyncModelCount: number } | null {
+  const db = getDbInstance();
+  const row = db
+    .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
+    .get(SYNC_STATUS_NAMESPACE, SYNC_STATUS_KEY);
+  const record = toRecord(row);
+  const rawValue = typeof record.value === "string" ? record.value : null;
+  if (!rawValue) return null;
+  try {
+    const parsed = JSON.parse(rawValue) as { lastSyncTime?: string; lastSyncModelCount?: number };
+    if (typeof parsed.lastSyncTime !== "string") return null;
+    return {
+      lastSyncTime: parsed.lastSyncTime,
+      lastSyncModelCount:
+        typeof parsed.lastSyncModelCount === "number" ? parsed.lastSyncModelCount : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writePersistedSyncStatus(lastSync: string, modelCount: number): void {
+  const db = getDbInstance();
+  db.prepare(
+    "INSERT INTO key_value (namespace, key, value) VALUES (?, ?, ?) " +
+      "ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value"
+  ).run(
+    SYNC_STATUS_NAMESPACE,
+    SYNC_STATUS_KEY,
+    JSON.stringify({ lastSyncTime: lastSync, lastSyncModelCount: modelCount })
+  );
 }
 
 // ─── Main sync function ─────────────────────────────────
@@ -286,6 +420,7 @@ export async function syncPricingFromSources(opts?: {
       saveSyncedPricing(aggregated);
       lastSyncTime = new Date().toISOString();
       lastSyncModelCount = modelCount;
+      writePersistedSyncStatus(lastSyncTime, modelCount);
     }
 
     return {
@@ -374,20 +509,28 @@ export function stopPeriodicSync(): void {
  */
 export function getSyncStatus(): SyncStatus {
   const enabled = process.env.PRICING_SYNC_ENABLED === "true";
+  // `lastSyncTime`/`lastSyncModelCount` are only reliably populated on the
+  // module instance that performed the sync (see note above
+  // writePersistedSyncStatus) — fall back to the persisted DB record so
+  // status reads from a different module instance still see it.
+  const persisted = lastSyncTime === null ? readPersistedSyncStatus() : null;
+  const effectiveLastSync = lastSyncTime ?? persisted?.lastSyncTime ?? null;
+  const effectiveModelCount =
+    lastSyncTime !== null ? lastSyncModelCount : (persisted?.lastSyncModelCount ?? 0);
   return {
     enabled,
-    lastSync: lastSyncTime,
-    lastSyncModelCount,
+    lastSync: effectiveLastSync,
+    lastSyncModelCount: effectiveModelCount,
     nextSync:
-      syncTimer && lastSyncTime
-        ? new Date(new Date(lastSyncTime).getTime() + activeSyncIntervalMs).toISOString()
+      enabled && effectiveLastSync
+        ? new Date(new Date(effectiveLastSync).getTime() + activeSyncIntervalMs).toISOString()
         : null,
     intervalMs: activeSyncIntervalMs,
     sources: SYNC_SOURCES,
   };
 }
 
-// ─── Init (called from server-init.ts) ───────────────────
+// ─── Init (called from instrumentation-node.ts) ───────────────────
 
 /**
  * Initialize pricing sync if enabled.

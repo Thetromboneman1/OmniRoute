@@ -11,12 +11,15 @@ const {
   resolveClaudeCodeCompatibleMaxTokens,
   buildClaudeCodeCompatibleRequest,
 } = await import("../../open-sse/services/claudeCodeCompatible.ts");
-const { getModelsByProviderId } = await import("../../open-sse/config/providerModels.ts");
+const { getModelsByProviderId, supportsXHighEffort } =
+  await import("../../open-sse/config/providerModels.ts");
 
 function getClaudeEffortFixtures() {
   const claudeModels = getModelsByProviderId("claude");
-  const xhighModel = claudeModels.find((model) => model.supportsXHighEffort === true);
-  const standardModel = claudeModels.find((model) => model.supportsXHighEffort === false);
+  const xhighModel = claudeModels.find((model) => supportsXHighEffort("claude", model.id));
+  const standardModel = claudeModels.find(
+    (model) => supportsXHighEffort("claude", model.id) === false
+  );
   assert.ok(xhighModel, "expected at least one Claude model with xhigh support");
   assert.ok(standardModel, "expected at least one Claude model without xhigh support");
   return { xhighModel, standardModel };
@@ -51,10 +54,26 @@ test("Claude Code compatible effort and max token helpers cover priority fallbac
     "xhigh"
   );
   assert.equal(
+    resolveClaudeCodeCompatibleEffort({ output_config: { effort: "max" } }, null, xhighModel.id),
+    "max"
+  );
+  assert.equal(
     resolveClaudeCodeCompatibleEffort(
       { output_config: { effort: "xhigh" } },
       null,
       standardModel.id
+    ),
+    "high"
+  );
+  assert.equal(
+    resolveClaudeCodeCompatibleEffort({ output_config: { effort: "max" } }, null, standardModel.id),
+    "max"
+  );
+  assert.equal(
+    resolveClaudeCodeCompatibleEffort(
+      { output_config: { effort: "max" } },
+      null,
+      "claude-haiku-4-5-20251001"
     ),
     "high"
   );
@@ -162,6 +181,80 @@ test("buildClaudeCodeCompatibleRequest prefers existing Claude top-level system 
   assert.deepEqual(payload.messages, [
     { role: "user", content: [{ type: "text", text: "hello" }] },
   ]);
+});
+
+test("buildClaudeCodeCompatibleRequest can request summarized thinking display", () => {
+  const defaultPayload = buildClaudeCodeCompatibleRequest({
+    normalizedBody: {
+      messages: [{ role: "user", content: "hello" }],
+    },
+    model: "claude-opus-4-8",
+    cwd: "/tmp/claude-code-compatible",
+    now: new Date("2026-01-02T12:00:00.000Z"),
+  });
+  assert.deepEqual(defaultPayload.thinking, { type: "adaptive" });
+
+  const summarizedDefault = buildClaudeCodeCompatibleRequest({
+    normalizedBody: {
+      messages: [{ role: "user", content: "hello" }],
+    },
+    model: "claude-opus-4-8",
+    cwd: "/tmp/claude-code-compatible",
+    now: new Date("2026-01-02T12:00:00.000Z"),
+    summarizeThinking: true,
+  });
+  assert.deepEqual(summarizedDefault.thinking, {
+    type: "adaptive",
+    display: "summarized",
+  });
+
+  const summarizedExistingThinking = buildClaudeCodeCompatibleRequest({
+    sourceBody: {
+      thinking: { type: "adaptive" },
+    },
+    normalizedBody: {
+      messages: [{ role: "user", content: "hello" }],
+    },
+    model: "claude-opus-4-8",
+    cwd: "/tmp/claude-code-compatible",
+    now: new Date("2026-01-02T12:00:00.000Z"),
+    summarizeThinking: true,
+  });
+  assert.deepEqual(summarizedExistingThinking.thinking, {
+    type: "adaptive",
+    display: "summarized",
+  });
+
+  const explicitDisplay = buildClaudeCodeCompatibleRequest({
+    sourceBody: {
+      thinking: { type: "adaptive", display: "omitted" },
+    },
+    normalizedBody: {
+      messages: [{ role: "user", content: "hello" }],
+    },
+    model: "claude-opus-4-8",
+    cwd: "/tmp/claude-code-compatible",
+    now: new Date("2026-01-02T12:00:00.000Z"),
+    summarizeThinking: true,
+  });
+  assert.deepEqual(explicitDisplay.thinking, {
+    type: "adaptive",
+    display: "omitted",
+  });
+
+  const disabledThinking = buildClaudeCodeCompatibleRequest({
+    sourceBody: {
+      thinking: { type: "disabled" },
+    },
+    normalizedBody: {
+      messages: [{ role: "user", content: "hello" }],
+    },
+    model: "claude-opus-4-8",
+    cwd: "/tmp/claude-code-compatible",
+    now: new Date("2026-01-02T12:00:00.000Z"),
+    summarizeThinking: true,
+  });
+  assert.deepEqual(disabledThinking.thinking, { type: "disabled" });
 });
 
 test("buildClaudeCodeCompatibleRequest does not duplicate an existing default system skeleton", () => {

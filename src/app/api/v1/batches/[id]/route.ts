@@ -1,38 +1,14 @@
 import { CORS_HEADERS, handleCorsOptions } from "@/shared/utils/cors";
-import { getBatch } from "@/lib/localDb";
+import { getBatch, deleteBatch } from "@/lib/db/batches";
 import { NextResponse } from "next/server";
-import { getApiKeyRequestScope } from "@/app/api/v1/_helpers/apiKeyScope";
-
-function formatBatchResponse(batch: any) {
-  return {
-    id: batch.id,
-    object: "batch",
-    endpoint: batch.endpoint,
-    errors: batch.errors || null,
-    input_file_id: batch.inputFileId,
-    completion_window: batch.completionWindow,
-    status: batch.status,
-    output_file_id: batch.outputFileId || null,
-    error_file_id: batch.errorFileId || null,
-    created_at: batch.createdAt,
-    in_progress_at: batch.inProgressAt || null,
-    expires_at: batch.expiresAt || null,
-    finalizing_at: batch.finalizingAt || null,
-    completed_at: batch.completedAt || null,
-    failed_at: batch.failedAt || null,
-    expired_at: batch.expiredAt || null,
-    cancelling_at: batch.cancellingAt || null,
-    cancelled_at: batch.cancelledAt || null,
-    request_counts: {
-      total: batch.requestCountsTotal || 0,
-      completed: batch.requestCountsCompleted || 0,
-      failed: batch.requestCountsFailed || 0,
-    },
-    metadata: batch.metadata || null,
-    model: batch.model || null,
-    usage: batch.usage || null,
-  };
-}
+import {
+  getApiKeyRequestScope,
+  canAccessOwnedRecord,
+  resolveEffectiveApiKeyId,
+} from "@/app/api/v1/_helpers/apiKeyScope";
+import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
+import { buildErrorBody } from "@omniroute/open-sse/utils/error";
+import { formatBatchResponse } from "../formatBatchResponse";
 
 export async function OPTIONS() {
   return handleCorsOptions();
@@ -41,12 +17,45 @@ export async function OPTIONS() {
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
   const scope = await getApiKeyRequestScope(request);
   if (scope.rejection) return scope.rejection;
-  const apiKeyId = scope.apiKeyId;
+
+  // Fail closed on an unresolvable OR invalid credential — the same 401 fold
+  // `getApiKeyRequestScope` already applies (`apiKeyId: null` for a
+  // revoked/expired/banned/deactivated/unresolvable key, #13881) — so the
+  // per-key policy check below never has to special-case that status itself.
+  if (scope.apiKey && !scope.apiKeyId) {
+    return NextResponse.json(buildErrorBody(401, "Invalid API key"), {
+      status: 401,
+      headers: CORS_HEADERS,
+    });
+  }
+
+  // per-key operator policy (endpoint allowlist, schedule, usage cap, rate
+  // limit) — LEDGER-2 of the omni-code-sec 2026-09-21 run / #14481. Called
+  // UNCONDITIONALLY, exactly like batches/delete-completed/route.ts: a bare
+  // `x-api-key`/`x-goog-api-key` credential (no anthropic-version, non-Claude
+  // UA) is accepted by the CLIENT_API auth layer but ignored by
+  // getApiKeyRequestScope's extractApiKey() (scope.apiKeyId stays null for
+  // it) — enforceApiKeyPolicy resolves it independently via
+  // extractUngatedClientApiKey() (GHSA-2phc-xp22-9f56), so gating this call
+  // on scope.apiKeyId let that transport skip the endpoint allowlist,
+  // schedule, usage cap, rate limit and key quota entirely (round-2 PoC
+  // against e543b64). A keyless caller (session/anonymous) is a no-op here.
+  const policy = await enforceApiKeyPolicy(request, null);
+  if (policy.rejection) return policy.rejection;
 
   const { id } = await params;
   const batch = getBatch(id);
 
-  if (!batch || (batch.apiKeyId !== null && batch.apiKeyId !== apiKeyId)) {
+  // A key resolved only via the ungated x-api-key/x-goog-api-key transport
+  // never sets scope.apiKeyId — fall back to the id enforceApiKeyPolicy()
+  // independently resolved, so that key can still reach its own rows
+  // (LEDGER-27, omni-code-sec round 3).
+  const effectiveApiKeyId = resolveEffectiveApiKeyId(scope, policy.apiKeyInfo);
+
+  // Session = operator, key = own rows only, null owner = denied
+  // (GHSA-2jm2-mpx8-6523): the previous local check let ANY caller read or
+  // delete an unowned batch by id.
+  if (!batch || !canAccessOwnedRecord({ ...scope, apiKeyId: effectiveApiKeyId }, batch.apiKeyId)) {
     return NextResponse.json(
       { error: { message: "Batch not found", type: "invalid_request_error" } },
       { status: 404, headers: CORS_HEADERS }
@@ -54,4 +63,63 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
   }
 
   return NextResponse.json(formatBatchResponse(batch), { headers: CORS_HEADERS });
+}
+
+export async function DELETE(request: Request, { params }: { params: Promise<{ id: string }> }) {
+  const scope = await getApiKeyRequestScope(request);
+  if (scope.rejection) return scope.rejection;
+
+  // Fail closed on an unresolvable OR invalid credential — the same 401 fold
+  // `getApiKeyRequestScope` already applies (`apiKeyId: null` for a
+  // revoked/expired/banned/deactivated/unresolvable key, #13881) — so the
+  // per-key policy check below never has to special-case that status itself.
+  if (scope.apiKey && !scope.apiKeyId) {
+    return NextResponse.json(buildErrorBody(401, "Invalid API key"), {
+      status: 401,
+      headers: CORS_HEADERS,
+    });
+  }
+
+  // per-key operator policy (endpoint allowlist, schedule, usage cap, rate
+  // limit) — LEDGER-2 of the omni-code-sec 2026-09-21 run / #14481. Called
+  // UNCONDITIONALLY, exactly like batches/delete-completed/route.ts: a bare
+  // `x-api-key`/`x-goog-api-key` credential (no anthropic-version, non-Claude
+  // UA) is accepted by the CLIENT_API auth layer but ignored by
+  // getApiKeyRequestScope's extractApiKey() (scope.apiKeyId stays null for
+  // it) — enforceApiKeyPolicy resolves it independently via
+  // extractUngatedClientApiKey() (GHSA-2phc-xp22-9f56), so gating this call
+  // on scope.apiKeyId let that transport skip the endpoint allowlist,
+  // schedule, usage cap, rate limit and key quota entirely (round-2 PoC
+  // against e543b64). A keyless caller (session/anonymous) is a no-op here.
+  const policy = await enforceApiKeyPolicy(request, null);
+  if (policy.rejection) return policy.rejection;
+
+  const { id } = await params;
+  const batch = getBatch(id);
+
+  // A key resolved only via the ungated x-api-key/x-goog-api-key transport
+  // never sets scope.apiKeyId — fall back to the id enforceApiKeyPolicy()
+  // independently resolved, so that key can still delete its own rows
+  // (LEDGER-27, omni-code-sec round 3).
+  const effectiveApiKeyId = resolveEffectiveApiKeyId(scope, policy.apiKeyInfo);
+
+  if (!batch || !canAccessOwnedRecord({ ...scope, apiKeyId: effectiveApiKeyId }, batch.apiKeyId)) {
+    return NextResponse.json(
+      { error: { message: "Batch not found", type: "invalid_request_error" } },
+      { status: 404, headers: CORS_HEADERS }
+    );
+  }
+
+  // Only allow deleting terminal batches (completed, failed, cancelled, expired)
+  const terminal = ["completed", "failed", "cancelled", "expired"];
+  if (!terminal.includes(batch.status)) {
+    return NextResponse.json(
+      { error: { message: "Only terminal batches can be deleted", type: "invalid_request_error" } },
+      { status: 409, headers: CORS_HEADERS }
+    );
+  }
+
+  deleteBatch(id);
+
+  return NextResponse.json({ id, object: "batch", deleted: true }, { headers: CORS_HEADERS });
 }

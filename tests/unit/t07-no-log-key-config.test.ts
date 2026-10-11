@@ -23,7 +23,7 @@ const schemas = await import("../../src/shared/validation/schemas.ts");
 async function resetStorage() {
   core.resetDbInstance();
   apiKeysDb.resetApiKeyState();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -34,7 +34,7 @@ test.beforeEach(async () => {
 test.after(async () => {
   core.resetDbInstance();
   apiKeysDb.resetApiKeyState();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 
   if (originalPiiEnabled === undefined) {
     delete process.env.PII_RESPONSE_SANITIZATION;
@@ -63,6 +63,11 @@ test("updateKeyPermissionsSchema accepts noLog-only updates and rejects empty pa
     maxSessions: 3,
   });
   assert.equal(maxSessionsOnly.success, true);
+
+  const streamDefaultOnly = schemas.validateBody(schemas.updateKeyPermissionsSchema, {
+    streamDefaultMode: "json",
+  });
+  assert.equal(streamDefaultOnly.success, true);
 
   const emptyPayload = schemas.validateBody(schemas.updateKeyPermissionsSchema, {});
   assert.equal(emptyPayload.success, false);
