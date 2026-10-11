@@ -1751,7 +1751,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 ![OmniRoute system architecture](docs/architecture/omniroute-system-architecture.png)
 
 - **Default branch:** `main`
-- **Implementation fingerprint:** `5335901569076c36`
+- **Implementation fingerprint:** `9df397cc44f11ad2`
 - **Detected structure:** Source modules, Automation modules, Workspace packages, GitHub Actions, Tests and validation, Maintained documentation.
 - **Documentation contract:** editable diagram sources, committed PNG renderings,
   resolved local image links, and generated state are checked on every commit.
