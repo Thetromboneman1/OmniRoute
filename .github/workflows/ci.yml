@@ -5,7 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   workflow_dispatch:
 
 concurrency:
@@ -1468,11 +1468,16 @@ jobs:
   ci-summary:
     name: CI Dashboard
     runs-on: ubuntu-latest
-    if: ${{ !cancelled() }}
+    # Evaluate dependency cancellation as a failed/incomplete required verdict instead
+    # of skipping this aggregate job and leaving its previous green status misleading.
+    if: ${{ always() }}
     needs:
       - changes
       - lint
+      - quality-gate
+      - quality-extended
       - docs-sync-strict
+      - docs-lint
       - i18n-ui-coverage
       - i18n-glossary-zhcn
       - i18n
@@ -1481,6 +1486,8 @@ jobs:
       - package-artifact
       - electron-package-smoke
       - test-unit
+      - test-bun-sqlite
+      - test-vitest
       - test-coverage
       - sonarqube
       - coverage-pr-comment
@@ -1490,6 +1497,10 @@ jobs:
       - test-ecosystem
       - test-protocols-e2e
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
       - name: Download i18n results
         continue-on-error: true
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -1501,6 +1512,8 @@ jobs:
       - name: Generate dashboard
         env:
           EVENT_NAME: ${{ github.event_name }}
+          PR_DRAFT: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
+          IS_HOTFIX: ${{ contains(github.event.pull_request.labels.*.name, 'hotfix') }}
           # Workflow-controlled data (job results), not user input — safe to read here.
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
@@ -1545,7 +1558,10 @@ jobs:
           echo "|-----|--------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Change Classification | $(status '${{ needs.changes.result }}') |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Lint | $(status '${{ needs.lint.result }}') |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Quality Ratchet | $(status '${{ needs.quality-gate.result }}') |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Extended Quality | $(status '${{ needs.quality-extended.result }}') |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Docs Sync (Strict) | $(status '${{ needs.docs-sync-strict.result }}') |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Docs Lint (advisory) | $(status '${{ needs.docs-lint.result }}') |" >> "$GITHUB_STEP_SUMMARY"
           echo "| i18n UI Coverage | $(status '${{ needs.i18n-ui-coverage.result }}') |" >> "$GITHUB_STEP_SUMMARY"
           echo "| i18n Glossary (zh-CN, ko) | $(status '${{ needs.i18n-glossary-zhcn.result }}') |" >> "$GITHUB_STEP_SUMMARY"
           echo "| PR Test Policy | $(status '${{ needs.pr-test-policy.result }}') |" >> "$GITHUB_STEP_SUMMARY"
@@ -1564,6 +1580,8 @@ jobs:
           echo "| Suite | Status |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Unit | $(status '${{ needs.test-unit.result }}') |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Bun/SQLite | $(status '${{ needs.test-bun-sqlite.result }}') |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Vitest | $(status '${{ needs.test-vitest.result }}') |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Coverage | $(status '${{ needs.test-coverage.result }}') |" >> "$GITHUB_STEP_SUMMARY"
           echo "| PR Coverage Comment | $(status '${{ needs.coverage-pr-comment.result }}') |" >> "$GITHUB_STEP_SUMMARY"
           echo "| E2E | $(status '${{ needs.test-e2e.result }}') |" >> "$GITHUB_STEP_SUMMARY"
@@ -1601,3 +1619,5 @@ jobs:
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "✅ **All translations complete**" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+          node scripts/quality/check-ci-dashboard.mjs
