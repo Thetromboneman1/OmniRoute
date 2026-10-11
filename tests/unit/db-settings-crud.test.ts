@@ -12,6 +12,7 @@ const ORIGINAL_INITIAL_PASSWORD = process.env.INITIAL_PASSWORD;
 const core = await import("../../src/lib/db/core.ts");
 const combosDb = await import("../../src/lib/db/combos.ts");
 const providersDb = await import("../../src/lib/db/providers.ts");
+const proxiesDb = await import("../../src/lib/db/proxies.ts");
 const settingsDb = await import("../../src/lib/db/settings.ts");
 
 async function resetStorage() {
@@ -20,7 +21,7 @@ async function resetStorage() {
   for (let attempt = 0; attempt < 10; attempt++) {
     try {
       if (fs.existsSync(TEST_DATA_DIR)) {
-        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
       break;
     } catch (error: any) {
@@ -42,7 +43,7 @@ test.beforeEach(async () => {
 
 test.after(async () => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 
   if (ORIGINAL_INITIAL_PASSWORD === undefined) {
     delete process.env.INITIAL_PASSWORD;
@@ -62,9 +63,10 @@ test("getSettings exposes defaults and updateSettings persists typed values", as
     label: "task-303",
   });
 
-  assert.equal(defaults.cloudEnabled, false);
+  assert.equal(defaults.cloudEnabled, true);
   assert.equal(defaults.requireLogin, true);
   assert.deepEqual(defaults.hiddenSidebarItems, []);
+  assert.deepEqual(defaults.hiddenSidebarGroupLabels, []);
   assert.equal(defaults.idempotencyWindowMs, 5000);
   assert.equal(defaults.requestRetry, 3);
   assert.equal(defaults.maxRetryIntervalSec, 30);
@@ -201,12 +203,51 @@ test("LKGP values can be set, read and cleared", async () => {
   await settingsDb.setLKGP("combo-a", "model-a", "openai");
   await settingsDb.setLKGP("combo-a", "model-b", "anthropic");
 
-  assert.equal(await settingsDb.getLKGP("combo-a", "model-a"), "openai");
-  assert.equal(await settingsDb.getLKGP("combo-a", "model-b"), "anthropic");
+  assert.deepEqual(await settingsDb.getLKGP("combo-a", "model-a"), { provider: "openai" });
+  assert.deepEqual(await settingsDb.getLKGP("combo-a", "model-b"), { provider: "anthropic" });
 
   settingsDb.clearAllLKGP();
 
   assert.equal(await settingsDb.getLKGP("combo-a", "model-a"), null);
+});
+
+test("LKGP stores and retrieves connectionId", async () => {
+  await settingsDb.setLKGP("combo-c", "model-c", "openai", "conn-abc123");
+
+  const record = await settingsDb.getLKGP("combo-c", "model-c");
+  assert.deepEqual(record, { provider: "openai", connectionId: "conn-abc123" });
+});
+
+test("LKGP without connectionId omits the field", async () => {
+  await settingsDb.setLKGP("combo-d", "model-d", "anthropic");
+
+  const record = await settingsDb.getLKGP("combo-d", "model-d");
+  assert.deepEqual(record, { provider: "anthropic" });
+  assert.equal("connectionId" in (record as object), false);
+});
+
+test("LKGP overwrites connectionId when updated without one", async () => {
+  await settingsDb.setLKGP("combo-e", "model-e", "openai", "conn-old");
+  await settingsDb.setLKGP("combo-e", "model-e", "openai");
+
+  const record = await settingsDb.getLKGP("combo-e", "model-e");
+  assert.deepEqual(record, { provider: "openai" });
+});
+
+test("clearLKGP deletes only the targeted combo/model key", async () => {
+  await settingsDb.setLKGP("combo-f", "model-f", "openai");
+  await settingsDb.setLKGP("combo-f", "model-g", "anthropic");
+
+  await settingsDb.clearLKGP("combo-f", "model-f");
+
+  assert.equal(await settingsDb.getLKGP("combo-f", "model-f"), null);
+  // A sibling key under the same combo must survive.
+  assert.deepEqual(await settingsDb.getLKGP("combo-f", "model-g"), { provider: "anthropic" });
+});
+
+test("clearLKGP on a key with no existing pin does not throw", async () => {
+  await assert.doesNotReject(() => settingsDb.clearLKGP("combo-never-set", "model-never-set"));
+  assert.equal(await settingsDb.getLKGP("combo-never-set", "model-never-set"), null);
 });
 
 test("pricing helpers ignore malformed synced data and LKGP falls back to raw values", async () => {
@@ -234,7 +275,9 @@ test("pricing helpers ignore malformed synced data and LKGP falls back to raw va
 
   assert.equal(pricing["broken-provider"], undefined);
   assert.equal(await settingsDb.getPricingForModel("alias-provider", "missing-model"), null);
-  assert.equal(await settingsDb.getLKGP("combo-raw", "model-raw"), "raw-provider-id");
+  assert.deepEqual(await settingsDb.getLKGP("combo-raw", "model-raw"), {
+    provider: "raw-provider-id",
+  });
 });
 
 test("pricing helpers resolve aliased providers and tolerate no-op resets", async () => {
@@ -463,6 +506,9 @@ test("proxy helpers resolve key, provider, global, and direct paths while tolera
     name: "Proxy Resolution Target",
     apiKey: "sk-proxy-resolution",
   });
+  db.prepare("UPDATE provider_connections SET proxy_enabled = 1 WHERE id = ?").run(
+    (connection as any).id
+  );
 
   await settingsDb.setProxyConfig({
     level: "global",
@@ -534,6 +580,9 @@ test("proxy resolution skips combos without serialized data and falls back to pr
     name: "Proxy Null Combo",
     apiKey: "sk-claude-proxy",
   });
+  db.prepare("UPDATE provider_connections SET proxy_enabled = 1 WHERE id = ?").run(
+    (connection as any).id
+  );
 
   await settingsDb.setProxyForLevel("provider", "claude", {
     type: "https",
@@ -566,6 +615,11 @@ test("proxy resolution matches combo proxies through aliased model entries", asy
     name: "Proxy Alias Combo",
     apiKey: "sk-claude-alias",
   });
+  // Enable proxy on this connection so legacy combo/provider proxy checks work
+  core
+    .getDbInstance()
+    .prepare("UPDATE provider_connections SET proxy_enabled = 1 WHERE id = ?")
+    .run((connection as any).id);
 
   const combo = await combosDb.createCombo({
     name: "combo-aliased-model",
@@ -583,6 +637,60 @@ test("proxy resolution matches combo proxies through aliased model entries", asy
   assert.equal(resolved.level, "combo");
   assert.equal(resolved.levelId, combo.id);
   assert.equal(resolved.proxy.host, "combo-alias.local");
+});
+
+test("proxy resolution prefers legacy key and provider proxies over registry global fallback (#2601)", async () => {
+  const keyConnection = await providersDb.createProviderConnection({
+    provider: "openai",
+    authType: "apikey",
+    name: "Legacy Key Override",
+    apiKey: "sk-key-override",
+  });
+  const providerConnection = await providersDb.createProviderConnection({
+    provider: "claude",
+    authType: "apikey",
+    name: "Legacy Provider Override",
+    apiKey: "sk-provider-override",
+  });
+
+  const registryGlobal = await proxiesDb.createProxy({
+    name: "Registry Global Fallback",
+    type: "http",
+    host: "registry-global.local",
+    port: 8080,
+  });
+  await proxiesDb.assignProxyToScope("global", null, registryGlobal.id);
+
+  // Enable proxy on both connections so legacy key/provider proxy checks work
+  core
+    .getDbInstance()
+    .prepare("UPDATE provider_connections SET proxy_enabled = 1 WHERE id = ?")
+    .run((keyConnection as any).id);
+  core
+    .getDbInstance()
+    .prepare("UPDATE provider_connections SET proxy_enabled = 1 WHERE id = ?")
+    .run((providerConnection as any).id);
+
+  await settingsDb.setProxyForLevel("key", (keyConnection as any).id, {
+    type: "http",
+    host: "legacy-key-override.local",
+    port: 3128,
+  });
+  await settingsDb.setProxyForLevel("provider", "claude", {
+    type: "https",
+    host: "legacy-provider-override.local",
+    port: 443,
+  });
+
+  const keyResolved = await settingsDb.resolveProxyForConnection((keyConnection as any).id);
+  const providerResolved = await settingsDb.resolveProxyForConnection(
+    (providerConnection as any).id
+  );
+
+  assert.equal(keyResolved.level, "key");
+  assert.equal(keyResolved.proxy.host, "legacy-key-override.local");
+  assert.equal(providerResolved.level, "provider");
+  assert.equal(providerResolved.proxy.host, "legacy-provider-override.local");
 });
 
 test("proxy readers normalize legacy rows, skip malformed entries, and coerce invalid globals to null", async () => {
@@ -774,7 +882,7 @@ test("cache metrics and trend coerce null aggregate fields to zero", async () =>
       };
     }
 
-    if (text.includes("GROUP BY 'direct'")) {
+    if (text.includes("GROUP BY combo_strategy")) {
       return {
         all: () => [
           {

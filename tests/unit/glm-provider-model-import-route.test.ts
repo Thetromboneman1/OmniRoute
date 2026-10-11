@@ -4,6 +4,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+// #10603 made upstream model sync opt-in (isAutoFetchModelsEnabled() now requires
+// providerSpecificData.autoFetchModels === true) so remote discovery doesn't overwrite
+// manual catalog overrides by default. Every connection below sets it explicitly so the
+// mocked `fetch` in each test actually gets called — without it, the route short-circuits
+// to the local/cached catalog before ever reaching the network call these tests assert on.
+
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-glm-models-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
 
@@ -13,13 +19,13 @@ const modelsRoute = await import("../../src/app/api/providers/[id]/models/route.
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
 test.after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("GLM import uses international coding endpoint when apiRegion is international", async () => {
@@ -29,7 +35,7 @@ test("GLM import uses international coding endpoint when apiRegion is internatio
     authType: "apikey",
     name: "glm-intl",
     apiKey: "glm-key",
-    providerSpecificData: { apiRegion: "international" },
+    providerSpecificData: { apiRegion: "international", autoFetchModels: true },
   });
 
   const originalFetch = globalThis.fetch;
@@ -58,6 +64,148 @@ test("GLM import uses international coding endpoint when apiRegion is internatio
   }
 });
 
+test("GLM import normalizes custom coding models URLs without duplicating endpoints", async () => {
+  await resetStorage();
+  // Distinct apiKeys per connection: createProviderConnection dedups by decrypted
+  // key value (#3023), so a shared key would collapse these two custom-endpoint
+  // connections into one and the second would serve from the first's cached
+  // catalog (only one discovery fetch instead of two).
+  const cases = [
+    {
+      baseUrl: "https://api.z.ai/api/coding/paas/v4",
+      expectedUrl: "https://api.z.ai/api/coding/paas/v4/models",
+      apiKey: "glm-key-0",
+    },
+    {
+      baseUrl: "https://api.z.ai/api/coding/paas/v4/models",
+      expectedUrl: "https://api.z.ai/api/coding/paas/v4/models",
+      apiKey: "glm-key-1",
+    },
+  ];
+
+  const originalFetch = globalThis.fetch;
+  const seenUrls: string[] = [];
+  const connections = [];
+
+  for (const [index, testCase] of cases.entries()) {
+    connections.push(
+      await providersDb.createProviderConnection({
+        provider: "glm",
+        authType: "apikey",
+        name: `glm-custom-${index}`,
+        apiKey: testCase.apiKey,
+        providerSpecificData: { baseUrl: testCase.baseUrl, autoFetchModels: true },
+      })
+    );
+  }
+
+  globalThis.fetch = async (url, init = {}) => {
+    const expected = cases[seenUrls.length];
+    assert.ok(expected, `unexpected GLM discovery call to ${String(url)}`);
+    assert.equal(String(url), expected.expectedUrl);
+    assert.equal(init.headers.Authorization, `Bearer ${expected.apiKey}`);
+    assert.equal(init.headers["x-api-key"], undefined);
+    assert.equal(init.headers["anthropic-version"], undefined);
+    seenUrls.push(String(url));
+    return Response.json({ data: [{ id: "glm-5", name: "GLM 5" }] });
+  };
+
+  try {
+    for (const connection of connections) {
+      const response = await modelsRoute.GET(
+        new Request(`http://localhost/api/providers/${connection.id}/models`),
+        { params: { id: connection.id } }
+      );
+      assert.equal(response.status, 200);
+    }
+
+    assert.deepEqual(
+      seenUrls,
+      cases.map((testCase) => testCase.expectedUrl)
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("GLM import falls back to Anthropic model discovery when coding discovery fails", async () => {
+  await resetStorage();
+  const connection = await providersDb.createProviderConnection({
+    provider: "glm",
+    authType: "apikey",
+    name: "glm-discovery-fallback",
+    apiKey: "glm-key",
+    providerSpecificData: { apiRegion: "international", autoFetchModels: true },
+  });
+
+  const originalFetch = globalThis.fetch;
+  const seenUrls: string[] = [];
+  globalThis.fetch = async (url, init = {}) => {
+    seenUrls.push(String(url));
+    if (seenUrls.length === 1) {
+      assert.equal(String(url), "https://api.z.ai/api/coding/paas/v4/models");
+      assert.equal(init.headers.Authorization, "Bearer glm-key");
+      assert.equal(init.headers["x-api-key"], undefined);
+      return new Response(JSON.stringify({ error: "bad gateway" }), { status: 502 });
+    }
+
+    assert.equal(String(url), "https://api.z.ai/api/anthropic/v1/models");
+    assert.equal(init.headers.Authorization, undefined);
+    assert.equal(init.headers["x-api-key"], "glm-key");
+    assert.equal(init.headers["anthropic-version"], "2023-06-01");
+    return Response.json({ data: [{ id: "glm-5.1", name: "GLM 5.1" }] });
+  };
+
+  try {
+    const response = await modelsRoute.GET(
+      new Request(`http://localhost/api/providers/${connection.id}/models`),
+      { params: { id: connection.id } }
+    );
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      provider: "glm",
+      connectionId: connection.id,
+      models: [{ id: "glm-5.1", name: "GLM 5.1" }],
+      source: "api",
+    });
+    assert.deepEqual(seenUrls, [
+      "https://api.z.ai/api/coding/paas/v4/models",
+      "https://api.z.ai/api/anthropic/v1/models",
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("GLM import preserves auth failures instead of falling back across transports", async () => {
+  await resetStorage();
+  const connection = await providersDb.createProviderConnection({
+    provider: "glm",
+    authType: "apikey",
+    name: "glm-auth-fail",
+    apiKey: "bad-key",
+    providerSpecificData: { apiRegion: "international", autoFetchModels: true },
+  });
+
+  const originalFetch = globalThis.fetch;
+  const seenUrls: string[] = [];
+  globalThis.fetch = async (url) => {
+    seenUrls.push(String(url));
+    return new Response(JSON.stringify({ error: "invalid api key" }), { status: 401 });
+  };
+
+  try {
+    const response = await modelsRoute.GET(
+      new Request(`http://localhost/api/providers/${connection.id}/models?refresh=true`),
+      { params: { id: connection.id } }
+    );
+    assert.equal(response.status, 401);
+    assert.deepEqual(seenUrls, ["https://api.z.ai/api/coding/paas/v4/models"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("GLMT import shares the GLM coding models endpoint and surfaces provider metadata correctly", async () => {
   await resetStorage();
   const connection = await providersDb.createProviderConnection({
@@ -65,7 +213,7 @@ test("GLMT import shares the GLM coding models endpoint and surfaces provider me
     authType: "apikey",
     name: "glmt-intl",
     apiKey: "glmt-key",
-    providerSpecificData: { apiRegion: "international" },
+    providerSpecificData: { apiRegion: "international", autoFetchModels: true },
   });
 
   const originalFetch = globalThis.fetch;
@@ -99,7 +247,7 @@ test("GLM import uses China coding endpoint when apiRegion is china", async () =
     authType: "apikey",
     name: "glm-cn",
     apiKey: "glm-cn-key",
-    providerSpecificData: { apiRegion: "china" },
+    providerSpecificData: { apiRegion: "china", autoFetchModels: true },
   });
 
   const originalFetch = globalThis.fetch;
@@ -123,6 +271,38 @@ test("GLM import uses China coding endpoint when apiRegion is china", async () =
   }
 });
 
+test("GLM China provider import uses the specialized GLM discovery path", async () => {
+  await resetStorage();
+  const connection = await providersDb.createProviderConnection({
+    provider: "glm-cn",
+    authType: "apikey",
+    name: "glm-cn-provider",
+    apiKey: "glm-cn-key",
+    providerSpecificData: { autoFetchModels: true },
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init = {}) => {
+    assert.equal(String(url), "https://open.bigmodel.cn/api/coding/paas/v4/models");
+    assert.equal(init.headers.Authorization, "Bearer glm-cn-key");
+    assert.equal(init.headers["x-api-key"], undefined);
+    return Response.json({ data: [{ id: "glm-5", name: "GLM 5" }] });
+  };
+
+  try {
+    const response = await modelsRoute.GET(
+      new Request(`http://localhost/api/providers/${connection.id}/models`),
+      { params: { id: connection.id } }
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as any;
+    assert.equal(body.provider, "glm-cn");
+    assert.deepEqual(body.models, [{ id: "glm-5", name: "GLM 5" }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("GLM import defaults to international endpoint when apiRegion is missing", async () => {
   await resetStorage();
   const connection = await providersDb.createProviderConnection({
@@ -130,7 +310,7 @@ test("GLM import defaults to international endpoint when apiRegion is missing", 
     authType: "apikey",
     name: "glm-default",
     apiKey: "glm-key",
-    providerSpecificData: {},
+    providerSpecificData: { autoFetchModels: true },
   });
 
   const originalFetch = globalThis.fetch;
@@ -157,7 +337,7 @@ test("GLM import defaults to international endpoint when apiRegion is invalid", 
     authType: "apikey",
     name: "glm-bogus",
     apiKey: "glm-key",
-    providerSpecificData: { apiRegion: "bogus" },
+    providerSpecificData: { apiRegion: "bogus", autoFetchModels: true },
   });
 
   const originalFetch = globalThis.fetch;
@@ -185,7 +365,7 @@ test("GLM import prefers apiKey over accessToken and sends only Authorization Be
     name: "glm-both-tokens",
     apiKey: "glm-api-key",
     accessToken: "glm-access-token",
-    providerSpecificData: { apiRegion: "international" },
+    providerSpecificData: { apiRegion: "international", autoFetchModels: true },
   });
 
   const originalFetch = globalThis.fetch;
@@ -213,7 +393,7 @@ test("GLM import falls back to accessToken when apiKey is absent", async () => {
     authType: "apikey",
     name: "glm-access-only",
     accessToken: "glm-access-token",
-    providerSpecificData: { apiRegion: "international" },
+    providerSpecificData: { apiRegion: "international", autoFetchModels: true },
   });
 
   const originalFetch = globalThis.fetch;
@@ -240,7 +420,7 @@ test("GLM import falls back to the local catalog on upstream non-OK status codes
     authType: "apikey",
     name: "glm-error",
     apiKey: "glm-key",
-    providerSpecificData: { apiRegion: "international" },
+    providerSpecificData: { apiRegion: "international", autoFetchModels: true },
   });
 
   const originalFetch = globalThis.fetch;

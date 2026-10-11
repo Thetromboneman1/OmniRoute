@@ -84,9 +84,9 @@ function ensureLegacyMemoryTable() {
   `);
 }
 
-async function waitForAsyncMemoryFlush() {
-  await new Promise((resolve) => setImmediate(resolve));
-  await new Promise((resolve) => setTimeout(resolve, 10));
+async function flushAsyncSideEffects() {
+  // setImmediate rounds drain the event loop more reliably than setTimeout under CI load.
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
 }
 
 async function invokeChatCore({
@@ -102,9 +102,15 @@ async function invokeChatCore({
 } = {}) {
   const originalFetch = globalThis.fetch;
   const calls = [];
+  const nextcloudJsonOnlyClient = /nextcloud\s+openai\/localai\s+integration/i.test(userAgent);
+  const jsonStreamDefault = apiKeyInfo?.streamDefaultMode === "json";
   const resolvedStream =
     body?.stream === true ||
-    (body?.stream === undefined && String(accept).toLowerCase().includes("text/event-stream"));
+    (body?.stream === undefined && String(accept).toLowerCase().includes("text/event-stream")) ||
+    (body?.stream === undefined &&
+      !nextcloudJsonOnlyClient &&
+      !jsonStreamDefault &&
+      !String(accept).includes("json"));
 
   globalThis.fetch = async (url, init = {}) => {
     const parsedBody = init.body ? JSON.parse(String(init.body)) : null;
@@ -128,7 +134,7 @@ async function invokeChatCore({
       clientRawRequest: {
         endpoint,
         body: structuredClone(body),
-        headers: new Headers({ accept }),
+        headers: new Headers({ accept, "user-agent": userAgent }),
       },
       apiKeyInfo,
       userAgent,
@@ -146,7 +152,7 @@ test.after(() => {
     db.close();
   } catch {}
 
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("chatCore sanitization normalizes max_output_tokens into max_tokens", async () => {
@@ -172,7 +178,7 @@ test("chatCore sanitization normalizes max_output_tokens into max_tokens", async
     },
   });
 
-  assert.equal(copied.call.body.max_tokens, 0);
+  assert.equal(copied.call.body.max_tokens, undefined);
   assert.equal("max_output_tokens" in copied.call.body, false);
   assert.equal(preserved.call.body.max_tokens, 7);
   assert.equal("max_output_tokens" in preserved.call.body, false);
@@ -278,6 +284,112 @@ test("chatCore sanitization preserves max_output_tokens for openai-responses tar
   );
 });
 
+test("chatCore preserves Chat max_tokens as max_output_tokens for Perplexity Agent Anthropic models", async () => {
+  const { call, result } = await invokeChatCore({
+    endpoint: "/v1/chat/completions",
+    provider: "perplexity-agent",
+    model: "anthropic/claude-opus-4-5",
+    body: {
+      model: "anthropic/claude-opus-4-5",
+      max_tokens: 32,
+      messages: [{ role: "user", content: "Reply with OK only." }],
+    },
+    responseFactory: () =>
+      new Response(
+        JSON.stringify({
+          id: "resp_pplx_agent",
+          object: "response",
+          status: "completed",
+          model: "anthropic/claude-opus-4-5",
+          output: [
+            { type: "message", role: "assistant", content: [{ type: "output_text", text: "OK" }] },
+          ],
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      ),
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(call.url, "https://api.perplexity.ai/v1/responses");
+  assert.equal(call.body.model, "anthropic/claude-opus-4-5");
+  assert.equal(call.body.max_output_tokens, 32);
+  assert.equal("max_tokens" in call.body, false);
+  assert.equal("max_completion_tokens" in call.body, false);
+});
+
+test("chatCore defaults max_output_tokens for Perplexity Agent Anthropic chat requests", async () => {
+  const { call, result } = await invokeChatCore({
+    endpoint: "/v1/chat/completions",
+    provider: "perplexity-agent",
+    model: "anthropic/claude-opus-4-5",
+    body: {
+      model: "anthropic/claude-opus-4-5",
+      messages: [{ role: "user", content: "hi" }],
+    },
+    responseFactory: () =>
+      new Response(
+        JSON.stringify({
+          id: "resp_pplx_agent_default_tokens",
+          object: "response",
+          status: "completed",
+          model: "anthropic/claude-opus-4-5",
+          output: [
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "Hello!" }],
+            },
+          ],
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      ),
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(call.url, "https://api.perplexity.ai/v1/responses");
+  assert.equal(call.body.max_output_tokens, 4096);
+  assert.equal("max_tokens" in call.body, false);
+  assert.equal("max_completion_tokens" in call.body, false);
+});
+
+test("chatCore defaults max_output_tokens for Perplexity Agent Kimi chat requests", async () => {
+  const { call, result } = await invokeChatCore({
+    endpoint: "/v1/chat/completions",
+    provider: "perplexity-agent",
+    model: "perplexity/kimi-k3",
+    body: {
+      model: "perplexity/kimi-k3",
+      messages: [{ role: "user", content: "hi" }],
+    },
+    responseFactory: () =>
+      new Response(
+        JSON.stringify({
+          id: "resp_pplx_agent_kimi_default_tokens",
+          object: "response",
+          status: "completed",
+          model: "perplexity/kimi-k3",
+          output: [
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "Hello!" }],
+            },
+          ],
+          usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      ),
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(call.url, "https://api.perplexity.ai/v1/responses");
+  assert.equal(call.body.max_output_tokens, 4096);
+  assert.equal("max_tokens" in call.body, false);
+  assert.equal("max_completion_tokens" in call.body, false);
+});
+
 test("chatCore sanitization strips empty message names and filters empty tool names", async () => {
   // Note: `input` field is tested separately because its presence triggers
   // Responses format detection (PR #1002), which changes message handling.
@@ -301,13 +413,12 @@ test("chatCore sanitization strips empty message names and filters empty tool na
   assert.equal(call.body.messages[0].name, undefined);
   assert.equal(call.body.messages[1].name, "valid-name");
   // 3 invalid tools removed: 2 empty function names + 1 empty anthropic name
-  // 2 valid remain: lookup_weather (function) + anthropic_lookup (anthropic-format)
+  // 2 valid remain (sorted alphabetically): anthropic_lookup + lookup_weather
   assert.equal(call.body.tools.length, 2);
-  assert.equal(call.body.tools[0].function.name, "lookup_weather");
-  // The second tool (anthropic-format) may be wrapped in .function by the translator
-  // or preserved as-is with .name; check whichever is available
-  const tool2Name = call.body.tools[1].function?.name ?? call.body.tools[1].name;
-  assert.equal(tool2Name, "anthropic_lookup");
+  const tool0Name = call.body.tools[0].function?.name ?? call.body.tools[0].name;
+  assert.equal(tool0Name, "anthropic_lookup");
+  const tool1Name = call.body.tools[1].function?.name ?? call.body.tools[1].name;
+  assert.equal(tool1Name, "lookup_weather");
 });
 
 test("chatCore sanitization strips empty input item names on responses endpoint", async () => {
@@ -431,17 +542,19 @@ test("chatCore sanitization normalizes mixed content blocks and removes unsuppor
     textBlocks.some((block) => block.text === "[draft.txt]\nDraft text"),
     true
   );
+  // Orphaned tool_result blocks (no matching tool_use anywhere in the request) are
+  // stripped by `stripOrphanedToolResults` (#5805) before reaching content normalization,
+  // to avoid strict-upstream 400s. They are therefore removed entirely — neither preserved
+  // as tool_result blocks nor inlined as "[Tool Result: …]" text.
   assert.equal(
-    textBlocks.some((block) => block.text === "[Tool Result: tool-1]\ndone"),
-    true
+    content.some((block) => block.type === "tool_result"),
+    false
   );
   assert.equal(
-    textBlocks.some((block) => block.text === "[Tool Result: tool-2]\nstructured result"),
-    true
-  );
-  assert.equal(
-    textBlocks.some((block) => block.text === '[Tool Result: tool-3]\n{"status":"ok","count":2}'),
-    true
+    textBlocks.some(
+      (block) => typeof block.text === "string" && block.text.includes("[Tool Result:")
+    ),
+    false
   );
 });
 
@@ -506,6 +619,45 @@ test("chatCore resolves stream mode from body.stream and Accept header", async (
   assert.equal(explicitFalse.call.headers.Accept, "application/json");
   assert.equal(acceptDriven.call.headers.Accept, "text/event-stream");
   assert.equal(jsonDefault.call.headers.Accept, "application/json");
+});
+
+test("chatCore treats Nextcloud OpenAI integration requests as non-streaming by default", async () => {
+  const nextcloudDefault = await invokeChatCore({
+    accept: "*/*",
+    userAgent: "Nextcloud OpenAI/LocalAI integration",
+    body: { model: "gpt-4o-mini", messages: [{ role: "user", content: "hello" }] },
+  });
+  const nextcloudExplicitStream = await invokeChatCore({
+    accept: "application/json",
+    userAgent: "Nextcloud OpenAI/LocalAI integration",
+    body: { model: "gpt-4o-mini", stream: true, messages: [{ role: "user", content: "hello" }] },
+  });
+
+  assert.equal(nextcloudDefault.call.headers.Accept, "application/json");
+  assert.equal(nextcloudDefault.result.response.headers.get("content-type"), "application/json");
+  assert.equal(nextcloudExplicitStream.call.headers.Accept, "text/event-stream");
+});
+
+test("chatCore honors API key JSON stream-default compatibility mode", async () => {
+  const jsonCompatibleDefault = await invokeChatCore({
+    accept: "*/*",
+    userAgent: "generic-openai-client",
+    apiKeyInfo: { id: "json-stream-default-key", streamDefaultMode: "json" },
+    body: { model: "gpt-4o-mini", messages: [{ role: "user", content: "hello" }] },
+  });
+  const explicitSse = await invokeChatCore({
+    accept: "text/event-stream",
+    userAgent: "generic-openai-client",
+    apiKeyInfo: { id: "json-stream-default-key", streamDefaultMode: "json" },
+    body: { model: "gpt-4o-mini", messages: [{ role: "user", content: "hello" }] },
+  });
+
+  assert.equal(jsonCompatibleDefault.call.headers.Accept, "application/json");
+  assert.equal(
+    jsonCompatibleDefault.result.response.headers.get("content-type"),
+    "application/json"
+  );
+  assert.equal(explicitSse.call.headers.Accept, "text/event-stream");
 });
 
 test("chatCore injects memories when enabled and memories are found", async () => {
@@ -600,7 +752,7 @@ test("chatCore does not share or persist memories when apiKeyInfo is missing", a
     },
   });
 
-  await waitForAsyncMemoryFlush();
+  await flushAsyncSideEffects();
 
   const localMemoriesResult = await listMemories({ apiKeyId: "local" });
   const localMemories = Array.isArray(localMemoriesResult)
@@ -704,7 +856,7 @@ test("chatCore extracts memories from Claude content arrays and Responses output
 
   assert.equal(responsesResult.result.success, true);
 
-  await waitForAsyncMemoryFlush();
+  await flushAsyncSideEffects();
 
   const claudeMemoriesResult = await listMemories({ apiKeyId: claudeKeyId });
   const responsesMemoriesResult = await listMemories({ apiKeyId: responsesKeyId });
@@ -772,7 +924,7 @@ test("chatCore request memory extraction for responses input ignores assistant i
 
   assert.equal(responsesResult.result.success, true);
 
-  await waitForAsyncMemoryFlush();
+  await flushAsyncSideEffects();
 
   const memoriesResult = await listMemories({ apiKeyId: responsesKeyId });
   const memories = Array.isArray(memoriesResult) ? memoriesResult : (memoriesResult.data ?? []);

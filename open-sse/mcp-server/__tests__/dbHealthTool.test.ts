@@ -13,9 +13,13 @@ vi.mock("../audit.ts", () => ({
   logToolCall: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock("../../../src/lib/db/core.ts", () => ({
-  runManagedDbHealthCheck: mockRunManagedDbHealthCheck,
-}));
+vi.mock("../../../src/lib/db/core.ts", async (importOriginal) => {
+  const actual = await importOriginal<any>();
+  return {
+    ...actual,
+    runManagedDbHealthCheck: mockRunManagedDbHealthCheck,
+  };
+});
 
 describe("omniroute_db_health_check MCP tool", () => {
   let client: Client;
@@ -23,7 +27,7 @@ describe("omniroute_db_health_check MCP tool", () => {
   beforeEach(async () => {
     mockFetch.mockReset();
     mockRunManagedDbHealthCheck.mockReset();
-    mockRunManagedDbHealthCheck.mockReturnValue({
+    mockRunManagedDbHealthCheck.mockResolvedValue({
       isHealthy: false,
       issues: [{ type: "broken_reference", table: "combos", description: "broken", count: 1 }],
       repairedCount: 1,

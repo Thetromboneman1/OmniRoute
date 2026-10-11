@@ -17,15 +17,61 @@ import {
   mergeUpstreamExtraHeaders,
   mergeAbortSignals,
   type ExecuteInput,
+  type ExecutorLog,
 } from "./base.ts";
-import { FETCH_TIMEOUT_MS } from "../config/constants.ts";
-import { extractCookieValue } from "@/lib/providers/webCookieAuth";
+import { FETCH_TIMEOUT_MS, STREAM_READINESS_TIMEOUT_MS } from "../config/constants.ts";
+import { buildGrokCookieHeader } from "@/lib/providers/webCookieAuth";
+import {
+  tlsFetchGrok,
+  TlsClientUnavailableError,
+  isCloudflareChallenge,
+  type TlsFetchResult,
+} from "../services/grokTlsClient.ts";
+import { buildErrorBody, sanitizeErrorMessage } from "../utils/error.ts";
+import { ensureStreamReadiness } from "../utils/streamReadiness.ts";
+import {
+  shouldUseGrokBrowserBacked,
+  acquireFreshGrokClearance,
+} from "../services/grokClearance.ts";
+import type { GrokStreamEvent } from "./grok-web/types.ts";
+import {
+  type OpenAIToolCall,
+  type GrokToolRegistry,
+  buildGrokToolRegistry,
+  buildGrokMessage,
+  parseClientToolCallMarkup,
+  hasOpenToolCallMarkup,
+} from "./grok-web/tool-bridge.ts";
+import { mapGrokNativeToolToOpenAI } from "./grok-web/native-tools.ts";
+import {
+  GrokMarkupFilter,
+  cleanGrokContentText,
+  cleanGrokThinkingText,
+  extractStructuredReasoning,
+} from "./grok-web/text-cleanup.ts";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const GROK_CHAT_API = "https://grok.com/rest/app-chat/conversations/new";
 const GROK_USER_AGENT =
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+const GROK_PUBLIC_UPSTREAM_ERROR = "Grok upstream error";
+
+function sanitizeGrokUpstreamError(message: unknown): string {
+  const sanitized = sanitizeErrorMessage(message);
+  return sanitized.trim() && !/^(?:[A-Za-z_$][\w$]*)?Error:\s*$/.test(sanitized)
+    ? sanitized
+    : GROK_PUBLIC_UPSTREAM_ERROR;
+}
+
+function isTlsClientUnavailableError(error: unknown): error is TlsClientUnavailableError {
+  try {
+    return error instanceof TlsClientUnavailableError;
+  } catch {
+    // A rejected Proxy may throw while instanceof walks its prototype chain.
+    return false;
+  }
+}
 
 // ─── Model mappings ─────────────────────────────────────────────────────────
 // Grok Web exposes UI modes, not stable public model IDs. Keep OmniRoute model
@@ -82,73 +128,6 @@ function randomHex(bytes: number): string {
   return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// ─── OpenAI message → Grok query translation ───────────────────────────────
-
-function parseOpenAIMessages(messages: Array<Record<string, unknown>>): string {
-  const parts: string[] = [];
-  let lastUserIdx = -1;
-
-  // Extract text from each message
-  const extracted: Array<{ role: string; text: string }> = [];
-
-  for (const msg of messages) {
-    let role = String(msg.role || "user");
-    if (role === "developer") role = "system";
-
-    let content = "";
-    if (typeof msg.content === "string") {
-      content = msg.content;
-    } else if (Array.isArray(msg.content)) {
-      content = (msg.content as Array<Record<string, unknown>>)
-        .filter((c) => c.type === "text")
-        .map((c) => String(c.text || ""))
-        .join(" ");
-    }
-    if (!content.trim()) continue;
-    extracted.push({ role, text: content });
-  }
-
-  // Find last user message index
-  for (let i = extracted.length - 1; i >= 0; i--) {
-    if (extracted[i].role === "user") {
-      lastUserIdx = i;
-      break;
-    }
-  }
-
-  // Build combined message — last user message is raw, others are prefixed
-  for (let i = 0; i < extracted.length; i++) {
-    const { role, text } = extracted[i];
-    if (i === lastUserIdx) {
-      parts.push(text);
-    } else {
-      parts.push(`${role}: ${text}`);
-    }
-  }
-
-  return parts.join("\n\n");
-}
-
-// ─── NDJSON stream types ────────────────────────────────────────────────────
-
-interface GrokStreamResponse {
-  token?: string;
-  responseId?: string;
-  llmInfo?: { modelHash?: string };
-  modelResponse?: {
-    message?: string;
-    responseId?: string;
-    generatedImageUrls?: string[];
-    metadata?: { llm_info?: { modelHash?: string } };
-    pipelineToken?: string;
-  };
-}
-
-interface GrokStreamEvent {
-  result?: { response?: GrokStreamResponse };
-  error?: { message?: string; code?: string };
-}
-
 // ─── NDJSON parsing ─────────────────────────────────────────────────────────
 
 async function* readGrokNdjsonEvents(
@@ -158,12 +137,29 @@ async function* readGrokNdjsonEvents(
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let reachedEnd = false;
+  let cancelRequested = false;
+
+  const requestReaderCancel = (reason?: unknown) => {
+    if (cancelRequested || reachedEnd) return;
+    cancelRequested = true;
+    // Cancellation must release the upstream promptly even when a provider's
+    // underlying cancel promise never settles.
+    void reader.cancel(reason).catch(() => {});
+  };
+  const handleAbort = () => requestReaderCancel(signal?.reason);
+
+  if (signal?.aborted) requestReaderCancel(signal.reason);
+  else signal?.addEventListener("abort", handleAbort, { once: true });
 
   try {
     while (true) {
       if (signal?.aborted) return;
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) {
+        reachedEnd = true;
+        break;
+      }
       buffer += decoder.decode(value, { stream: true });
 
       while (true) {
@@ -181,6 +177,8 @@ async function* readGrokNdjsonEvents(
       }
     }
 
+    if (signal?.aborted) return;
+
     // Flush remaining buffer
     buffer += decoder.decode();
     const remaining = buffer.trim();
@@ -192,7 +190,11 @@ async function* readGrokNdjsonEvents(
       }
     }
   } finally {
-    reader.releaseLock();
+    signal?.removeEventListener("abort", handleAbort);
+    if (!reachedEnd) requestReaderCancel(signal?.reason ?? "Grok stream reader closed early");
+    try {
+      reader.releaseLock();
+    } catch {}
   }
 }
 
@@ -201,6 +203,7 @@ async function* readGrokNdjsonEvents(
 interface ContentChunk {
   delta?: string;
   thinking?: string;
+  toolCalls?: OpenAIToolCall[];
   fingerprint?: string;
   responseId?: string;
   fullMessage?: string;
@@ -211,11 +214,16 @@ interface ContentChunk {
 async function* extractContent(
   eventStream: ReadableStream<Uint8Array>,
   isThinkingModel: boolean,
-  signal?: AbortSignal | null
+  toolRegistry: GrokToolRegistry,
+  signal?: AbortSignal | null,
+  suppressThinkingAfterVisibleContent = false
 ): AsyncGenerator<ContentChunk> {
   let fingerprint = "";
   let responseId = "";
-  let thinkOpened = false;
+  const contentFilter = new GrokMarkupFilter();
+  const thinkingFilter = new GrokMarkupFilter();
+  let emittedThinking = "";
+  let emittedVisibleContent = false;
 
   for await (const event of readGrokNdjsonEvents(eventStream, signal)) {
     // Error handling
@@ -235,21 +243,37 @@ async function* extractContent(
       responseId = resp.responseId;
     }
 
+    const nativeToolCall = mapGrokNativeToolToOpenAI(resp, toolRegistry);
+    if (nativeToolCall) {
+      yield { toolCalls: [nativeToolCall], fingerprint, responseId };
+      return;
+    }
+
+    if (resp.messageTag === "raw_function_result" || resp.messageTag === "tool_usage_card") {
+      continue;
+    }
+
     // modelResponse = final/complete response
     if (resp.modelResponse) {
       const mr = resp.modelResponse;
 
-      // Close thinking block if open
-      if (thinkOpened && isThinkingModel) {
-        if (mr.message) {
-          yield { thinking: mr.message };
+      const finalThinking = isThinkingModel ? extractStructuredReasoning(mr) : "";
+      if ((!suppressThinkingAfterVisibleContent || !emittedVisibleContent) && finalThinking) {
+        const cleanedThinking = thinkingFilter.feed(finalThinking);
+        const thinkingDelta = cleanedThinking.startsWith(emittedThinking)
+          ? cleanedThinking.slice(emittedThinking.length)
+          : cleanedThinking;
+        if (thinkingDelta) {
+          emittedThinking += thinkingDelta;
+          yield { thinking: thinkingDelta };
         }
-        thinkOpened = false;
       }
 
       // Extract final message
       if (mr.message) {
-        yield { fullMessage: mr.message, fingerprint, responseId };
+        const fullMessage = cleanGrokContentText(mr.message);
+        if (fullMessage) emittedVisibleContent = true;
+        yield { fullMessage, fingerprint, responseId };
       }
 
       // Extract fingerprint from metadata
@@ -260,10 +284,47 @@ async function* extractContent(
     }
 
     // Streaming token
+    const thinking = isThinkingModel ? extractStructuredReasoning(resp) : "";
+    if ((!suppressThinkingAfterVisibleContent || !emittedVisibleContent) && thinking) {
+      const cleanedThinking = thinkingFilter.feed(thinking);
+      const thinkingDelta = cleanedThinking.startsWith(emittedThinking)
+        ? cleanedThinking.slice(emittedThinking.length)
+        : cleanedThinking;
+      if (thinkingDelta) {
+        emittedThinking += thinkingDelta;
+        yield { thinking: thinkingDelta, fingerprint, responseId };
+      }
+    }
     if (resp.token != null) {
-      yield { delta: resp.token, fingerprint, responseId };
+      if (resp.isThinking) {
+        const thinkingDelta =
+          suppressThinkingAfterVisibleContent && emittedVisibleContent
+            ? ""
+            : cleanGrokThinkingText(resp);
+        if (thinkingDelta) yield { thinking: thinkingDelta, fingerprint, responseId };
+        continue;
+      }
+      const cleanedDelta = contentFilter.feed(resp.token);
+      if (cleanedDelta) {
+        emittedVisibleContent = true;
+        yield { delta: cleanedDelta, fingerprint, responseId };
+      }
     }
   }
+
+  if (signal?.aborted) return;
+
+  const trailingThinking =
+    suppressThinkingAfterVisibleContent && emittedVisibleContent ? "" : thinkingFilter.flush();
+  if (trailingThinking) {
+    const thinkingDelta = trailingThinking.startsWith(emittedThinking)
+      ? trailingThinking.slice(emittedThinking.length)
+      : trailingThinking;
+    if (thinkingDelta) yield { thinking: thinkingDelta, fingerprint, responseId };
+  }
+  const trailingContent = contentFilter.flush();
+  const trailingContentWithTrace = trailingContent;
+  if (trailingContentWithTrace) yield { delta: trailingContentWithTrace, fingerprint, responseId };
 
   yield { done: true, fingerprint, responseId };
 }
@@ -274,41 +335,102 @@ function sseChunk(data: unknown): string {
   return `data: ${JSON.stringify(data)}\n\n`;
 }
 
+const GROK_STREAM_FAILURE_MESSAGE = "Grok upstream stream failed";
+const GROK_STREAM_FAILURE_CODE = "GROK_STREAM_ERROR";
+
+function grokStreamErrorChunk(): string {
+  return sseChunk(
+    buildErrorBody(502, GROK_STREAM_FAILURE_MESSAGE, undefined, {
+      type: "upstream_error",
+      code: GROK_STREAM_FAILURE_CODE,
+    })
+  );
+}
+
+function grokStreamFailure(): Error & { statusCode: number; code: string } {
+  return Object.assign(new Error(GROK_STREAM_FAILURE_MESSAGE), {
+    statusCode: 502,
+    code: GROK_STREAM_FAILURE_CODE,
+  });
+}
+
+function enqueueStreamingToolCalls(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder,
+  params: {
+    id: string;
+    created: number;
+    model: string;
+    fingerprint: string;
+    toolCalls: OpenAIToolCall[];
+  }
+): void {
+  for (let i = 0; i < params.toolCalls.length; i++) {
+    controller.enqueue(
+      encoder.encode(
+        sseChunk({
+          id: params.id,
+          object: "chat.completion.chunk",
+          created: params.created,
+          model: params.model,
+          system_fingerprint: params.fingerprint || null,
+          choices: [
+            {
+              index: 0,
+              delta: { tool_calls: [{ index: i, ...params.toolCalls[i] }] },
+              finish_reason: null,
+              logprobs: null,
+            },
+          ],
+        })
+      )
+    );
+  }
+  controller.enqueue(
+    encoder.encode(
+      sseChunk({
+        id: params.id,
+        object: "chat.completion.chunk",
+        created: params.created,
+        model: params.model,
+        system_fingerprint: params.fingerprint || null,
+        choices: [{ index: 0, delta: {}, finish_reason: "tool_calls", logprobs: null }],
+      })
+    )
+  );
+  controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+}
+
 function buildStreamingResponse(
   eventStream: ReadableStream<Uint8Array>,
   model: string,
   cid: string,
   created: number,
   isThinkingModel: boolean,
+  toolRegistry: GrokToolRegistry,
   signal?: AbortSignal | null
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
+  const streamAbortController = new AbortController();
+  const requestStreamCancel = (reason?: unknown) => {
+    if (!streamAbortController.signal.aborted) streamAbortController.abort(reason);
+  };
+  const handleParentAbort = () => requestStreamCancel(signal?.reason);
 
-  return new ReadableStream({
-    async start(controller) {
-      try {
-        // Initial role chunk
-        controller.enqueue(
-          encoder.encode(
-            sseChunk({
-              id: cid,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              system_fingerprint: null,
-              choices: [
-                { index: 0, delta: { role: "assistant" }, finish_reason: null, logprobs: null },
-              ],
-            })
-          )
-        );
+  if (signal?.aborted) requestStreamCancel(signal.reason);
+  else signal?.addEventListener("abort", handleParentAbort, { once: true });
 
-        let fp = "";
+  return new ReadableStream(
+    {
+      async start(controller) {
+        let roleSent = false;
+        let firstOutputHandedOff = false;
+        try {
+          let fp = "";
+          let buffered = "";
 
-        for await (const chunk of extractContent(eventStream, isThinkingModel, signal)) {
-          if (chunk.fingerprint) fp = chunk.fingerprint;
-
-          if (chunk.error) {
+          const enqueueRole = () => {
+            if (roleSent) return;
             controller.enqueue(
               encoder.encode(
                 sseChunk({
@@ -320,7 +442,7 @@ function buildStreamingResponse(
                   choices: [
                     {
                       index: 0,
-                      delta: { content: `[Error: ${chunk.error}]` },
+                      delta: { role: "assistant" },
                       finish_reason: null,
                       logprobs: null,
                     },
@@ -328,99 +450,189 @@ function buildStreamingResponse(
                 })
               )
             );
-            break;
-          }
+            roleSent = true;
+          };
 
-          if (chunk.thinking) {
-            controller.enqueue(
-              encoder.encode(
-                sseChunk({
+          const handOffFirstOutput = async () => {
+            if (firstOutputHandedOff) return;
+            firstOutputHandedOff = true;
+            // Give readiness/finalization wrappers one turn to attach before a later
+            // upstream failure errors the stream and invalidates queued chunks.
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          };
+
+          for await (const chunk of extractContent(
+            eventStream,
+            isThinkingModel,
+            toolRegistry,
+            streamAbortController.signal,
+            true
+          )) {
+            if (chunk.fingerprint) fp = chunk.fingerprint;
+
+            if (chunk.error) {
+              if (roleSent) {
+                controller.error(grokStreamFailure());
+                return;
+              }
+              controller.enqueue(encoder.encode(grokStreamErrorChunk()));
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              return;
+            }
+
+            if (chunk.thinking) {
+              enqueueRole();
+              controller.enqueue(
+                encoder.encode(
+                  sseChunk({
+                    id: cid,
+                    object: "chat.completion.chunk",
+                    created,
+                    model,
+                    system_fingerprint: fp || null,
+                    choices: [
+                      {
+                        index: 0,
+                        delta: { reasoning_content: chunk.thinking },
+                        finish_reason: null,
+                        logprobs: null,
+                      },
+                    ],
+                  })
+                )
+              );
+              await handOffFirstOutput();
+              continue;
+            }
+
+            if (chunk.toolCalls) {
+              enqueueRole();
+              enqueueStreamingToolCalls(controller, encoder, {
+                id: cid,
+                created,
+                model,
+                fingerprint: fp,
+                toolCalls: chunk.toolCalls,
+              });
+              return;
+            }
+
+            if (chunk.done) break;
+
+            if (chunk.fullMessage) {
+              const toolCalls = parseClientToolCallMarkup(chunk.fullMessage, toolRegistry);
+              if (toolCalls) {
+                enqueueRole();
+                enqueueStreamingToolCalls(controller, encoder, {
                   id: cid,
-                  object: "chat.completion.chunk",
                   created,
                   model,
-                  system_fingerprint: fp || null,
-                  choices: [
-                    {
-                      index: 0,
-                      delta: { reasoning_content: chunk.thinking },
-                      finish_reason: null,
-                      logprobs: null,
-                    },
-                  ],
-                })
-              )
-            );
-            continue;
-          }
+                  fingerprint: fp,
+                  toolCalls,
+                });
+                return;
+              }
+              if (!buffered) {
+                enqueueRole();
+                buffered = chunk.fullMessage;
+                controller.enqueue(
+                  encoder.encode(
+                    sseChunk({
+                      id: cid,
+                      object: "chat.completion.chunk",
+                      created,
+                      model,
+                      system_fingerprint: fp || null,
+                      choices: [
+                        {
+                          index: 0,
+                          delta: { content: chunk.fullMessage },
+                          finish_reason: null,
+                          logprobs: null,
+                        },
+                      ],
+                    })
+                  )
+                );
+                await handOffFirstOutput();
+              }
+            }
 
-          if (chunk.done) break;
-
-          if (chunk.delta) {
-            controller.enqueue(
-              encoder.encode(
-                sseChunk({
+            if (chunk.delta) {
+              buffered += chunk.delta;
+              const toolCalls = parseClientToolCallMarkup(buffered, toolRegistry);
+              if (toolCalls) {
+                enqueueStreamingToolCalls(controller, encoder, {
                   id: cid,
-                  object: "chat.completion.chunk",
                   created,
                   model,
-                  system_fingerprint: fp || null,
-                  choices: [
-                    {
-                      index: 0,
-                      delta: { content: chunk.delta },
-                      finish_reason: null,
-                      logprobs: null,
-                    },
-                  ],
-                })
-              )
-            );
+                  fingerprint: fp,
+                  toolCalls,
+                });
+                return;
+              }
+              if (hasOpenToolCallMarkup(buffered)) continue;
+              enqueueRole();
+              controller.enqueue(
+                encoder.encode(
+                  sseChunk({
+                    id: cid,
+                    object: "chat.completion.chunk",
+                    created,
+                    model,
+                    system_fingerprint: fp || null,
+                    choices: [
+                      {
+                        index: 0,
+                        delta: { content: chunk.delta },
+                        finish_reason: null,
+                        logprobs: null,
+                      },
+                    ],
+                  })
+                )
+              );
+              await handOffFirstOutput();
+            }
           }
+
+          if (streamAbortController.signal.aborted || !roleSent) return;
+
+          // Stop chunk — only after legitimate content/reasoning/tool output.
+          controller.enqueue(
+            encoder.encode(
+              sseChunk({
+                id: cid,
+                object: "chat.completion.chunk",
+                created,
+                model,
+                system_fingerprint: fp || null,
+                choices: [{ index: 0, delta: {}, finish_reason: "stop", logprobs: null }],
+              })
+            )
+          );
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        } catch {
+          if (streamAbortController.signal.aborted) return;
+          if (roleSent) {
+            controller.error(grokStreamFailure());
+            return;
+          }
+          controller.enqueue(encoder.encode(grokStreamErrorChunk()));
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        } finally {
+          signal?.removeEventListener("abort", handleParentAbort);
+          try {
+            controller.close();
+          } catch {}
         }
-
-        // Stop chunk
-        controller.enqueue(
-          encoder.encode(
-            sseChunk({
-              id: cid,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              system_fingerprint: fp || null,
-              choices: [{ index: 0, delta: {}, finish_reason: "stop", logprobs: null }],
-            })
-          )
-        );
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-      } catch (err) {
-        controller.enqueue(
-          encoder.encode(
-            sseChunk({
-              id: cid,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              system_fingerprint: null,
-              choices: [
-                {
-                  index: 0,
-                  delta: {
-                    content: `[Stream error: ${err instanceof Error ? err.message : String(err)}]`,
-                  },
-                  finish_reason: "stop",
-                  logprobs: null,
-                },
-              ],
-            })
-          )
-        );
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-      } finally {
-        controller.close();
-      }
+      },
+      cancel(reason) {
+        requestStreamCancel(reason);
+      },
     },
-  });
+    { highWaterMark: 16384 }
+  );
 }
 
 async function buildNonStreamingResponse(
@@ -429,19 +641,24 @@ async function buildNonStreamingResponse(
   cid: string,
   created: number,
   isThinkingModel: boolean,
+  toolRegistry: GrokToolRegistry,
   signal?: AbortSignal | null
 ): Promise<Response> {
   let fullContent = "";
   let fingerprint = "";
   const thinkingParts: string[] = [];
 
-  for await (const chunk of extractContent(eventStream, isThinkingModel, signal)) {
+  for await (const chunk of extractContent(eventStream, isThinkingModel, toolRegistry, signal)) {
     if (chunk.fingerprint) fingerprint = chunk.fingerprint;
 
     if (chunk.error) {
       return new Response(
         JSON.stringify({
-          error: { message: chunk.error, type: "upstream_error", code: "GROK_ERROR" },
+          error: {
+            message: sanitizeGrokUpstreamError(chunk.error),
+            type: "upstream_error",
+            code: "GROK_ERROR",
+          },
         }),
         { status: 502, headers: { "Content-Type": "application/json" } }
       );
@@ -450,12 +667,56 @@ async function buildNonStreamingResponse(
       thinkingParts.push(chunk.thinking);
       continue;
     }
+    if (chunk.toolCalls) {
+      return new Response(
+        JSON.stringify({
+          id: cid,
+          object: "chat.completion",
+          created,
+          model,
+          system_fingerprint: fingerprint || null,
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: null, tool_calls: chunk.toolCalls },
+              finish_reason: "tool_calls",
+              logprobs: null,
+            },
+          ],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
     if (chunk.done) break;
     if (chunk.fullMessage) {
       fullContent = chunk.fullMessage;
     } else if (chunk.delta) {
       fullContent += chunk.delta;
     }
+  }
+
+  const manifestToolCalls = parseClientToolCallMarkup(fullContent, toolRegistry);
+  if (manifestToolCalls) {
+    return new Response(
+      JSON.stringify({
+        id: cid,
+        object: "chat.completion",
+        created,
+        model,
+        system_fingerprint: fingerprint || null,
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: null, tool_calls: manifestToolCalls },
+            finish_reason: "tool_calls",
+            logprobs: null,
+          },
+        ],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
   }
 
   const msg: Record<string, unknown> = { role: "assistant", content: fullContent };
@@ -473,7 +734,14 @@ async function buildNonStreamingResponse(
       created,
       model,
       system_fingerprint: fingerprint || null,
-      choices: [{ index: 0, message: msg, finish_reason: "stop", logprobs: null }],
+      choices: [
+        {
+          index: 0,
+          message: msg,
+          finish_reason: "stop",
+          logprobs: null,
+        },
+      ],
       usage: {
         prompt_tokens: promptTokens,
         completion_tokens: completionTokens,
@@ -482,6 +750,160 @@ async function buildNonStreamingResponse(
     }),
     { status: 200, headers: { "Content-Type": "application/json" } }
   );
+}
+
+// ─── Cloudflare anti-bot classification + browser-backed recovery (#8019) ──
+//
+// Grok's own TLS-impersonating client (grokTlsClient.ts) still gets a
+// Cloudflare Enterprise anti-bot rejection from datacenter/sandbox egresses
+// even with a valid sso+sso-rw cookie. Before this, a Cloudflare block and a
+// genuinely expired SSO cookie both surfaced as the SAME generic auth error
+// (#8019). classifyGrokNullBodyError() distinguishes them so the caller gets
+// an actionable message, and (opt-in only) resolveGrokNullBodyTlsResult()
+// tries one browser-backed cf_clearance refresh + retry before giving up.
+
+export interface GrokNullBodyError {
+  type: "cloudflare_challenge" | "authentication_error" | "rate_limit_error" | "upstream_error";
+  code: string;
+  message: string;
+}
+
+/**
+ * Classify a `tlsResult.body === null` response (no streamable body — either
+ * a non-2xx status or a Cloudflare interstitial peeked at 200). Exported so
+ * both the executor and its unit tests share one decision.
+ */
+export function classifyGrokNullBodyError(
+  status: number,
+  text: string | null | undefined
+): GrokNullBodyError {
+  if (isCloudflareChallenge(text)) {
+    return {
+      type: "cloudflare_challenge",
+      code: "cf_mitigated_challenge",
+      message:
+        "Grok returned a Cloudflare bot-management challenge instead of a real response. " +
+        "cf_clearance is pinned to the IP+TLS+UA that earned it and can't be replayed from " +
+        "a datacenter/sandbox egress. Probe from a residential IP, or use the official xAI API " +
+        "(provider: 'grok') instead.",
+    };
+  }
+  if (status === 401 || status === 403) {
+    return {
+      type: "authentication_error",
+      code: `HTTP_${status}`,
+      message:
+        "Grok auth failed — SSO cookie may be expired. Re-paste your sso cookie value from grok.com.",
+    };
+  }
+  if (status === 429) {
+    return {
+      type: "rate_limit_error",
+      code: "HTTP_429",
+      message: "Grok rate limited. Wait a moment and retry, or rotate cookies.",
+    };
+  }
+  return {
+    type: "upstream_error",
+    code: `HTTP_${status}`,
+    message: `Grok returned HTTP ${status}`,
+  };
+}
+
+function buildGrokNullBodyErrorResponse(
+  status: number,
+  classification: GrokNullBodyError
+): Response {
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: classification.message,
+        type: classification.type,
+        code: classification.code,
+      },
+    }),
+    { status, headers: { "Content-Type": "application/json" } }
+  );
+}
+
+function appendCfClearanceCookie(cookieHeader: string | undefined, cfClearance: string): string {
+  const cfCookie = `cf_clearance=${cfClearance}`;
+  if (!cookieHeader) return cfCookie;
+  if (/(?:^|;\s*)cf_clearance=/.test(cookieHeader)) {
+    return cookieHeader.replace(/cf_clearance=[^;]*/, cfCookie);
+  }
+  return `${cookieHeader}; ${cfCookie}`;
+}
+
+/**
+ * Attempt ONE browser-backed cf_clearance refresh + retry of tlsFetchGrok.
+ * Returns the retried TlsFetchResult on success, or null on any failure
+ * (acquisition failure, retry still challenged, retry threw) so the caller
+ * falls through to the original Cloudflare-challenge error — never throws.
+ */
+async function retryGrokWithFreshClearance(params: {
+  headers: Record<string, string>;
+  grokPayload: Record<string, unknown>;
+  signal?: AbortSignal;
+}): Promise<TlsFetchResult | null> {
+  let cfClearance: string | null;
+  try {
+    cfClearance = await acquireFreshGrokClearance(params.signal);
+  } catch {
+    cfClearance = null;
+  }
+  if (!cfClearance) return null;
+
+  const retryHeaders = {
+    ...params.headers,
+    Cookie: appendCfClearanceCookie(params.headers.Cookie, cfClearance),
+  };
+  try {
+    const retried = await tlsFetchGrok(GROK_CHAT_API, {
+      method: "POST",
+      headers: retryHeaders,
+      body: JSON.stringify(params.grokPayload),
+      timeoutMs: FETCH_TIMEOUT_MS,
+      signal: params.signal,
+      stream: true,
+      streamEofSymbol: "[DONE]",
+    });
+    return retried.body ? retried : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolves a `tlsResult.body === null` response: if it classifies as a
+ * Cloudflare challenge AND the browser-backed opt-in gate is on, tries one
+ * recovery retry; otherwise returns the original result unchanged. Callers
+ * re-classify the (possibly retried) result themselves.
+ */
+export async function resolveGrokNullBodyTlsResult(params: {
+  tlsResult: TlsFetchResult;
+  headers: Record<string, string>;
+  grokPayload: Record<string, unknown>;
+  signal?: AbortSignal;
+  log?: ExecutorLog | null;
+}): Promise<TlsFetchResult> {
+  const { tlsResult, headers, grokPayload, signal, log } = params;
+  if (tlsResult.body) return tlsResult;
+
+  const classification = classifyGrokNullBodyError(tlsResult.status, tlsResult.text);
+  if (classification.type !== "cloudflare_challenge" || !shouldUseGrokBrowserBacked()) {
+    return tlsResult;
+  }
+
+  log?.info?.(
+    "GROK-WEB",
+    "Cloudflare challenge detected on grok.com; attempting browser-backed cf_clearance refresh"
+  );
+  const retried = await retryGrokWithFreshClearance({ headers, grokPayload, signal });
+  if (retried) {
+    log?.info?.("GROK-WEB", "Browser-backed cf_clearance refresh succeeded; retry passed through");
+  }
+  return retried ?? tlsResult;
 }
 
 // ─── Executor ───────────────────────────────────────────────────────────────
@@ -501,8 +923,7 @@ export class GrokWebExecutor extends BaseExecutor {
     upstreamExtraHeaders,
   }: ExecuteInput) {
     const messages = (body as Record<string, unknown>).messages as
-      | Array<Record<string, unknown>>
-      | undefined;
+      Array<Record<string, unknown>> | undefined;
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       const errResp = new Response(
         JSON.stringify({
@@ -518,10 +939,15 @@ export class GrokWebExecutor extends BaseExecutor {
     if (!modelInfo) {
       log?.info?.("GROK-WEB", `Unmapped model ${model}, defaulting to fast mode`);
     }
+    const toolRegistry = buildGrokToolRegistry(body as Record<string, unknown>);
     const { modeId, isThinking } = modelInfo || MODEL_MAP.fast;
 
     // Parse OpenAI messages → single Grok message string
-    const message = parseOpenAIMessages(messages);
+    const message = buildGrokMessage(
+      messages,
+      toolRegistry,
+      (body as Record<string, unknown>).tool_choice
+    );
     if (!message.trim()) {
       const errResp = new Response(
         JSON.stringify({
@@ -580,7 +1006,7 @@ export class GrokWebExecutor extends BaseExecutor {
       Origin: "https://grok.com",
       Pragma: "no-cache",
       Referer: "https://grok.com/",
-      "Sec-Ch-Ua": '"Google Chrome";v="147", "Chromium";v="147", "Not(A:Brand";v="24"',
+      "Sec-Ch-Ua": '"Google Chrome";v="149", "Chromium";v="149", "Not(A:Brand";v="24"',
       "Sec-Ch-Ua-Mobile": "?0",
       "Sec-Ch-Ua-Platform": '"macOS"',
       "Sec-Fetch-Dest": "empty",
@@ -592,11 +1018,12 @@ export class GrokWebExecutor extends BaseExecutor {
       traceparent: `00-${traceId}-${spanId}-00`,
     };
 
-    // Cookie auth — accepts a bare value, "sso=<value>", or a full
-    // DevTools cookie blob; we extract the sso pair and ignore the rest.
+    // Cookie auth — accepts a bare value, "sso=<value>", or a full DevTools
+    // cookie blob. Forwards both `sso` and (when present) the paired `sso-rw`
+    // write cookie, which Grok's anti-bot now requires (#3063).
     if (credentials.apiKey) {
-      const token = extractCookieValue(credentials.apiKey, "sso");
-      if (token) headers["Cookie"] = `sso=${token}`;
+      const cookieHeader = buildGrokCookieHeader(credentials.apiKey);
+      if (cookieHeader) headers["Cookie"] = cookieHeader;
     }
 
     // Apply upstream extra headers
@@ -608,23 +1035,42 @@ export class GrokWebExecutor extends BaseExecutor {
     const timeoutSignal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
     const combinedSignal = signal ? mergeAbortSignals(signal, timeoutSignal) : timeoutSignal;
 
-    // Fetch from Grok
-    const fetchOptions: RequestInit = {
-      method: "POST",
-      headers,
-      body: JSON.stringify(grokPayload),
-      signal: combinedSignal,
-    };
-
-    let response: Response;
+    // Fetch from Grok via TLS-impersonating client (#3180).
+    // Grok sits behind Cloudflare Enterprise which rejects Node's native TLS
+    // fingerprint even with valid sso+sso-rw cookies. The pinned wreq-js
+    // transport sends a Chrome-like handshake instead.
+    let tlsResult: TlsFetchResult;
     try {
-      response = await fetch(GROK_CHAT_API, fetchOptions);
+      tlsResult = await tlsFetchGrok(GROK_CHAT_API, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(grokPayload),
+        timeoutMs: FETCH_TIMEOUT_MS,
+        signal: combinedSignal,
+        stream: true,
+        streamEofSymbol: "[DONE]",
+      });
     } catch (err) {
-      log?.error?.("GROK-WEB", `Fetch failed: ${err instanceof Error ? err.message : String(err)}`);
+      const publicError = sanitizeGrokUpstreamError(err);
+      if (isTlsClientUnavailableError(err)) {
+        log?.error?.("GROK-WEB", `TLS client unavailable: ${publicError}`);
+        const errResp = new Response(
+          JSON.stringify({
+            error: {
+              message: `Grok TLS client unavailable: ${publicError}`,
+              type: "upstream_error",
+              code: "TLS_CLIENT_UNAVAILABLE",
+            },
+          }),
+          { status: 502, headers: { "Content-Type": "application/json" } }
+        );
+        return { response: errResp, url: GROK_CHAT_API, headers, transformedBody: grokPayload };
+      }
+      log?.error?.("GROK-WEB", `Fetch failed: ${publicError}`);
       const errResp = new Response(
         JSON.stringify({
           error: {
-            message: `Grok connection failed: ${err instanceof Error ? err.message : String(err)}`,
+            message: `Grok connection failed: ${publicError}`,
             type: "upstream_error",
           },
         }),
@@ -633,32 +1079,24 @@ export class GrokWebExecutor extends BaseExecutor {
       return { response: errResp, url: GROK_CHAT_API, headers, transformedBody: grokPayload };
     }
 
-    if (!response.ok) {
-      const status = response.status;
-      let errMsg = `Grok returned HTTP ${status}`;
-      if (status === 401 || status === 403) {
-        errMsg =
-          "Grok auth failed — SSO cookie may be expired. Re-paste your sso cookie value from grok.com.";
-      } else if (status === 429) {
-        errMsg = "Grok rate limited. Wait a moment and retry, or rotate cookies.";
-      }
-      log?.warn?.("GROK-WEB", errMsg);
-      const errResp = new Response(
-        JSON.stringify({
-          error: { message: errMsg, type: "upstream_error", code: `HTTP_${status}` },
-        }),
-        { status, headers: { "Content-Type": "application/json" } }
-      );
-      return { response: errResp, url: GROK_CHAT_API, headers, transformedBody: grokPayload };
+    if (!tlsResult.body) {
+      // Non-streaming fallback (shouldn't happen for chat, but handle gracefully).
+      // Distinguish a Cloudflare anti-bot block from a genuine auth/rate-limit
+      // failure (#8019); optionally recover via one browser-backed retry.
+      tlsResult = await resolveGrokNullBodyTlsResult({
+        tlsResult,
+        headers,
+        grokPayload,
+        signal: combinedSignal,
+        log,
+      });
     }
 
-    if (!response.body) {
-      const errResp = new Response(
-        JSON.stringify({
-          error: { message: "Grok returned empty response body", type: "upstream_error" },
-        }),
-        { status: 502, headers: { "Content-Type": "application/json" } }
-      );
+    if (!tlsResult.body) {
+      const status = tlsResult.status;
+      const classification = classifyGrokNullBodyError(status, tlsResult.text);
+      log?.warn?.("GROK-WEB", classification.message);
+      const errResp = buildGrokNullBodyErrorResponse(status, classification);
       return { response: errResp, url: GROK_CHAT_API, headers, transformedBody: grokPayload };
     }
 
@@ -669,11 +1107,12 @@ export class GrokWebExecutor extends BaseExecutor {
     let finalResponse: Response;
     if (stream) {
       const sseStream = buildStreamingResponse(
-        response.body,
+        tlsResult.body,
         model,
         cid,
         created,
         isThinking,
+        toolRegistry,
         signal
       );
       finalResponse = new Response(sseStream, {
@@ -684,13 +1123,21 @@ export class GrokWebExecutor extends BaseExecutor {
           "X-Accel-Buffering": "no",
         },
       });
+      const readiness = await ensureStreamReadiness(finalResponse, {
+        timeoutMs: STREAM_READINESS_TIMEOUT_MS,
+        provider: this.provider,
+        model,
+        log,
+      });
+      finalResponse = readiness.response;
     } else {
       finalResponse = await buildNonStreamingResponse(
-        response.body,
+        tlsResult.body,
         model,
         cid,
         created,
         isThinking,
+        toolRegistry,
         signal
       );
     }

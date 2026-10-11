@@ -19,11 +19,29 @@ import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 /**
  * GET /api/settings/model-aliases
  * Returns the full alias map, separated into built-in and custom.
+ *
+ * Self-healing: if `_customAliases` is empty (e.g. after a server restart
+ * where the webpack-bundled module instance used by this route was not
+ * hydrated by the startup path), read `modelAliases` from the settings
+ * blob in the DB and hydrate this module instance.  This bridges the
+ * webpack chunk-splitting gap in the standalone production build.
  */
 export async function GET(request: Request) {
   const authError = await requireManagementAuth(request);
   if (authError) return authError;
   try {
+    const custom = getCustomAliases();
+    if (Object.keys(custom).length === 0) {
+      try {
+        const settings = await getSettings();
+        const stored = settings.modelAliases;
+        if (stored && typeof stored === "object" && Object.keys(stored).length > 0) {
+          setCustomAliases(stored as Record<string, string>);
+        }
+      } catch {
+        // Best-effort hydration — fall through with empty custom aliases
+      }
+    }
     return NextResponse.json({
       builtIn: getBuiltInAliases(),
       custom: getCustomAliases(),
@@ -65,7 +83,7 @@ export async function PUT(request: Request) {
     }
     const { aliases } = validation.data;
     setCustomAliases(aliases);
-    await updateSettings({ modelAliases: JSON.stringify(aliases) });
+    await updateSettings({ modelAliases: aliases });
     return NextResponse.json({ success: true, custom: getCustomAliases() });
   } catch (error) {
     console.error("[API ERROR] /api/settings/model-aliases PUT:", error);
@@ -103,7 +121,7 @@ export async function POST(request: Request) {
     }
     const { from, to } = validation.data;
     addCustomAlias(from, to);
-    await updateSettings({ modelAliases: JSON.stringify(getCustomAliases()) });
+    await updateSettings({ modelAliases: getCustomAliases() });
     return NextResponse.json({ success: true, custom: getCustomAliases() });
   } catch (error) {
     console.error("[API ERROR] /api/settings/model-aliases POST:", error);
@@ -144,7 +162,7 @@ export async function DELETE(request: Request) {
     if (!removed) {
       return NextResponse.json({ error: "Alias not found" }, { status: 404 });
     }
-    await updateSettings({ modelAliases: JSON.stringify(getCustomAliases()) });
+    await updateSettings({ modelAliases: getCustomAliases() });
     return NextResponse.json({ success: true, custom: getCustomAliases() });
   } catch (error) {
     console.error("[API ERROR] /api/settings/model-aliases DELETE:", error);

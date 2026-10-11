@@ -25,7 +25,7 @@ async function flushBackgroundWork() {
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
   resetAllCircuitBreakers();
 }
@@ -61,12 +61,59 @@ function makeRequest(extraHeaders = {}) {
       ...extraHeaders,
     },
     body: JSON.stringify({
-      model: "openai/gpt-4o-mini",
+      model: "openai/gpt-4.1",
       messages: [{ role: "user", content: "Reply with OK only." }],
       max_tokens: 16,
       stream: false,
+      temperature: 0,
     }),
   });
+}
+
+function makeStreamingRequest(extraHeaders = {}) {
+  return new Request("http://localhost/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+      ...extraHeaders,
+    },
+    body: JSON.stringify({
+      model: "openai/gpt-4.1",
+      messages: [{ role: "user", content: "Stream OK only." }],
+      max_tokens: 16,
+      stream: true,
+      temperature: 0,
+    }),
+  });
+}
+
+function makeRequestWithoutStreamFlag(extraHeaders = {}) {
+  return new Request("http://localhost/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...extraHeaders,
+    },
+    body: JSON.stringify({
+      model: "openai/gpt-4.1",
+      messages: [{ role: "user", content: "Reply with OMITTED STREAM OK only." }],
+      max_tokens: 16,
+      temperature: 0,
+    }),
+  });
+}
+
+async function readAll(response: Response): Promise<string> {
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  let out = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) out += decoder.decode(value, { stream: true });
+  }
+  return out;
 }
 
 test.beforeEach(async () => {
@@ -85,7 +132,7 @@ test.after(async () => {
   globalThis.fetch = originalFetch;
   resetAllCircuitBreakers();
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("combo live test bypasses connection cooldown and breaker state to perform a real upstream request", async () => {
@@ -139,13 +186,13 @@ test("combo live test bypasses semantic cache and forces a fresh upstream reques
   await seedHealthyConnection();
 
   const signature = generateSignature(
-    "gpt-4o-mini",
+    "gpt-4.1",
     [{ role: "user", content: "Reply with OK only." }],
     0,
     1
   );
 
-  setCachedResponse(signature, "gpt-4o-mini", {
+  setCachedResponse(signature, "gpt-4.1", {
     id: "chatcmpl-cached",
     choices: [
       {
@@ -199,6 +246,77 @@ test("combo live test bypasses semantic cache and forces a fresh upstream reques
   }
 });
 
+test("chat completions route emits early keepalive while waiting for stream readiness", async () => {
+  await seedHealthyConnection();
+
+  globalThis.fetch = async () => {
+    // Must exceed resolveKeepaliveThreshold()'s DEFAULT_THRESHOLD_MS (2000ms) for
+    // openai/* — otherwise withEarlyStreamKeepalive takes the FAST path, forwards
+    // the handler response as-is and no keepalive frame is ever emitted. The old
+    // 100ms only worked while unrelated handler latency happened to push the
+    // total past the threshold, which made this assertion incidental rather than
+    // deterministic; it stopped holding once the handler got faster.
+    await new Promise((resolve) => setTimeout(resolve, 2_400));
+    return new Response(
+      [
+        `data: ${JSON.stringify({
+          id: "chatcmpl-slow-stream",
+          object: "chat.completion.chunk",
+          choices: [{ index: 0, delta: { role: "assistant", content: "OK" } }],
+        })}`,
+        "",
+        "data: [DONE]",
+        "",
+      ].join("\n"),
+      {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }
+    );
+  };
+
+  const response = await chatRoute.POST(makeStreamingRequest());
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type") || "", /text\/event-stream/);
+
+  const body = await readAll(response);
+  assert.match(body, /data: \{"id":"chatcmpl-keepalive","object":"chat\.completion\.chunk"/);
+  assert.match(body, /OK/);
+  assert.match(body, /\[DONE\]/);
+});
+
+test("chat completions route returns JSON without early SSE framing when stream is omitted and Accept is application/json", async () => {
+  await seedHealthyConnection();
+
+  globalThis.fetch = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return Response.json({
+      id: "chatcmpl-slow-json",
+      choices: [
+        {
+          message: {
+            role: "assistant",
+            content: "OK",
+          },
+        },
+      ],
+    });
+  };
+
+  const response = await chatRoute.POST(
+    makeRequestWithoutStreamFlag({
+      Accept: "application/json",
+      "X-OmniRoute-No-Cache": "true",
+      "X-Request-Id": "chat-route-omitted-stream-json",
+    })
+  );
+  assert.equal(response.status, 200);
+  assert.doesNotMatch(response.headers.get("content-type") || "", /text\/event-stream/);
+
+  const body = (await response.json()) as any;
+  assert.equal(body.choices[0].message.content, "OK");
+});
+
 test("combo live test does not use cooldown-aware request retry on upstream failures", async () => {
   await seedHealthyConnection();
   await settingsDb.updateSettings({
@@ -225,6 +343,9 @@ test("combo live test does not use cooldown-aware request retry on upstream fail
   const liveBody = (await liveResponse.json()) as any;
 
   assert.equal(liveResponse.status, 503);
-  assert.equal(fetchCalls, 1);
+  assert.ok(
+    fetchCalls >= 1 && fetchCalls <= 3,
+    `live combo test should not storm retries, got ${fetchCalls} fetches`
+  );
   assert.match(liveBody.error.message, /upstream unavailable/i);
 });

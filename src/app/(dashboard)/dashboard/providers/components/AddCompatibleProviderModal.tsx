@@ -1,9 +1,17 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslations } from "next-intl";
 
-import { Badge, Button, Input, Modal, Select } from "@/shared/components";
+import { Badge, Button, Input, Modal, Select, Toggle } from "@/shared/components";
+import { readFetchErrorMessage } from "@/shared/utils/fetchError";
+import { isValidProviderIconUrl } from "@/shared/validation/iconUrl";
+import {
+  CLIENT_IDENTITY_PROFILE_OPTIONS,
+  getClientIdentityProfileHeaders,
+} from "@/shared/constants/clientIdentityProfiles";
+import NewApiAggregatorFields from "../[id]/components/modals/NewApiAggregatorFields";
+import { providerText } from "../[id]/providerPageHelpers";
 
 type CompatibleMode = "openai" | "anthropic" | "cc";
 type CompatibleProviderNode = { id: string } & Record<string, unknown>;
@@ -23,6 +31,12 @@ interface CompatibleFormState {
   baseUrl: string;
   chatPath: string;
   modelsPath: string;
+  iconUrl: string;
+  clientIdentityProfile: string;
+  newApiAggregatorBalance: boolean;
+  consoleApiKey: string;
+  newApiUserId: string;
+  quotaPerUnit: string;
 }
 
 const CC_DEFAULT_CHAT_PATH = "/v1/messages?beta=true";
@@ -75,6 +89,12 @@ function createInitialForm(mode: CompatibleMode): CompatibleFormState {
     baseUrl: defaults.baseUrl,
     chatPath: defaults.chatPath,
     modelsPath: "",
+    iconUrl: "",
+    clientIdentityProfile: "default",
+    newApiAggregatorBalance: false,
+    consoleApiKey: "",
+    newApiUserId: "",
+    quotaPerUnit: "",
   };
 }
 
@@ -90,9 +110,16 @@ export default function AddCompatibleProviderModal({
   const [formData, setFormData] = useState<CompatibleFormState>(() => createInitialForm(mode));
   const [submitting, setSubmitting] = useState(false);
   const [checkKey, setCheckKey] = useState("");
+  const [checkModelId, setCheckModelId] = useState("");
   const [validating, setValidating] = useState(false);
-  const [validationResult, setValidationResult] = useState<"success" | "failed" | null>(null);
+  const [validationResult, setValidationResult] = useState<null | {
+    valid: boolean;
+    error?: string | null;
+    method?: string | null;
+  }>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [iconUrlError, setIconUrlError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const apiTypeOptions = useMemo(
     () => [
@@ -106,13 +133,25 @@ export default function AddCompatibleProviderModal({
     [t]
   );
 
-  useEffect(() => {
-    if (!isOpen) return;
-    setFormData(createInitialForm(mode));
-    setValidationResult(null);
-    setCheckKey("");
-    setShowAdvanced(false);
-  }, [isOpen, mode]);
+  // Fresh form on every open (and on a mode switch while open) — applied as a
+  // render-phase adjustment guarded by the previously initialized mode
+  // (react.dev "adjusting state when a prop changes") instead of a
+  // synchronous-setState effect. Closing clears the marker so the next open
+  // re-initializes again.
+  const [initializedFor, setInitializedFor] = useState<{ mode: CompatibleMode } | null>(null);
+  if (isOpen) {
+    if (initializedFor?.mode !== mode) {
+      setInitializedFor({ mode });
+      setFormData(createInitialForm(mode));
+      setValidationResult(null);
+      setCheckKey("");
+      setShowAdvanced(false);
+      setSaveError(null);
+      setIconUrlError(null);
+    }
+  } else if (initializedFor !== null) {
+    setInitializedFor(null);
+  }
 
   const modalTitle =
     title ||
@@ -162,10 +201,19 @@ export default function AddCompatibleProviderModal({
     setCheckKey("");
     setValidationResult(null);
     setShowAdvanced(false);
+    setSaveError(null);
+    setIconUrlError(null);
   };
 
   const handleSubmit = async () => {
     if (!hasRequiredFields) return;
+    const iconUrl = formData.iconUrl.trim();
+    if (!isValidProviderIconUrl(iconUrl)) {
+      setIconUrlError(t("iconUrlInvalid"));
+      return;
+    }
+    setIconUrlError(null);
+    setSaveError(null);
     setSubmitting(true);
     try {
       const body: Record<string, unknown> = {
@@ -178,19 +226,54 @@ export default function AddCompatibleProviderModal({
       if (defaults.hasApiType) body.apiType = formData.apiType;
       if (defaults.hasModelsPath) body.modelsPath = formData.modelsPath || "";
       if (defaults.compatMode) body.compatMode = defaults.compatMode;
+      body.iconUrl = formData.iconUrl.trim();
+      // Merge the selected identity profile's preset headers into the SAME
+      // `customHeaders` field the node already persists (see
+      // src/lib/db/providers/nodes.ts + open-sse/executors/default.ts
+      // `applyCustomHeaders`) — no separate profile field, no new pipeline.
+      const identityHeaders = getClientIdentityProfileHeaders(formData.clientIdentityProfile);
+      if (Object.keys(identityHeaders).length > 0) body.customHeaders = identityHeaders;
+
+      // Aggregator gateway fields (#9415)
+      if (formData.newApiAggregatorBalance) {
+        body.providerSpecificData = {
+          ...(body.providerSpecificData as Record<string, unknown> | undefined),
+          newApiAggregatorBalance: true,
+        };
+        if (formData.consoleApiKey.trim()) {
+          (body.providerSpecificData as Record<string, unknown>).consoleApiKey =
+            formData.consoleApiKey.trim();
+        }
+        if (formData.newApiUserId.trim()) {
+          (body.providerSpecificData as Record<string, unknown>).newApiUserId =
+            formData.newApiUserId.trim();
+        }
+        const parsedQuotaPerUnit = parseInt(formData.quotaPerUnit, 10);
+        if (Number.isFinite(parsedQuotaPerUnit) && parsedQuotaPerUnit > 0) {
+          (body.providerSpecificData as Record<string, unknown>).quotaPerUnit = parsedQuotaPerUnit;
+        }
+      }
 
       const res = await fetch("/api/provider-nodes", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      const data = (await res.json()) as { node: CompatibleProviderNode };
-      if (res.ok) {
+      const failedCreate = providerText(t, "failedCreate", "Failed to create provider");
+      if (!res.ok) {
+        setSaveError(await readFetchErrorMessage(res, failedCreate));
+        return;
+      }
+
+      const data = await res.json().catch(() => ({}));
+      if (data.node) {
         onCreated(data.node);
         resetAfterCreate();
+        return;
       }
-    } catch (error) {
-      console.log(`Error creating ${mode} compatible node:`, error);
+      setSaveError(failedCreate);
+    } catch {
+      setSaveError(providerText(t, "networkError", "Network error"));
     } finally {
       setSubmitting(false);
     }
@@ -204,11 +287,14 @@ export default function AddCompatibleProviderModal({
         apiKey: checkKey,
         type: defaults.type,
       };
+      if (defaults.hasApiType) body.apiType = formData.apiType;
       if (defaults.hasModelsPath) body.modelsPath = formData.modelsPath || "";
       if (defaults.compatMode) {
         body.compatMode = defaults.compatMode;
         body.chatPath = formData.chatPath || CC_DEFAULT_CHAT_PATH;
       }
+      const trimmedModelId = checkModelId.trim();
+      if (trimmedModelId) body.modelId = trimmedModelId;
 
       const res = await fetch("/api/provider-nodes/validate", {
         method: "POST",
@@ -216,9 +302,16 @@ export default function AddCompatibleProviderModal({
         body: JSON.stringify(body),
       });
       const data = await res.json();
-      setValidationResult(data.valid ? "success" : "failed");
+      setValidationResult({
+        valid: !!data.valid,
+        error: data.error ?? null,
+        method: data.method ?? null,
+      });
     } catch {
-      setValidationResult("failed");
+      setValidationResult({
+        valid: false,
+        error: providerText(t, "networkError", "Network error"),
+      });
     } finally {
       setValidating(false);
     }
@@ -267,6 +360,32 @@ export default function AddCompatibleProviderModal({
           placeholder={baseUrlPlaceholder}
           hint={baseUrlHint}
         />
+        <Input
+          label={t("iconUrlLabel")}
+          value={formData.iconUrl}
+          onChange={(e) => setFormData({ ...formData, iconUrl: e.target.value })}
+          placeholder="https://example.com/logo.png"
+          hint={iconUrlError ?? t("iconUrlHint")}
+        />
+
+        <Toggle
+          label={t("newApiAggregatorToggleLabel")}
+          description={t("newApiAggregatorToggleHint")}
+          checked={formData.newApiAggregatorBalance}
+          onChange={(checked: boolean) =>
+            setFormData({ ...formData, newApiAggregatorBalance: checked })
+          }
+        />
+        <NewApiAggregatorFields
+          enabled={formData.newApiAggregatorBalance}
+          values={{
+            consoleApiKey: formData.consoleApiKey,
+            newApiUserId: formData.newApiUserId,
+            quotaPerUnit: formData.quotaPerUnit,
+          }}
+          onChange={(patch) => setFormData({ ...formData, ...patch })}
+          t={t}
+        />
 
         <button
           type="button"
@@ -301,6 +420,13 @@ export default function AddCompatibleProviderModal({
                 hint={t("modelsPathHint")}
               />
             )}
+            <Select
+              label={t("clientIdentityLabel")}
+              options={CLIENT_IDENTITY_PROFILE_OPTIONS.map((option) => ({ ...option }))}
+              value={formData.clientIdentityProfile}
+              onChange={(e) => setFormData({ ...formData, clientIdentityProfile: e.target.value })}
+              hint={t("clientIdentityHint")}
+            />
           </div>
         )}
 
@@ -322,12 +448,37 @@ export default function AddCompatibleProviderModal({
             </Button>
           </div>
         </div>
+        <Input
+          label={t("testModelIdLabel")}
+          value={checkModelId}
+          onChange={(e) => setCheckModelId(e.target.value)}
+          placeholder={t("testModelIdPlaceholder")}
+          hint={t("testModelIdHint")}
+        />
         {validationResult && (
-          <Badge variant={validationResult === "success" ? "success" : "error"}>
-            {validationResult === "success" ? t("valid") : t("invalid")}
-          </Badge>
+          <div className="flex flex-col gap-1">
+            <Badge variant={validationResult.valid ? "success" : "error"}>
+              {validationResult.valid ? t("valid") : t("invalid")}
+            </Badge>
+            {validationResult.error && (
+              <span
+                className={`text-sm ${validationResult.valid ? "text-text-muted" : "text-red-500"}`}
+              >
+                {validationResult.error}
+              </span>
+            )}
+          </div>
         )}
 
+        {saveError && (
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="text-sm text-red-500 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2"
+          >
+            {saveError}
+          </div>
+        )}
         <div className="flex gap-2">
           <Button onClick={handleSubmit} fullWidth disabled={!hasRequiredFields || submitting}>
             {submitting ? t("creating") : t("add")}

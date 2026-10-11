@@ -49,9 +49,9 @@ test("serper validation still rejects unauthorized keys", async () => {
   }
 });
 
-test("kimi-coding-apikey validation uses Kimi Coding messages endpoint", async () => {
+test("Kimi Code API-key validation uses the messages endpoint for both provider ids", async () => {
   const originalFetch = globalThis.fetch;
-  const calls = [];
+  let calls = [];
 
   globalThis.fetch = async (url, init = {}) => {
     calls.push({
@@ -67,23 +67,28 @@ test("kimi-coding-apikey validation uses Kimi Coding messages endpoint", async (
   };
 
   try {
-    const result = await validateProviderApiKey({
-      provider: "kimi-coding-apikey",
-      apiKey: "sk-kimi-test",
-    });
+    for (const provider of ["kimi-coding", "kimi-coding-apikey"]) {
+      calls = [];
+      const result = await validateProviderApiKey({
+        provider,
+        apiKey: "sk-kimi-test",
+      });
 
-    assert.equal(result.valid, true);
-    assert.equal(result.error, null);
-    assert.equal(calls.length, 1);
+      assert.equal(result.valid, true);
+      assert.equal(result.error, null);
+      // The Anthropic-like validator first probes /models then falls back to the messages endpoint.
+      assert.equal(calls.length, 2);
 
-    assert.equal(calls[0].url, "https://api.kimi.com/coding/v1/messages");
-    assert.equal(calls[0].method, "POST");
-    assert.equal(calls[0].headers["x-api-key"], "sk-kimi-test");
-    assert.equal(calls[0].headers["Anthropic-Version"], "2023-06-01");
+      // calls[0] is the models probe; calls[1] is the POST to the messages endpoint.
+      assert.equal(calls[1].url, "https://api.kimi.com/coding/v1/messages?beta=true");
+      assert.equal(calls[1].method, "POST");
+      assert.equal(calls[1].headers["x-api-key"], "sk-kimi-test");
+      assert.equal(calls[1].headers["Anthropic-Version"], "2023-06-01");
 
-    for (const call of calls) {
-      assert.equal(call.url.includes("?beta=true/messages"), false);
-      assert.equal(call.url.includes("?beta=true/models"), false);
+      for (const call of calls) {
+        assert.equal(call.url.includes("?beta=true/messages"), false);
+        assert.equal(call.url.includes("?beta=true/models"), false);
+      }
     }
   } finally {
     globalThis.fetch = originalFetch;
@@ -128,7 +133,9 @@ test("bailian-coding-plan validation rejects 401 as invalid key", async () => {
     });
 
     assert.equal(result.valid, false);
-    assert.equal(result.error, "Invalid API key");
+    // Prefix match: the message now also names an expired Token Plan subscription,
+    // which yields the identical upstream 401/403.
+    assert.match(String(result.error), /^Invalid API key/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -150,7 +157,9 @@ test("bailian-coding-plan validation rejects 403 as invalid key", async () => {
     });
 
     assert.equal(result.valid, false);
-    assert.equal(result.error, "Invalid API key");
+    // Prefix match: the message now also names an expired Token Plan subscription,
+    // which yields the identical upstream 401/403.
+    assert.match(String(result.error), /^Invalid API key/);
   } finally {
     globalThis.fetch = originalFetch;
   }

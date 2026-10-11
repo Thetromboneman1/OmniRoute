@@ -26,7 +26,7 @@ function listProjectFiles(relativePath: string): string[] {
 }
 
 test.after(() => {
-  rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("src/sse model shim keeps parseModel behavior aligned with open-sse core", async () => {
@@ -43,6 +43,14 @@ test("src/sse model shim keeps parseModel behavior aligned with open-sse core", 
 
   for (const sample of samples) {
     assert.deepEqual(srcModel.parseModel(sample), coreModel.parseModel(sample));
+  }
+});
+
+test("src/sse model shim exposes the active model helper surface", async () => {
+  const srcModel = await import("../../src/sse/services/model.ts");
+
+  for (const helper of ["parseModel", "getModelInfo", "getCombo", "getComboForModel"]) {
+    assert.equal(typeof srcModel[helper], "function", `${helper} should stay exported`);
   }
 });
 

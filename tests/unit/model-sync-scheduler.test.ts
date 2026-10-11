@@ -18,7 +18,7 @@ async function resetStorage() {
   for (let attempt = 0; attempt < 10; attempt++) {
     try {
       if (fs.existsSync(TEST_DATA_DIR)) {
-        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+        fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       }
       break;
     } catch (error: any) {
@@ -107,7 +107,7 @@ test.beforeEach(async () => {
 
 test.after(async () => {
   coreDb.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("modelSyncScheduler: internal auth headers validate only for scheduler requests", async () => {
@@ -128,6 +128,157 @@ test("modelSyncScheduler: internal auth headers validate only for scheduler requ
     headers: { [getModelSyncInternalAuthHeaderName()]: "invalid-token" },
   });
   assert.equal(isModelSyncInternalRequest(externalRequest), false);
+});
+
+test("modelSyncScheduler resolves only loopback origins and uses the dashboard port", async () => {
+  const previous = {
+    OMNIROUTE_PORT: process.env.OMNIROUTE_PORT,
+    PORT: process.env.PORT,
+    DASHBOARD_PORT: process.env.DASHBOARD_PORT,
+    BASE_URL: process.env.BASE_URL,
+    NEXT_PUBLIC_BASE_URL: process.env.NEXT_PUBLIC_BASE_URL,
+    NEXT_PUBLIC_APP_URL: process.env.NEXT_PUBLIC_APP_URL,
+    OMNIROUTE_BASE_PATH: process.env.OMNIROUTE_BASE_PATH,
+    OMNIROUTE_INTERNAL_SCHEME: process.env.OMNIROUTE_INTERNAL_SCHEME,
+    OMNIROUTE_TLS_CERT: process.env.OMNIROUTE_TLS_CERT,
+    OMNIROUTE_TLS_KEY: process.env.OMNIROUTE_TLS_KEY,
+  };
+  process.env.OMNIROUTE_PORT = "20128";
+  process.env.PORT = "22128";
+  process.env.DASHBOARD_PORT = "22128";
+  process.env.BASE_URL = "https://attacker.example";
+  delete process.env.NEXT_PUBLIC_BASE_URL;
+  delete process.env.NEXT_PUBLIC_APP_URL;
+  process.env.OMNIROUTE_BASE_PATH = "/omniroute/";
+  delete process.env.OMNIROUTE_INTERNAL_SCHEME;
+  delete process.env.OMNIROUTE_TLS_CERT;
+  delete process.env.OMNIROUTE_TLS_KEY;
+
+  try {
+    const scheduler = await loadScheduler("trusted-loopback-origin");
+    assert.equal(scheduler.getModelSyncInternalBaseUrl(), "http://127.0.0.1:22128/omniroute");
+    assert.equal(
+      scheduler.resolveModelSyncInternalBaseUrl("https://attacker.example/steal"),
+      "http://127.0.0.1:22128/omniroute"
+    );
+    assert.equal(
+      scheduler.resolveModelSyncInternalBaseUrl("http://127.0.0.1:7777/nested/path"),
+      "http://127.0.0.1:22128/omniroute"
+    );
+    assert.equal(
+      scheduler.resolveModelSyncInternalBaseUrl("http://0.0.0.0:7777/nested/path"),
+      "http://127.0.0.1:22128/omniroute"
+    );
+    assert.equal(
+      scheduler.resolveModelSyncInternalBaseUrl("http://user:pass@localhost:7777"),
+      "http://127.0.0.1:22128/omniroute"
+    );
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("modelSyncScheduler does not infer the internal listener scheme from public URLs", async () => {
+  const previous = {
+    DASHBOARD_PORT: process.env.DASHBOARD_PORT,
+    BASE_URL: process.env.BASE_URL,
+    NEXT_PUBLIC_BASE_URL: process.env.NEXT_PUBLIC_BASE_URL,
+    NEXT_PUBLIC_APP_URL: process.env.NEXT_PUBLIC_APP_URL,
+    OMNIROUTE_INTERNAL_SCHEME: process.env.OMNIROUTE_INTERNAL_SCHEME,
+    OMNIROUTE_TLS_CERT: process.env.OMNIROUTE_TLS_CERT,
+    OMNIROUTE_TLS_KEY: process.env.OMNIROUTE_TLS_KEY,
+  };
+  process.env.DASHBOARD_PORT = "22128";
+  process.env.BASE_URL = "https://attacker.example";
+  process.env.NEXT_PUBLIC_BASE_URL = "file:///tmp/not-http";
+  process.env.NEXT_PUBLIC_APP_URL = "https://localhost:7777/ignored";
+  delete process.env.OMNIROUTE_INTERNAL_SCHEME;
+  delete process.env.OMNIROUTE_TLS_CERT;
+  delete process.env.OMNIROUTE_TLS_KEY;
+
+  try {
+    const scheduler = await loadScheduler("safe-loopback-fallback");
+    assert.equal(scheduler.getModelSyncInternalBaseUrl(), "http://127.0.0.1:22128");
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("modelSyncScheduler uses the listener-declared TLS scheme without trusting candidates", async () => {
+  const previous = {
+    DASHBOARD_PORT: process.env.DASHBOARD_PORT,
+    BASE_URL: process.env.BASE_URL,
+    NEXT_PUBLIC_BASE_URL: process.env.NEXT_PUBLIC_BASE_URL,
+    NEXT_PUBLIC_APP_URL: process.env.NEXT_PUBLIC_APP_URL,
+    OMNIROUTE_BASE_PATH: process.env.OMNIROUTE_BASE_PATH,
+    OMNIROUTE_INTERNAL_SCHEME: process.env.OMNIROUTE_INTERNAL_SCHEME,
+    OMNIROUTE_TLS_CERT: process.env.OMNIROUTE_TLS_CERT,
+    OMNIROUTE_TLS_KEY: process.env.OMNIROUTE_TLS_KEY,
+  };
+  process.env.DASHBOARD_PORT = "22128";
+  process.env.BASE_URL = "https://attacker.example";
+  delete process.env.NEXT_PUBLIC_BASE_URL;
+  delete process.env.NEXT_PUBLIC_APP_URL;
+  process.env.OMNIROUTE_BASE_PATH = "/omniroute";
+  process.env.OMNIROUTE_INTERNAL_SCHEME = "https";
+  delete process.env.OMNIROUTE_TLS_CERT;
+  delete process.env.OMNIROUTE_TLS_KEY;
+
+  try {
+    const scheduler = await loadScheduler("trusted-native-tls");
+    assert.equal(
+      scheduler.resolveModelSyncInternalBaseUrl("https://attacker.example:7777/steal"),
+      "https://localhost:22128/omniroute"
+    );
+    assert.equal(
+      scheduler.resolveModelSyncInternalBaseUrl("https://127.0.0.1:7777/nested/path"),
+      "https://localhost:22128/omniroute"
+    );
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test("modelSyncScheduler pins HTTPS transport to IPv4 while retaining localhost SNI", async () => {
+  const scheduler = await loadScheduler("pinned-loopback-tls-connector");
+  let forwardedOptions: Record<string, unknown> | undefined;
+  const connector = scheduler.createPinnedModelSyncTlsConnector((options, callback) => {
+    forwardedOptions = options;
+    callback(new Error("stop before socket creation"), null);
+  });
+
+  connector(
+    {
+      hostname: "localhost",
+      host: "localhost:22128",
+      protocol: "https:",
+      port: "22128",
+    },
+    () => undefined
+  );
+
+  assert.equal(forwardedOptions?.hostname, "127.0.0.1");
+  assert.equal(forwardedOptions?.servername, "localhost");
+});
+
+test("runtime launchers publish the actual internal listener scheme", () => {
+  const runNext = fs.readFileSync(path.join(process.cwd(), "scripts/dev/run-next.mjs"), "utf8");
+  const standalone = fs.readFileSync(
+    path.join(process.cwd(), "scripts/dev/standalone-server-ws.mjs"),
+    "utf8"
+  );
+
+  assert.match(runNext, /OMNIROUTE_INTERNAL_SCHEME\s*=\s*["']http["']/);
+  assert.match(standalone, /OMNIROUTE_INTERNAL_SCHEME\s*=\s*tlsOptions\s*\?\s*["']https["']/);
 });
 
 test("initCloudSync: startup initialization also starts model sync scheduler", () => {
@@ -214,18 +365,27 @@ test("modelSyncScheduler starts once, honors env interval and syncs only active 
     scheduler.startModelSyncScheduler("http://127.0.0.1:7777", 1000);
     scheduler.startModelSyncScheduler("http://127.0.0.1:8888", 9999);
 
-    assert.equal(timers.timeouts.length, 1);
-    assert.equal(timers.timeouts[0].ms, 5000);
+    assert.equal(timers.timeouts.length, 2);
+    assert.equal(timers.timeouts[0].ms, scheduler.MODEL_SYNC_STARTUP_DELAY_MS);
     assert.equal(timers.timeouts[0].unrefCalled, true);
+    // #13973: the recurring interval is phase-shifted against cleanup.ts's
+    // own 6h scheduler — armed only after the offset, never at boot.
+    assert.equal(timers.timeouts[1].ms, scheduler.MODEL_SYNC_STAGGER_OFFSET_MS);
+    assert.equal(timers.timeouts[1].unrefCalled, true);
+    assert.equal(timers.intervals.length, 0);
+    timers.timeouts[1].fn();
     assert.equal(timers.intervals.length, 1);
+    // The period itself is exactly the configured interval (no stagger added).
     assert.equal(timers.intervals[0].ms, 6 * 60 * 60 * 1000);
     assert.equal(timers.intervals[0].unrefCalled, true);
 
     await timers.timeouts[0].fn();
 
     assert.equal(fetchCalls.length, 1);
+    assert.match(fetchCalls[0].url, /^http:\/\/127\.0\.0\.1:20128\//);
     assert.match(fetchCalls[0].url, /\/api\/providers\/.*\/sync-models$/);
     assert.equal(fetchCalls[0].options.method, "POST");
+    assert.equal(fetchCalls[0].options.redirect, "error");
     assert.equal(fetchCalls[0].options.headers["Content-Type"], "application/json");
     assert.equal(
       fetchCalls[0].options.headers[scheduler.getModelSyncInternalAuthHeaderName()],
@@ -239,6 +399,50 @@ test("modelSyncScheduler starts once, honors env interval and syncs only active 
     assert.equal(timers.intervals[0].cleared, true);
   } finally {
     globalThis.fetch = originalFetch;
+    timers.restore();
+  }
+});
+
+test("#13973: phase offset delays the first periodic tick but never changes the configured period", async () => {
+  const timers = installTimerStubs();
+  const previousHours = process.env.MODEL_SYNC_INTERVAL_HOURS;
+  process.env.MODEL_SYNC_INTERVAL_HOURS = "4";
+
+  try {
+    const scheduler = await loadScheduler("phase-offset-period");
+    scheduler.startModelSyncScheduler("http://127.0.0.1:7777");
+    // Let the fire-and-forget codex revalidation import settle while the timer
+    // stubs are still installed, so its setTimeout(0) is captured here instead
+    // of arming a real loopback poll that leaks fetches into later tests.
+    await flushMicrotasks();
+
+    // No recurring timer exists at boot: arming it at boot is what made it
+    // collide with cleanup.ts's boot-anchored 6h interval.
+    assert.equal(timers.intervals.length, 0);
+    const phase = timers.timeouts.find((t) => t.ms === scheduler.MODEL_SYNC_STAGGER_OFFSET_MS);
+    assert.ok(phase, "expected a one-shot phase timer of MODEL_SYNC_STAGGER_OFFSET_MS");
+    assert.ok(scheduler.MODEL_SYNC_STAGGER_OFFSET_MS > 0);
+
+    phase.fn();
+    assert.equal(timers.intervals.length, 1);
+    // The operator-configured MODEL_SYNC_INTERVAL_HOURS=4 must be honored exactly.
+    assert.equal(timers.intervals[0].ms, 4 * 60 * 60 * 1000);
+
+    // Stopping before the phase fires must cancel the pending arm too.
+    scheduler.stopModelSyncScheduler();
+    assert.equal(timers.intervals[0].cleared, true);
+
+    timers.timeouts.length = 0;
+    timers.intervals.length = 0;
+    scheduler.startModelSyncScheduler("http://127.0.0.1:7777");
+    await flushMicrotasks();
+    const pending = timers.timeouts.find((t) => t.ms === scheduler.MODEL_SYNC_STAGGER_OFFSET_MS);
+    scheduler.stopModelSyncScheduler();
+    assert.equal(pending.cleared, true);
+    assert.equal(timers.intervals.length, 0);
+  } finally {
+    if (previousHours === undefined) delete process.env.MODEL_SYNC_INTERVAL_HOURS;
+    else process.env.MODEL_SYNC_INTERVAL_HOURS = previousHours;
     timers.restore();
   }
 });
@@ -287,4 +491,96 @@ test("modelSyncScheduler skips empty cycles and tolerates failing sync requests"
     globalThis.fetch = originalFetch;
     timers.restore();
   }
+});
+
+test("test 12: default interval is 6h; env hours override; no-arg uses default", async () => {
+  const source = fs.readFileSync(
+    path.join(process.cwd(), "src/shared/services/modelSyncScheduler.ts"),
+    "utf8"
+  );
+  assert.match(source, /DEFAULT_INTERVAL_MS\s*=\s*6\s*\*\s*60\s*\*\s*60\s*\*\s*1000/);
+  assert.doesNotMatch(source, /DEFAULT_INTERVAL_MS\s*=\s*24\s*\*\s*60\s*\*\s*60\s*\*\s*1000/);
+  assert.match(source, /intervalMs\s*=\s*DEFAULT_INTERVAL_MS/);
+  const { DEFAULT_INTERVAL_MS } = await import("../../src/shared/services/modelSyncScheduler.ts");
+  assert.equal(DEFAULT_INTERVAL_MS, 6 * 60 * 60 * 1000);
+});
+
+test("test 12: MODEL_SYNC_INTERVAL_HOURS still wins over default", () => {
+  const source = fs.readFileSync(
+    path.join(process.cwd(), "src/shared/services/modelSyncScheduler.ts"),
+    "utf8"
+  );
+  assert.match(source, /MODEL_SYNC_INTERVAL_HOURS/);
+  assert.match(source, /envHours \* 60 \* 60 \* 1000/);
+});
+
+async function flushMicrotasks(times = 20) {
+  for (let i = 0; i < times; i++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+test("runSyncCycle keeps in-flight catalog fetches at or below the cycle concurrency cap", async () => {
+  const connectionCount = 12;
+  const cycleCap = 4;
+
+  for (let i = 0; i < connectionCount; i++) {
+    await providersDb.createProviderConnection({
+      provider: "openai",
+      authType: "apikey",
+      name: `Auto Sync ${i}`,
+      apiKey: `gw-auth-placeholder-${i}`,
+      providerSpecificData: { autoSync: true },
+    });
+  }
+
+  const timers = installTimerStubs();
+  const originalFetch = globalThis.fetch;
+  let inFlight = 0;
+  let peak = 0;
+  let releaseGate;
+  const gate = new Promise((resolve) => {
+    releaseGate = resolve;
+  });
+
+  globalThis.fetch = async () => {
+    inFlight += 1;
+    peak = Math.max(peak, inFlight);
+    await gate;
+    inFlight -= 1;
+    return new Response(JSON.stringify({ syncedModels: 1 }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  try {
+    const scheduler = await loadScheduler("bounded-cycle-concurrency");
+    assert.equal(scheduler.MODEL_SYNC_CYCLE_CONCURRENCY, cycleCap);
+    scheduler.startModelSyncScheduler("http://127.0.0.1:7777", 1000);
+    const cycle = timers.timeouts[0].fn();
+    await flushMicrotasks();
+
+    assert.equal(peak, cycleCap);
+    assert.equal(inFlight, cycleCap);
+
+    releaseGate();
+    await cycle;
+    assert.equal(peak, cycleCap);
+    scheduler.stopModelSyncScheduler();
+  } finally {
+    globalThis.fetch = originalFetch;
+    timers.restore();
+  }
+});
+
+test("first model-sync cycle waits until after the 30s startup cleanup window", async () => {
+  const source = fs.readFileSync(
+    path.join(process.cwd(), "src/shared/services/modelSyncScheduler.ts"),
+    "utf8"
+  );
+  const { MODEL_SYNC_STARTUP_DELAY_MS } = await loadScheduler("startup-delay-constant");
+  assert.equal(MODEL_SYNC_STARTUP_DELAY_MS, 90_000);
+  assert.match(source, /MODEL_SYNC_STARTUP_DELAY_MS/);
+  assert.doesNotMatch(source, /setTimeout\(\(\) => runSyncCycle\(trustedApiBaseUrl\), 5_000\)/);
 });

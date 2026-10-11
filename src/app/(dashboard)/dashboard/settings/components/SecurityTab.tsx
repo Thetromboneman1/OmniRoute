@@ -1,10 +1,12 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { Card, Button, Input, Toggle } from "@/shared/components";
+import { Card, Button, Input, Toggle, Modal } from "@/shared/components";
 import { AI_PROVIDERS } from "@/shared/constants/providers";
+import ProviderIcon from "@/shared/components/ProviderIcon";
 import IPFilterSection from "./IPFilterSection";
 import SessionInfoCard from "./SessionInfoCard";
+import AuthzSection from "./AuthzSection";
 import { useTranslations } from "next-intl";
 
 export default function SecurityTab() {
@@ -13,7 +15,18 @@ export default function SecurityTab() {
   const [passwords, setPasswords] = useState({ current: "", new: "", confirm: "" });
   const [passStatus, setPassStatus] = useState({ type: "", message: "" });
   const [passLoading, setPassLoading] = useState(false);
+
+  const [requireLoginModalOpen, setRequireLoginModalOpen] = useState(false);
+  const [pendingRequireLoginVal, setPendingRequireLoginVal] = useState<boolean | null>(null);
+  const [requireLoginPassword, setRequireLoginPassword] = useState("");
+  const [requireLoginError, setRequireLoginError] = useState("");
+  const [requireLoginLoading, setRequireLoginLoading] = useState(false);
+  const [newBannedKeyword, setNewBannedKeyword] = useState("");
+
   const t = useTranslations("settings");
+  const tc = useTranslations("common");
+  const getSettingsLabel = (key: string, fallback: string) =>
+    typeof t.has === "function" && t.has(key) ? t(key) : fallback;
 
   useEffect(() => {
     fetch("/api/settings")
@@ -25,7 +38,15 @@ export default function SecurityTab() {
       .catch(() => setLoading(false));
   }, []);
 
-  const updateRequireLogin = async (requireLogin) => {
+  const updateRequireLogin = async (requireLogin: boolean) => {
+    if (settings.hasPassword) {
+      setPendingRequireLoginVal(requireLogin);
+      setRequireLoginPassword("");
+      setRequireLoginError("");
+      setRequireLoginModalOpen(true);
+      return;
+    }
+
     try {
       const res = await fetch("/api/settings", {
         method: "PATCH",
@@ -33,10 +54,40 @@ export default function SecurityTab() {
         body: JSON.stringify({ requireLogin }),
       });
       if (res.ok) {
-        setSettings((prev) => ({ ...prev, requireLogin }));
+        setSettings((prev: any) => ({ ...prev, requireLogin }));
       }
     } catch (err) {
       console.error("Failed to update require login:", err);
+    }
+  };
+
+  const confirmRequireLoginUpdate = async () => {
+    if (pendingRequireLoginVal === null) return;
+    setRequireLoginLoading(true);
+    setRequireLoginError("");
+
+    try {
+      const res = await fetch("/api/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requireLogin: pendingRequireLoginVal,
+          currentPassword: requireLoginPassword,
+        }),
+      });
+
+      if (res.ok) {
+        setSettings((prev: any) => ({ ...prev, requireLogin: pendingRequireLoginVal }));
+        setRequireLoginModalOpen(false);
+      } else {
+        const data = await res.json();
+        setRequireLoginError(data?.error?.message || t("errorOccurred"));
+      }
+    } catch (err) {
+      console.error("Failed to update require login:", err);
+      setRequireLoginError(t("errorOccurred"));
+    } finally {
+      setRequireLoginLoading(false);
     }
   };
 
@@ -63,6 +114,20 @@ export default function SecurityTab() {
     updateSetting("blockedProviders", updated);
   };
 
+  const customBannedSignals: string[] = settings.customBannedSignals || [];
+
+  const addBannedKeyword = () => {
+    const keyword = newBannedKeyword.trim().toLowerCase();
+    if (!keyword || customBannedSignals.includes(keyword)) return;
+    updateSetting("customBannedSignals", [...customBannedSignals, keyword]);
+    setNewBannedKeyword("");
+  };
+
+  const removeBannedKeyword = (index: number) => {
+    const updated = customBannedSignals.filter((_, i) => i !== index);
+    updateSetting("customBannedSignals", updated);
+  };
+
   const handlePasswordChange = async (e) => {
     e.preventDefault();
     if (passwords.new !== passwords.confirm) {
@@ -86,6 +151,7 @@ export default function SecurityTab() {
       if (res.ok) {
         setPassStatus({ type: "success", message: t("passwordUpdated") });
         setPasswords({ current: "", new: "", confirm: "" });
+        setSettings((prev: any) => ({ ...prev, hasPassword: true }));
       } else {
         setPassStatus({ type: "error", message: data.error || t("failedUpdatePassword") });
       }
@@ -121,6 +187,47 @@ export default function SecurityTab() {
               disabled={loading}
             />
           </div>
+
+          <Modal
+            isOpen={requireLoginModalOpen}
+            onClose={() => !requireLoginLoading && setRequireLoginModalOpen(false)}
+            title={t("currentPassword")}
+          >
+            <div className="flex flex-col gap-4">
+              <p className="text-sm text-text-muted">{t("enterCurrentPassword")}</p>
+              <Input
+                label={t("currentPassword")}
+                type="password"
+                placeholder={t("currentPassword")}
+                value={requireLoginPassword}
+                onChange={(e) => setRequireLoginPassword(e.target.value)}
+                onKeyDown={(e) =>
+                  e.key === "Enter" && requireLoginPassword && confirmRequireLoginUpdate()
+                }
+                autoFocus
+                disabled={requireLoginLoading}
+              />
+              {requireLoginError && <p className="text-sm text-red-500">{requireLoginError}</p>}
+              <div className="flex justify-end gap-2 pt-2">
+                <Button
+                  variant="ghost"
+                  onClick={() => setRequireLoginModalOpen(false)}
+                  disabled={requireLoginLoading}
+                >
+                  {tc("cancel")}
+                </Button>
+                <Button
+                  variant="primary"
+                  onClick={confirmRequireLoginUpdate}
+                  loading={requireLoginLoading}
+                  disabled={!requireLoginPassword}
+                >
+                  {t("confirm")}
+                </Button>
+              </div>
+            </div>
+          </Modal>
+
           {settings.requireLogin === true && (
             <form
               onSubmit={handlePasswordChange}
@@ -172,6 +279,8 @@ export default function SecurityTab() {
           )}
         </div>
       </Card>
+
+      <IPFilterSection />
 
       {/* API Endpoint Protection */}
       <Card>
@@ -246,12 +355,16 @@ export default function SecurityTab() {
                         : t("blockProviderTitle", { provider: provider.name })
                     }
                   >
-                    <span
-                      className="material-symbols-outlined text-[14px]"
-                      style={{ color: isBlocked ? undefined : provider.color }}
-                    >
-                      {isBlocked ? "block" : provider.icon}
-                    </span>
+                    {isBlocked ? (
+                      <span className="material-symbols-outlined text-[14px]">block</span>
+                    ) : (
+                      <ProviderIcon
+                        providerId={provider.id}
+                        size={14}
+                        className="shrink-0"
+                        style={{ color: provider.color }}
+                      />
+                    )}
                     {provider.name}
                     {isBlocked && (
                       <span className="material-symbols-outlined text-[12px] text-red-500">
@@ -272,8 +385,120 @@ export default function SecurityTab() {
         </div>
       </Card>
 
+      {/* Custom Banned Keywords */}
+      <Card>
+        <div className="flex items-center gap-3 mb-4">
+          <div className="p-2 rounded-lg bg-red-500/10 text-red-500">
+            <span className="material-symbols-outlined text-[20px]" aria-hidden="true">
+              report
+            </span>
+          </div>
+          <div>
+            <h3 className="text-lg font-semibold">
+              {getSettingsLabel("customBannedSignals", "Banned Keywords")}
+            </h3>
+            <p className="text-sm text-text-muted">
+              {getSettingsLabel(
+                "customBannedSignalsDesc",
+                "Additional keywords that trigger permanent account ban detection. Built-in keywords always apply."
+              )}
+            </p>
+          </div>
+        </div>
+        <div className="flex flex-col gap-4">
+          <div className="flex flex-col sm:flex-row gap-2">
+            <Input
+              placeholder={getSettingsLabel(
+                "customBannedSignalsPlaceholder",
+                "e.g. api key revoked"
+              )}
+              value={newBannedKeyword}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                setNewBannedKeyword(e.target.value)
+              }
+              onKeyDown={(e: React.KeyboardEvent) => {
+                if (e.key === "Enter") addBannedKeyword();
+              }}
+            />
+            <Button
+              variant="secondary"
+              size="sm"
+              icon="add"
+              onClick={addBannedKeyword}
+              disabled={!newBannedKeyword.trim()}
+            >
+              {getSettingsLabel("add", "Add")}
+            </Button>
+          </div>
+          {customBannedSignals.length > 0 ? (
+            <div className="flex flex-wrap gap-2">
+              {customBannedSignals.map((keyword, index) => (
+                <div
+                  key={index}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border bg-red-500/10 border-red-500/30 text-red-600 dark:text-red-400"
+                >
+                  {keyword}
+                  <button
+                    onClick={() => removeBannedKeyword(index)}
+                    className="material-symbols-outlined text-[12px] hover:opacity-70"
+                  >
+                    close
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-text-muted">
+              {getSettingsLabel(
+                "noCustomBannedSignals",
+                "No custom keywords. Only built-in keywords are active."
+              )}
+            </p>
+          )}
+        </div>
+      </Card>
+
+      <Card>
+        <div className="flex items-center gap-3 mb-4">
+          <div className="p-2 rounded-lg bg-primary/10 text-primary">
+            <span className="material-symbols-outlined">shield</span>
+          </div>
+          <div>
+            <p className="font-medium">
+              {getSettingsLabel("credentialRedaction", "Credential Redaction")}
+            </p>
+            <p className="text-sm text-text-muted">
+              {getSettingsLabel(
+                "credentialRedactionDesc",
+                "Redact API keys, tokens, and secrets from context sent to providers and from responses."
+              )}
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="font-medium">
+              {getSettingsLabel("enableCredentialRedaction", "Enable credential redaction")}
+            </p>
+            <p className="text-sm text-text-muted">
+              {getSettingsLabel(
+                "enableCredentialRedactionDesc",
+                "Scrubs API keys, tokens, private keys, and JWTs from messages, tool calls, and responses."
+              )}
+            </p>
+          </div>
+          <Toggle
+            checked={settings.credentialRedactionEnabled === true}
+            onChange={() =>
+              updateSetting("credentialRedactionEnabled", !settings.credentialRedactionEnabled)
+            }
+            disabled={loading}
+          />
+        </div>
+      </Card>
+
+      <AuthzSection />
       <SessionInfoCard />
-      <IPFilterSection />
     </div>
   );
 }

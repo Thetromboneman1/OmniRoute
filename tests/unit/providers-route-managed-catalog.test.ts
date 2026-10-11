@@ -12,10 +12,11 @@ process.env.INITIAL_PASSWORD = "admin-secret";
 
 const core = await import("../../src/lib/db/core.ts");
 const providersRoute = await import("../../src/app/api/providers/route.ts");
+const modelsDb = await import("../../src/lib/db/models.ts");
 
 function resetDb() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -25,17 +26,17 @@ test.beforeEach(() => {
 
 test.after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("providers route accepts managed local, audio, web-cookie and search providers", async () => {
   const cases = [
     {
-      provider: "glhf",
+      provider: "synthetic",
       body: {
-        provider: "glhf",
-        apiKey: "glhf-key",
-        name: "GLHF Chat",
+        provider: "synthetic",
+        apiKey: "synthetic-key",
+        name: "Synthetic",
       },
     },
     {
@@ -44,14 +45,6 @@ test("providers route accepts managed local, audio, web-cookie and search provid
         provider: "gitlab",
         apiKey: "glpat-test",
         name: "GitLab Duo PAT",
-      },
-    },
-    {
-      provider: "cablyai",
-      body: {
-        provider: "cablyai",
-        apiKey: "cably-key",
-        name: "CablyAI Primary",
       },
     },
     {
@@ -108,13 +101,6 @@ test("providers route accepts managed local, audio, web-cookie and search provid
         provider: "nous-research",
         apiKey: "nous-key",
         name: "Nous Research Primary",
-      },
-    },
-    {
-      provider: "petals",
-      body: {
-        provider: "petals",
-        name: "Petals Public Endpoint",
       },
     },
     {
@@ -281,6 +267,16 @@ test("providers route accepts managed local, audio, web-cookie and search provid
       },
     },
     {
+      provider: "llama-cpp",
+      body: {
+        provider: "llama-cpp",
+        name: "llama.cpp Local",
+        providerSpecificData: {
+          baseUrl: "http://127.0.0.1:8080/v1",
+        },
+      },
+    },
+    {
       provider: "triton",
       body: {
         provider: "triton",
@@ -401,6 +397,14 @@ test("providers route accepts managed local, audio, web-cookie and search provid
         },
       },
     },
+    {
+      provider: "jules",
+      body: {
+        provider: "jules",
+        apiKey: "jules-test-key",
+        name: "Jules API",
+      },
+    },
   ];
 
   for (const entry of cases) {
@@ -435,4 +439,91 @@ test("providers route rejects upstream proxy tools as direct provider connection
 
   assert.equal(response.status, 400);
   assert.deepEqual(await response.json(), { error: "Invalid provider" });
+});
+
+test("DELETE /api/providers batch deletes connections", async () => {
+  const createReq = async (provider, name, apiKey) =>
+    providersRoute.POST(
+      await makeManagementSessionRequest("http://localhost/api/providers", {
+        method: "POST",
+        body: { provider, name, apiKey },
+      })
+    );
+
+  const r1 = await createReq("synthetic", "Conn 1", "key-1");
+  const r2 = await createReq("synthetic", "Conn 2", "key-2");
+  const r3 = await createReq("synthetic", "Conn 3", "key-3");
+  const id1 = (await r1.json()).connection.id;
+  const id2 = (await r2.json()).connection.id;
+  const id3 = (await r3.json()).connection.id;
+  await modelsDb.addCustomModel("synthetic", "manual-model", "Manual", "manual");
+  await modelsDb.addCustomModel("synthetic", "imported-model", "Imported", "imported");
+
+  const deleteRes = await providersRoute.DELETE(
+    await makeManagementSessionRequest("http://localhost/api/providers", {
+      method: "DELETE",
+      body: { ids: [id1, id3] },
+    })
+  );
+
+  assert.equal(deleteRes.status, 200);
+  const deletePayload = (await deleteRes.json()) as any;
+  assert.equal(deletePayload.deleted, 2);
+
+  const listRes = await providersRoute.GET(
+    await makeManagementSessionRequest("http://localhost/api/providers")
+  );
+  const listPayload = (await listRes.json()) as any;
+  const remainingIds = listPayload.connections.map((c) => c.id);
+  assert.equal(remainingIds.includes(id1), false);
+  assert.equal(remainingIds.includes(id3), false);
+  assert.equal(remainingIds.includes(id2), true);
+  assert.deepEqual(
+    (await modelsDb.getCustomModels("synthetic")).map((model: { id: string }) => model.id),
+    ["manual-model", "imported-model"]
+  );
+
+  const deleteLastRes = await providersRoute.DELETE(
+    await makeManagementSessionRequest("http://localhost/api/providers", {
+      method: "DELETE",
+      body: { ids: [id2] },
+    })
+  );
+  assert.equal(deleteLastRes.status, 200);
+  assert.deepEqual(
+    (await modelsDb.getCustomModels("synthetic")).map((model: { id: string }) => model.id),
+    ["manual-model"]
+  );
+});
+
+test("DELETE /api/providers rejects empty ids array", async () => {
+  const res = await providersRoute.DELETE(
+    await makeManagementSessionRequest("http://localhost/api/providers", {
+      method: "DELETE",
+      body: { ids: [] },
+    })
+  );
+  assert.equal(res.status, 400);
+});
+
+test("DELETE /api/providers rejects ids over 100 limit", async () => {
+  const res = await providersRoute.DELETE(
+    await makeManagementSessionRequest("http://localhost/api/providers", {
+      method: "DELETE",
+      body: { ids: Array.from({ length: 101 }, (_, i) => `id-${i}`) },
+    })
+  );
+  assert.equal(res.status, 400);
+  const payload = (await res.json()) as any;
+  assert.equal(payload.error, "Cannot delete more than 100 connections at once");
+});
+
+test("DELETE /api/providers rejects non-array ids", async () => {
+  const res = await providersRoute.DELETE(
+    await makeManagementSessionRequest("http://localhost/api/providers", {
+      method: "DELETE",
+      body: { ids: "not-an-array" },
+    })
+  );
+  assert.equal(res.status, 400);
 });

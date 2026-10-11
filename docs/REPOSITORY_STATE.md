@@ -1,15 +1,15 @@
 # Repository State
 
-Updated: 2026-08-18
+Updated: 2026-10-11
 
 This file is generated from the tracked repository tree. It is committed so
 the documentation record advances with implementation changes.
 
 - Repository: `Thetromboneman1/OmniRoute`
 - Default branch: `main`
-- Implementation fingerprint: `08d72b5fb792b96b`
-- Maintained documents: 1077
-- Architecture assets: 59
+- Implementation fingerprint: `075dab06259689c9`
+- Maintained documents: 10469
+- Architecture assets: 29
 
 ## Detected architecture
 
@@ -23,6 +23,7 @@ the documentation record advances with implementation changes.
 
 - Source modules
 - Automation modules
+- Workspace packages
 
 ### State
 

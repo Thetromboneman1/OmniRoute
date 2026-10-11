@@ -1,10 +1,51 @@
 import { execFile, spawn } from "node:child_process";
-import { closeSync, mkdirSync, openSync, existsSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, existsSync, readFileSync } from "node:fs";
 import { access } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { homedir } from "node:os";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * Check whether a directory's package.json is a valid project-root marker by
+ * requiring a non-empty `name` field.  The Next.js standalone build writes a
+ * synthetic `.build/next/package.json` = `{"type":"commonjs"}` that should not
+ * be mistaken for the real project root.
+ *
+ * Swallows read / parse errors (missing file, invalid JSON) and returns false
+ * so the walk-up continues.
+ *
+ * @internal — exported for testability.
+ */
+export function isValidPackageMarker(dir: string): boolean {
+  try {
+    const content = readFileSync(path.join(dir, "package.json"), "utf-8");
+    const pkg = JSON.parse(content);
+    return typeof pkg.name === "string" && pkg.name.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** @internal — exported for testability. */
+export function resolveProjectRoot(
+  fallback: string,
+  startDir: string = typeof __dirname !== "undefined" ? __dirname : process.cwd()
+): string {
+  let dir = path.resolve(startDir);
+  while (true) {
+    if (existsSync(path.join(dir, ".git"))) return dir;
+    if (existsSync(path.join(dir, "package.json")) && isValidPackageMarker(dir)) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return fallback;
+}
+
+const FALLBACK_CWD = process.env.HOME || homedir() || "/tmp";
+export const PROJECT_ROOT: string = resolveProjectRoot(FALLBACK_CWD);
 
 type ComposeCommand = "docker compose" | "docker-compose";
 export type AutoUpdateMode = "npm" | "docker-compose" | "source";
@@ -44,6 +85,82 @@ function normalizeMode(raw: string | undefined): AutoUpdateMode {
   return "npm";
 }
 
+/**
+ * Match `node_modules` as a real path **segment**, not a substring — a folder literally named
+ * "my-node_modules-backup" must NOT count as an installed-package location. Operates on a local
+ * filesystem path (`__dirname`), never untrusted input; the pattern is linear (ReDoS-safe).
+ *
+ * @internal — exported for testability.
+ */
+export function isUnderNodeModules(dir: string): boolean {
+  return /(^|[/\\])node_modules([/\\]|$)/.test(dir);
+}
+
+/**
+ * Match an installed `omniroute` package directory as a path segment (`.../node_modules/omniroute/...`),
+ * on both separators. Covers npm global installs and pnpm's `.pnpm/omniroute@x/node_modules/omniroute`.
+ */
+const OMNIROUTE_PACKAGE_SEGMENT = /(^|[/\\])node_modules[/\\]omniroute([/\\]|$)/;
+
+/**
+ * Directory used to tell an npm install from a source checkout at runtime.
+ *
+ * `__dirname` cannot be trusted on its own: inside the Next.js server bundle Turbopack replaces it
+ * at build time with a virtual path (`"/ROOT/src/lib/system"`) that does not exist on disk and never
+ * contains `node_modules`, so every global npm install was classified as "source" and the dashboard
+ * showed "Not a git repository" instead of offering the npm update.
+ *
+ * - `compiledDir` is used when it exists on disk (unbundled/dev runs keep the previous behavior).
+ * - Otherwise the first entry script that lives inside an installed `omniroute` package wins:
+ *   `process.argv[1]` for `omniroute serve` / `node .../dist/server-ws.mjs`, and
+ *   `process.env.pm_exec_path` because under pm2 `argv[1]` is pm2's own ProcessContainerFork.js.
+ *   A source checkout started via `node_modules/.bin/next` does not match, so it stays "source".
+ * - Anything else returns `compiledDir`, or `""` when there is none; neither sits under
+ *   `node_modules`, so the result is "source", same as before this fix.
+ *
+ * The directory is cut with a separator-agnostic regex instead of `path.dirname`, so a Windows
+ * path is handled the same on every platform (`argv[1]` is always absolute).
+ *
+ * @internal — exported for testability.
+ */
+export function resolveRuntimeModuleDir(
+  compiledDir: string | undefined = typeof __dirname !== "undefined" ? __dirname : undefined,
+  entryScripts: ReadonlyArray<string | undefined> = [process.argv[1], process.env.pm_exec_path],
+  exists: (target: string) => boolean = existsSync
+): string {
+  if (compiledDir && exists(compiledDir)) return compiledDir;
+  for (const entry of entryScripts) {
+    if (!entry) continue;
+    const entryDir = entry.replace(/[/\\][^/\\]*$/, "");
+    if (OMNIROUTE_PACKAGE_SEGMENT.test(entryDir)) return entryDir;
+  }
+  return compiledDir ?? "";
+}
+
+/**
+ * Decide the effective auto-update channel when the operator left it at the default ("npm").
+ *
+ * - A source checkout (`.git` present) always self-updates via git, even if it also lives under a
+ *   `node_modules` path.
+ * - Otherwise "npm" mode only makes sense when the running module sits under a real
+ *   `node_modules/` path segment (a global or local package install). Anything else — a downloaded
+ *   build/zip with no `.git` — is treated as source.
+ *
+ * Behavior matches the previous inline heuristic for every realistic path; it only tightens the
+ * pathological case where "node_modules" appeared as a substring but not a path segment (Bug 1,
+ * security-report v3.8.15). Pure + injectable so the branch logic is unit-testable.
+ *
+ * @internal — exported for testability.
+ */
+export function resolveAutoUpdateMode(
+  rawMode: AutoUpdateMode,
+  detection: { isGitRepo: boolean; currentDir: string }
+): AutoUpdateMode {
+  if (rawMode !== "npm") return rawMode;
+  if (detection.isGitRepo) return "source";
+  return isUnderNodeModules(detection.currentDir) ? "npm" : "source";
+}
+
 async function pathExists(targetPath: string): Promise<boolean> {
   try {
     await access(targetPath);
@@ -64,21 +181,31 @@ function parsePatchCommits(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
-export function getAutoUpdateConfig(env: NodeJS.ProcessEnv = process.env): AutoUpdateConfig {
+/**
+ * Runtime probes for {@link getAutoUpdateConfig}. Production callers omit it; tests inject a bundled
+ * `compiledDir`, entry scripts and `exists` to exercise the npm-vs-source wiring end to end.
+ *
+ * @internal
+ */
+export type AutoUpdateRuntimeProbe = {
+  compiledDir?: string;
+  entryScripts?: ReadonlyArray<string | undefined>;
+  exists?: (target: string) => boolean;
+};
+
+export function getAutoUpdateConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  runtime: AutoUpdateRuntimeProbe = {}
+): AutoUpdateConfig {
   const dataDir = env.DATA_DIR || "/tmp/omniroute";
   const repoDir = env.AUTO_UPDATE_REPO_DIR || "/workspace/omniroute";
 
   let mode = normalizeMode(env.AUTO_UPDATE_MODE);
   if (mode === "npm") {
-    const isGitRepo = existsSync(path.join(process.cwd(), ".git"));
-    const currentDir = typeof __dirname !== "undefined" ? __dirname : process.cwd();
-    const isGlobalNodeModules = currentDir.includes("node_modules");
-
-    // If we are not in a global node_modules directory, we are likely a local source install/build.
-    // Even if .git is missing (downloaded zip), we should treat it as source.
-    if (isGitRepo || !isGlobalNodeModules) {
-      mode = "source";
-    }
+    const exists = runtime.exists ?? existsSync;
+    const isGitRepo = exists(path.join(PROJECT_ROOT, ".git"));
+    const currentDir = resolveRuntimeModuleDir(runtime.compiledDir, runtime.entryScripts, exists);
+    mode = resolveAutoUpdateMode(mode, { isGitRepo, currentDir });
   }
 
   return {
@@ -117,7 +244,7 @@ export async function validateAutoUpdateRuntime(
   existsImpl: (targetPath: string) => Promise<boolean> = pathExists
 ): Promise<AutoUpdateValidation> {
   if (config.mode === "source") {
-    const gitDir = path.join(process.cwd(), ".git");
+    const gitDir = path.join(PROJECT_ROOT, ".git");
     if (!(await existsImpl(gitDir))) {
       return {
         supported: false,
@@ -197,7 +324,7 @@ export async function validateAutoUpdateRuntime(
 export async function ensureGitTagExists(
   targetTag: string,
   execFileImpl: ExecFileLike = execFileAsync,
-  cwd = process.cwd()
+  cwd = PROJECT_ROOT
 ): Promise<void> {
   try {
     await execFileImpl("git", ["rev-parse", "-q", "--verify", `refs/tags/${targetTag}`], {
@@ -212,7 +339,10 @@ export async function ensureGitTagExists(
 export function buildNpmUpdateScript(latest: string): string {
   return [
     "set -eu",
-    `npm install -g omniroute@${latest} --ignore-scripts --legacy-peer-deps`,
+    // --include=optional keeps the optionalDependencies (better-sqlite3, keytar,
+    // tls-client, and the llmlingua SLM stack) installed on every update so an
+    // `omit=optional` config / .npmrc cannot silently drop them.
+    `npm install -g omniroute@${latest} --include=optional --ignore-scripts --legacy-peer-deps`,
     "if command -v pm2 >/dev/null 2>&1; then",
     "  pm2 restart omniroute || true",
     "fi",
@@ -234,8 +364,8 @@ export function buildSourceUpdateScript(latest: string, gitRemote = "origin"): s
     'backup_branch="pre-update/$(git rev-parse --short HEAD)-$(date +%Y%m%d-%H%M%S)"',
     'git branch "$backup_branch" 2>/dev/null || true',
     `git checkout "${targetTag}"`,
-    "npm install --legacy-peer-deps",
-    "node scripts/sync-env.mjs 2>/dev/null || true",
+    "npm install --include=optional --legacy-peer-deps",
+    "node scripts/dev/sync-env.mjs 2>/dev/null || true",
     "npm run build",
     "if command -v pm2 >/dev/null 2>&1; then",
     "  pm2 restart omniroute --update-env || true",

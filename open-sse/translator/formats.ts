@@ -5,7 +5,8 @@ export const FORMATS = {
   OPENAI_RESPONSE: "openai-response",
   CLAUDE: "claude",
   GEMINI: "gemini",
-  GEMINI_CLI: "gemini-cli",
+  /** Naver CLOVA Studio Chat Completions v3 (native envelope, model in URL path). */
+  CLOVA: "clova",
   CODEX: "codex",
   ANTIGRAVITY: "antigravity",
   KIRO: "kiro",

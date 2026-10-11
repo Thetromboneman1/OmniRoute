@@ -1,70 +1,160 @@
-import { antigravityUserAgent } from "../services/antigravityHeaders.ts";
+import { getAntigravityContentHeaders } from "../services/antigravityHeaders.ts";
+import type { AntigravityClientProfile } from "@/shared/constants/antigravityClientProfile";
 
-export const GITHUB_COPILOT_API_VERSION = "2025-04-01";
-export const GITHUB_COPILOT_EDITOR_VERSION = "vscode/1.117.0";
-export const GITHUB_COPILOT_CHAT_PLUGIN_VERSION = "copilot-chat/0.45.1";
-export const GITHUB_COPILOT_CHAT_USER_AGENT = "GitHubCopilotChat/0.45.1";
-export const GITHUB_COPILOT_REFRESH_PLUGIN_VERSION = "copilot/1.388.0";
+// GitHub Copilot request identity. Ported to match the GitHub Copilot CLI
+// (`copilot` npm package) wire identity that Hermes captured live, NOT the
+// VS Code Copilot Chat extension. The CLI's `copilot-developer-cli` integration
+// id is the catalog-unlock lever: it exposes the full entitled model set
+// (gemini-3.x, gpt-5.4-nano, the full opus reasoning range) where `vscode-chat`
+// returns a narrower list. Version strings track the live-captured CLI 1.0.88.
+export const GITHUB_COPILOT_API_VERSION = "2026-08-01";
+export const GITHUB_COPILOT_CLI_VERSION = "1.0.88";
+const GITHUB_COPILOT_VERSION_OVERRIDE_ENV = "GITHUB_COPILOT_CLI_VERSION";
+const SAFE_COPILOT_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
+
+function getSafeCopilotEnvValue(name: string, pattern: RegExp): string | null {
+  const raw = typeof process === "undefined" ? undefined : process.env?.[name];
+  if (typeof raw !== "string") return null;
+  const normalized = raw.trim();
+  if (!normalized || !pattern.test(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+/** Captured pin, overridable via GITHUB_COPILOT_CLI_VERSION (#12417). */
+export function getGitHubCopilotCliVersion(): string {
+  return (
+    getSafeCopilotEnvValue(GITHUB_COPILOT_VERSION_OVERRIDE_ENV, SAFE_COPILOT_VERSION_PATTERN) ||
+    GITHUB_COPILOT_CLI_VERSION
+  );
+}
+
+export const GITHUB_COPILOT_EDITOR_VERSION = `copilot/${GITHUB_COPILOT_CLI_VERSION}`;
+export const GITHUB_COPILOT_CHAT_PLUGIN_VERSION = `copilot-chat/${GITHUB_COPILOT_CLI_VERSION}`;
+export const GITHUB_COPILOT_CHAT_USER_AGENT = `GitHubCopilotChat/${GITHUB_COPILOT_CLI_VERSION}`;
+export const GITHUB_COPILOT_CLI_USER_AGENT = `copilot/${GITHUB_COPILOT_CLI_VERSION}`;
+export const GITHUB_COPILOT_REFRESH_PLUGIN_VERSION = `copilot/${GITHUB_COPILOT_CLI_VERSION}`;
 export const GITHUB_COPILOT_REFRESH_USER_AGENT = "GithubCopilot/1.0";
-export const GITHUB_COPILOT_INTEGRATION_ID = "vscode-chat";
-export const GITHUB_COPILOT_OPENAI_INTENT = "conversation-panel";
-export const GITHUB_COPILOT_DEFAULT_INITIATOR = "user";
-export const GITHUB_COPILOT_USER_AGENT_LIBRARY = "electron-fetch";
 
-export const QWEN_CLI_VERSION = "0.15.4";
+/** Request-time Copilot Chat UA. Pin consts above stay for lockstep tests (#12417). */
+export function getGitHubCopilotChatUserAgent(): string {
+  return `GitHubCopilotChat/${getGitHubCopilotCliVersion()}`;
+}
+export const GITHUB_COPILOT_CLI_INTEGRATION_ID = "copilot-developer-cli";
+export const GITHUB_COPILOT_CHAT_INTEGRATION_ID = "copilot-chat";
+export const GITHUB_COPILOT_INTEGRATION_ID = GITHUB_COPILOT_CLI_INTEGRATION_ID;
+export const GITHUB_COPILOT_OPENAI_INTENT = "conversation-agent";
+export const GITHUB_COPILOT_INTERACTION_TYPE = "conversation-user";
+export const GITHUB_COPILOT_HARNESS_ID = "copilot-sdk";
+export const GITHUB_COPILOT_DEFAULT_INITIATOR = "user";
+
+export function normalizeCopilotIntegrationId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || /[\r\n]/.test(trimmed)) return null;
+  return trimmed;
+}
+
+export function resolveCopilotIntegrationIdOverride(): string | null {
+  const raw = typeof process === "undefined" ? undefined : process.env?.COPILOT_INTEGRATION_ID;
+  return normalizeCopilotIntegrationId(raw);
+}
+
+// Stable per-install device fingerprint (the CLI's X-Client-Machine-Id). The
+// real @github/copilot CLI sends ONE stable UUID on every inference + /models
+// call (verified identical across all captured requests) — a per-call random id
+// would itself be an anti-fingerprint tell. We mint one per process and cache
+// it (env-overridable via GITHUB_COPILOT_MACHINE_ID), which keeps it stable for
+// the lifetime of a running OmniRoute instance, matching "one CLI install".
+let _copilotMachineId: string | null = null;
+export function getGitHubCopilotMachineId(): string {
+  const override = (process?.env?.GITHUB_COPILOT_MACHINE_ID || "").trim();
+  if (override) return override;
+  if (_copilotMachineId) return _copilotMachineId;
+  _copilotMachineId =
+    crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return _copilotMachineId;
+}
+
+export const QWEN_CLI_VERSION = "0.19.3";
 export const QWEN_STAINLESS_LANG = "js";
-export const QWEN_STAINLESS_PACKAGE_VERSION = "5.11.0";
-export const QWEN_STAINLESS_RETRY_COUNT = "1";
-export const QWEN_STAINLESS_RUNTIME = "node";
-export const QWEN_ACCEPT_LANGUAGE = "*";
-export const QWEN_SEC_FETCH_MODE = "cors";
 
 export const QODER_DEFAULT_USER_AGENT = "Qoder-Cli";
+
+// CODEBUDDY_CN_USER_AGENT is the single source of truth for the CLI/CodeBuddy version
+// string. It MUST stay identical across OAuth (src/lib/oauth/constants/oauth.ts), chat
+// completions (open-sse/config/providers/registry/codebuddy-cn/index.ts) and usage/quota
+// (open-sse/services/usage/codebuddy-cn.ts) — a mismatched version string across a
+// single account's auth vs. chat calls is exactly the kind of internally-inconsistent
+// client fingerprint Tencent's WAF flags as anomalous (#12702).
+export const CODEBUDDY_CN_USER_AGENT = "CLI/2.108.1 CodeBuddy/2.108.1";
 
 export const KIRO_SDK_USER_AGENT = "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0";
 export const KIRO_AMZ_USER_AGENT = "aws-sdk-js/3.0.0 kiro-ide/1.0.0";
 export const KIRO_STREAMING_TARGET =
   "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
 
-export const CURSOR_REGISTRY_VERSION = "3.2.14";
+export const CURSOR_REGISTRY_VERSION = "3.9";
 
 export function getGitHubCopilotChatHeaders(
   accept = "application/json",
-  initiator = GITHUB_COPILOT_DEFAULT_INITIATOR
+  initiator = GITHUB_COPILOT_DEFAULT_INITIATOR,
+  options: { vision?: boolean; intent?: string; integrationId?: string } = {}
 ): Record<string, string> {
-  return {
-    "copilot-integration-id": GITHUB_COPILOT_INTEGRATION_ID,
-    "editor-version": GITHUB_COPILOT_EDITOR_VERSION,
-    "editor-plugin-version": GITHUB_COPILOT_CHAT_PLUGIN_VERSION,
-    "user-agent": GITHUB_COPILOT_CHAT_USER_AGENT,
-    "openai-intent": GITHUB_COPILOT_OPENAI_INTENT,
+  // Matches the live @github/copilot CLI 1.0.88 inference request 1:1 (MITM-
+  // captured). NOTE the CLI does NOT send `editor-plugin-version` nor
+  // `x-vscode-user-agent-library-version` on the inference path — those belong
+  // to the VS Code Copilot Chat extension, not the CLI. Sending an incomplete
+  // OR an over-complete header fingerprint is itself a flagging signal, so we
+  // send exactly the CLI's set. The `copilot-integration-id` (copilot-developer-cli)
+  // is the catalog-unlock lever; the stable X-Client-Machine-Id is the CLI's
+  // per-install device fingerprint.
+  const version = getGitHubCopilotCliVersion();
+  const integrationId =
+    normalizeCopilotIntegrationId(options.integrationId) ||
+    resolveCopilotIntegrationIdOverride() ||
+    GITHUB_COPILOT_CLI_INTEGRATION_ID;
+  const headers: Record<string, string> = {
+    "copilot-integration-id": integrationId,
+    "editor-version": `copilot/${version}`,
+    "user-agent": `copilot/${version} (${getRuntimePlatform()}) term/unknown`,
+    "openai-intent": options.intent || GITHUB_COPILOT_OPENAI_INTENT,
+    "x-interaction-type": GITHUB_COPILOT_INTERACTION_TYPE,
+    "copilot-harness-id": GITHUB_COPILOT_HARNESS_ID,
     "x-github-api-version": GITHUB_COPILOT_API_VERSION,
-    "x-vscode-user-agent-library-version": GITHUB_COPILOT_USER_AGENT_LIBRARY,
+    "x-client-machine-id": getGitHubCopilotMachineId(),
     "X-Initiator": initiator,
     Accept: accept,
     "Content-Type": "application/json",
   };
+  // Copilot's /v1/messages proxy returns an empty content block for image
+  // requests unless this is set. Add it only when the turn carries an image.
+  if (options.vision) {
+    headers["copilot-vision-request"] = "true";
+  }
+  return headers;
 }
 
-function getRuntimePlatform(): string {
+export function getRuntimePlatform(): string {
   return typeof process !== "undefined" && typeof process.platform === "string"
     ? process.platform
     : "unknown";
 }
 
-function getRuntimeArch(): string {
+export function getRuntimeArch(): string {
   return typeof process !== "undefined" && typeof process.arch === "string"
     ? process.arch
     : "unknown";
 }
 
-function getRuntimeVersion(): string {
+export function getRuntimeVersion(): string {
   return typeof process !== "undefined" && typeof process.version === "string"
     ? process.version
     : "unknown";
 }
 
-function normalizeStainlessPlatform(platform: string = getRuntimePlatform()): string {
+export function normalizeStainlessPlatform(platform: string = getRuntimePlatform()): string {
   const normalized = platform.toLowerCase();
   if (normalized.includes("ios")) return "iOS";
   if (normalized === "android") return "Android";
@@ -76,7 +166,7 @@ function normalizeStainlessPlatform(platform: string = getRuntimePlatform()): st
   return normalized ? `Other:${normalized}` : "Unknown";
 }
 
-function normalizeStainlessArch(arch: string = getRuntimeArch()): string {
+export function normalizeStainlessArch(arch: string = getRuntimeArch()): string {
   if (arch === "x32") return "x32";
   if (arch === "x86_64" || arch === "x64") return "x64";
   if (arch === "arm") return "arm";
@@ -85,49 +175,31 @@ function normalizeStainlessArch(arch: string = getRuntimeArch()): string {
 }
 
 export function getQwenCliUserAgent(version = QWEN_CLI_VERSION): string {
-  // Qwen Code builds this from the runtime process values. Keep it runtime-derived so
-  // packaged deployments use their own platform/architecture instead of a maintainer's host.
+  // Qoder's DashScope-compatible backend expects Qwen Code's runtime-derived wire identity.
+  // Keep it runtime-derived so packaged deployments use their own platform/architecture.
   return `QwenCode/${version} (${getRuntimePlatform()}; ${getRuntimeArch()})`;
 }
 
 export function getGitHubCopilotInternalUserHeaders(authorization: string): Record<string, string> {
+  const version = getGitHubCopilotCliVersion();
   return {
     Authorization: authorization,
     Accept: "application/json",
     "X-GitHub-Api-Version": GITHUB_COPILOT_API_VERSION,
-    "User-Agent": GITHUB_COPILOT_CHAT_USER_AGENT,
-    "Editor-Version": GITHUB_COPILOT_EDITOR_VERSION,
-    "Editor-Plugin-Version": GITHUB_COPILOT_CHAT_PLUGIN_VERSION,
+    "User-Agent": `GitHubCopilotChat/${version}`,
+    "Editor-Version": `copilot/${version}`,
+    "Editor-Plugin-Version": `copilot-chat/${version}`,
   };
 }
 
 export function getGitHubCopilotRefreshHeaders(authorization: string): Record<string, string> {
+  const version = getGitHubCopilotCliVersion();
   return {
     Authorization: authorization,
     Accept: "application/json",
     "User-Agent": GITHUB_COPILOT_REFRESH_USER_AGENT,
-    "Editor-Version": GITHUB_COPILOT_EDITOR_VERSION,
-    "Editor-Plugin-Version": GITHUB_COPILOT_REFRESH_PLUGIN_VERSION,
-  };
-}
-
-export function getQwenOauthHeaders(): Record<string, string> {
-  const userAgent = getQwenCliUserAgent();
-  return {
-    "User-Agent": userAgent,
-    "X-Dashscope-AuthType": "qwen-oauth",
-    "X-Dashscope-CacheControl": "enable",
-    "X-Dashscope-UserAgent": userAgent,
-    "X-Stainless-Arch": normalizeStainlessArch(),
-    "X-Stainless-Lang": QWEN_STAINLESS_LANG,
-    "X-Stainless-Os": normalizeStainlessPlatform(),
-    "X-Stainless-Package-Version": QWEN_STAINLESS_PACKAGE_VERSION,
-    "X-Stainless-Retry-Count": QWEN_STAINLESS_RETRY_COUNT,
-    "X-Stainless-Runtime": QWEN_STAINLESS_RUNTIME,
-    "X-Stainless-Runtime-Version": getRuntimeVersion(),
-    Connection: "keep-alive",
-    "Accept-Language": QWEN_ACCEPT_LANGUAGE,
-    "Sec-Fetch-Mode": QWEN_SEC_FETCH_MODE,
+    "Editor-Version": `copilot/${version}`,
+    "Editor-Plugin-Version": `copilot/${version}`,
   };
 }
 
@@ -150,14 +222,14 @@ export function getQoderDashscopeCompatHeaders(): Record<string, string> {
   };
 }
 
-export function getAntigravityUserAgent(): string {
-  return antigravityUserAgent();
+export function getAntigravityUserAgent(profile: AntigravityClientProfile = "ide"): string {
+  return getAntigravityContentHeaders(profile)["User-Agent"];
 }
 
-export function getAntigravityProviderHeaders(): Record<string, string> {
-  return {
-    "User-Agent": getAntigravityUserAgent(),
-  };
+export function getAntigravityProviderHeaders(
+  profile: AntigravityClientProfile = "ide"
+): Record<string, string> {
+  return getAntigravityContentHeaders(profile);
 }
 
 export function getKiroServiceHeaders(
@@ -184,19 +256,5 @@ export function getCursorRegistryHeaders(
     "connect-protocol-version": "1",
     "Content-Type": "application/connect+proto",
     "User-Agent": getCursorUserAgent(version),
-  };
-}
-
-export function getCursorUsageHeaders(
-  accessToken: string,
-  version = CURSOR_REGISTRY_VERSION
-): Record<string, string> {
-  const userAgent = getCursorUserAgent(version);
-  return {
-    Authorization: `Bearer ${accessToken}`,
-    Accept: "application/json",
-    "User-Agent": userAgent,
-    "x-cursor-client-version": version,
-    "x-cursor-user-agent": userAgent,
   };
 }

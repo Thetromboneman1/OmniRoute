@@ -6,13 +6,53 @@ import {
 } from "./base.ts";
 import { FETCH_TIMEOUT_MS } from "../config/constants.ts";
 import { normalizeSessionCookieHeader } from "@/lib/providers/webCookieAuth";
+import { prepareToolMessages, buildToolAwareResult } from "../translator/webTools.ts";
 
 const BLACKBOX_CHAT_API = "https://app.blackbox.ai/api/chat";
 const BLACKBOX_DEFAULT_COOKIE = "next-auth.session-token";
 const BLACKBOX_USER_AGENT =
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
 const SESSION_CACHE_TTL_MS = 5 * 60_000; // 5 minutes
+
+/**
+ * Resolve the `validated` token for Blackbox `/api/chat` requests.
+ *
+ * Blackbox's web frontend ships a real validation token (exported as `tk` from
+ * its Next.js JavaScript chunks). If the value sent in `transformedBody.validated`
+ * does not match that token, the upstream returns HTTP 403 even when the session
+ * cookie and subscription are valid — see issue #2252.
+ *
+ * Resolution priority:
+ *   1. `BLACKBOX_WEB_VALIDATED_TOKEN` env var (operator-supplied, preferred)
+ *   2. Random UUID fallback (the original behavior; works only as long as
+ *      Blackbox doesn't enforce a specific frontend `tk` value)
+ *
+ * We do NOT scrape Blackbox's Next.js chunks at runtime to extract `tk` — that
+ * coupling to their bundle hash is fragile and would silently break on every
+ * frontend deploy. The env-var override gives operators who have figured out
+ * the token a stable way to use it without patching code.
+ */
+export function resolveBlackboxValidatedToken(): string {
+  const explicit = (process.env.BLACKBOX_WEB_VALIDATED_TOKEN || "").trim();
+  if (explicit) return explicit;
+  return crypto.randomUUID();
+}
+
+/**
+ * Detect whether a Blackbox 403 response body indicates that the `validated`
+ * token is the problem (as opposed to a missing cookie or expired subscription).
+ * Surfaces the BLACKBOX_WEB_VALIDATED_TOKEN env var as the next step.
+ */
+function isBlackboxValidatedTokenError(responseText: string): boolean {
+  const lower = (responseText || "").toLowerCase();
+  return (
+    lower.includes("invalid validated token") ||
+    lower.includes("invalid validated") ||
+    lower.includes("validation token") ||
+    lower.includes("invalid token")
+  );
+}
 
 type CachedSession = {
   sessionData: Record<string, unknown> | null;
@@ -21,6 +61,7 @@ type CachedSession = {
   fetchedAt: number;
 };
 
+const MAX_SESSIONS = 100;
 const sessionCache = new Map<string, CachedSession>();
 
 type BlackboxMessage = {
@@ -155,29 +196,9 @@ function buildStreamingResponse(
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
 
-  return new ReadableStream({
-    start(controller) {
-      controller.enqueue(
-        encoder.encode(
-          sseChunk({
-            id,
-            object: "chat.completion.chunk",
-            created,
-            model,
-            system_fingerprint: null,
-            choices: [
-              {
-                index: 0,
-                delta: { role: "assistant" },
-                finish_reason: null,
-                logprobs: null,
-              },
-            ],
-          })
-        )
-      );
-
-      if (responseText) {
+  return new ReadableStream(
+    {
+      start(controller) {
         controller.enqueue(
           encoder.encode(
             sseChunk({
@@ -189,7 +210,7 @@ function buildStreamingResponse(
               choices: [
                 {
                   index: 0,
-                  delta: { content: responseText },
+                  delta: { role: "assistant" },
                   finish_reason: null,
                   logprobs: null,
                 },
@@ -197,24 +218,47 @@ function buildStreamingResponse(
             })
           )
         );
-      }
 
-      controller.enqueue(
-        encoder.encode(
-          sseChunk({
-            id,
-            object: "chat.completion.chunk",
-            created,
-            model,
-            system_fingerprint: null,
-            choices: [{ index: 0, delta: {}, finish_reason: "stop", logprobs: null }],
-          })
-        )
-      );
-      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-      controller.close();
+        if (responseText) {
+          controller.enqueue(
+            encoder.encode(
+              sseChunk({
+                id,
+                object: "chat.completion.chunk",
+                created,
+                model,
+                system_fingerprint: null,
+                choices: [
+                  {
+                    index: 0,
+                    delta: { content: responseText },
+                    finish_reason: null,
+                    logprobs: null,
+                  },
+                ],
+              })
+            )
+          );
+        }
+
+        controller.enqueue(
+          encoder.encode(
+            sseChunk({
+              id,
+              object: "chat.completion.chunk",
+              created,
+              model,
+              system_fingerprint: null,
+              choices: [{ index: 0, delta: {}, finish_reason: "stop", logprobs: null }],
+            })
+          )
+        );
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
     },
-  });
+    { highWaterMark: 16384 }
+  );
 }
 
 function buildNonStreamingResponse(
@@ -271,9 +315,8 @@ export class BlackboxWebExecutor extends BaseExecutor {
     log,
     upstreamExtraHeaders,
   }: ExecuteInput) {
-    const messages = (body as Record<string, unknown>).messages as
-      | Array<Record<string, unknown>>
-      | undefined;
+    const bodyObj = (body || {}) as Record<string, unknown>;
+    const messages = bodyObj.messages as Array<Record<string, unknown>> | undefined;
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       const errorResponse = new Response(
         JSON.stringify({
@@ -292,8 +335,12 @@ export class BlackboxWebExecutor extends BaseExecutor {
       };
     }
 
+    const { hasTools, requestedTools, effectiveMessages } = prepareToolMessages(
+      bodyObj,
+      messages as Array<{ role: string; content: unknown }>
+    );
     const chatId = crypto.randomUUID().slice(0, 7);
-    const parsedMessages = parseOpenAIMessages(messages, chatId);
+    const parsedMessages = parseOpenAIMessages(effectiveMessages, chatId);
     if (parsedMessages.length === 0) {
       const errorResponse = new Response(
         JSON.stringify({
@@ -383,6 +430,11 @@ export class BlackboxWebExecutor extends BaseExecutor {
           teamAccount,
           fetchedAt: Date.now(),
         });
+        while (sessionCache.size > MAX_SESSIONS) {
+          const oldestKey = sessionCache.keys().next().value;
+          if (oldestKey !== undefined) sessionCache.delete(oldestKey);
+          else break;
+        }
       } catch (diagErr) {
         log?.debug?.("BLACKBOX-WEB", `Session/subscription fetch failed (non-fatal): ${diagErr}`);
       }
@@ -418,7 +470,9 @@ export class BlackboxWebExecutor extends BaseExecutor {
       mobileClient: false,
       userSelectedModel: model || null,
       userSelectedAgent: "VscodeAgent",
-      validated: crypto.randomUUID(),
+      // Issue #2252: prefer operator-supplied BLACKBOX_WEB_VALIDATED_TOKEN over
+      // a random UUID — Blackbox's `/api/chat` rejects mismatched tokens with 403.
+      validated: resolveBlackboxValidatedToken(),
       imageGenerationMode: false,
       imageGenMode: "autoMode",
       webSearchModePrompt: false,
@@ -489,7 +543,15 @@ export class BlackboxWebExecutor extends BaseExecutor {
     if (!upstreamResponse.ok) {
       const status = upstreamResponse.status;
       let message = `Blackbox Web returned HTTP ${status}`;
-      if (status === 401 || status === 403) {
+      // Issue #2252: distinguish "wrong validated token" from "expired cookie"
+      // when 403 carries a token-specific body — the fix is different in each case.
+      const errorBody = await upstreamResponse.text().catch(() => "");
+      if (status === 403 && isBlackboxValidatedTokenError(errorBody)) {
+        message =
+          "Blackbox Web rejected the request with an invalid `validated` token. " +
+          "If you have a valid frontend token (the `tk` value from app.blackbox.ai's " +
+          "Next.js bundle), set BLACKBOX_WEB_VALIDATED_TOKEN in your environment and restart.";
+      } else if (status === 401 || status === 403) {
         message =
           "Blackbox Web auth failed — your app.blackbox.ai session cookie may be missing or expired.";
       } else if (status === 429) {
@@ -598,6 +660,44 @@ export class BlackboxWebExecutor extends BaseExecutor {
 
     const id = `chatcmpl-blackbox-${crypto.randomUUID().slice(0, 12)}`;
     const created = Math.floor(Date.now() / 1000);
+
+    if (hasTools) {
+      const { content, toolCalls, finishReason } = buildToolAwareResult(
+        responseText,
+        requestedTools,
+        "bbx"
+      );
+      if (toolCalls) {
+        const toolResponse = new Response(
+          JSON.stringify({
+            id,
+            object: "chat.completion",
+            created,
+            model,
+            choices: [
+              {
+                index: 0,
+                message: { role: "assistant", content: null, tool_calls: toolCalls },
+                finish_reason: finishReason,
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+        return { response: toolResponse, url: BLACKBOX_CHAT_API, headers, transformedBody };
+      }
+      const finalResponse = stream
+        ? new Response(buildStreamingResponse(content, model, id, created), {
+            status: 200,
+            headers: {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              "X-Accel-Buffering": "no",
+            },
+          })
+        : buildNonStreamingResponse(content, model, id, created);
+      return { response: finalResponse, url: BLACKBOX_CHAT_API, headers, transformedBody };
+    }
 
     const finalResponse = stream
       ? new Response(buildStreamingResponse(responseText, model, id, created), {

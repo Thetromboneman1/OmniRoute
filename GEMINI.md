@@ -1,21 +1,13 @@
-# Security and Cleanliness Rules for AI Assistants
+# GEMINI.md
 
-## 1. File Placement & Organization
+> **Single source of truth:** all project rules for AI assistants live in
+> [`AGENTS.md`](AGENTS.md). Read it in full before any change — it contains the 23 Hard Rules,
+> quality gates, code conventions, file-placement / repo-root hygiene rules, the repository map
+> and the local development access notes that used to live in this file.
 
-- **Test Files**: ALL unit tests, integration tests, ecosystem tests, or Vitest files MUST strictly be placed within the `tests/` directory (e.g., `tests/unit/`, `tests/integration/`). NEVER create test files in the project root (`/`).
-- **Scripts and Utilities**: ALL maintenance, debugging, generation, or experimental scripts (`.cjs`, `.mjs`, `.js`, `.ts`) MUST be placed strictly inside the `scripts/` directory or `scripts/scratch/` for temporary one-offs. NEVER dump loose scripts in the project root (`/`).
+Gemini-specific notes:
 
-**The Project Root MUST ONLY CONTAIN:**
-
-- Configuration files (`vitest.config.ts`, `next.config.mjs`, `eslint.config.mjs`, etc.)
-- Dependency files (`package.json`, `package-lock.json`)
-- Documentation files (`README.md`, `CHANGELOG.md`, `AGENTS.md`)
-- CI/CD files and ignore definitions (`.gitignore`, `.dockerignore`)
-
-When creating _any_ validation tests or one-off logic scripts, default to using `scripts/scratch/` or the `tests/unit/` directories according to your goals. Do not pollute the `/` root context.
-
-## 2. VPS Dashboard Credentials
-
-| Environment | URL                       | Password |
-| ----------- | ------------------------- | -------- |
-| Local VPS   | http://192.168.0.15:20128 | 123456   |
+- Skills activate via the `activate_skill` tool (skill metadata is loaded at session start and
+  the full content is activated on demand).
+- There are no other Gemini-only rules today. Do not re-add project rules here — edit
+  `AGENTS.md` instead, so every assistant sees the same instructions.

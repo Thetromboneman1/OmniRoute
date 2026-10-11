@@ -7,8 +7,15 @@
 **/.vscode
 
 # Dependencies and build output
+# `node_modules` alone matches the ROOT only — Docker's matcher does not cross
+# `/` like .gitignore does. Without the `**/` form, nested installs ship in the
+# build context (e.g. @omniroute/opencode-provider/node_modules, ~79 MB of
+# devDependencies). Both forms are kept: the bare one is the documented root
+# rule, the `**/` one covers every nested package.
 node_modules
+**/node_modules
 .next
+.build
 out
 build
 dist
@@ -17,6 +24,7 @@ coverage
 # Runtime data and logs
 data
 logs
+.sandbox
 
 # Local env files (inject at runtime via --env-file or -e)
 .env
@@ -36,9 +44,47 @@ tests
 test-results
 playwright-report
 blob-report
+output
+.playwright-cli
+.playwright-mcp
+.stryker-tmp
+reports/mutation
 
-# Documentation (not needed in container)
-docs
+# Local caches and quality-gate artifacts (all gitignored). `_*` does not match
+# dot-prefixed names, so these need explicit entries.
+.artifacts
+.eslintcache*
+.fakebin-*
+MAX
+quality-ratchet/
+
+# Documentation
+# Issue #2348: The Dashboard Docs viewer reads markdown from `/app/docs` at
+# runtime. The previous `docs/*` block hid every file except openapi.yaml,
+# so the in-product help screen failed with ENOENT for every page.
+# We now keep the English markdown tree plus the docs assets imported by MDX
+# during `next build`, while still dropping the bulky translated docs and
+# extra raster diagram sources that account for most of the docs footprint
+# of the ~50 MB docs directory. The Docs viewer reads the default-locale
+# (English) sources at runtime, so translations are not required in the
+# container image.
+docs/i18n/**
+# Internal planning artifacts (gitignored). `*.md` above only matches the root,
+# so without this rule these land in /app/docs and become readable through the
+# dashboard's Docs viewer at runtime.
+docs/superpowers/**
+# Operator-internal security writeups: git only, not the image or /docs catalog.
+docs/security/STEALTH_GUIDE.md
+docs/security/SOCKET_DEV_FINDINGS.md
+docs/security/MITM-TPROXY-DECRYPT.md
+docs/security/PUBLIC_CREDS.md
+docs/diagrams/**/*.png
+docs/diagrams/**/*.jpg
+docs/diagrams/**/*.jpeg
+docs/diagrams/**/*.gif
+docs/diagrams/**/*.webp
+# Note: `*.md` matches the root only (Go filepath.Match does not cross /),
+# so nested docs/**/*.md is implicitly kept without a re-include rule.
 *.md
 !README.md
 
@@ -60,6 +106,8 @@ bun.lock
 # Agent config
 .agents
 .gemini
+.claude
+.source
 
 # Misc
 llm.txt
@@ -106,3 +154,4 @@ app.__qa_backup/
 .worktrees
 .next-playwright/
 cloud/
+electron/dist-electron

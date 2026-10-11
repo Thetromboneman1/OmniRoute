@@ -456,17 +456,28 @@ test.describe("Combos flow", () => {
     await comboDialog.locator('[data-testid="combo-manual-model-add"]').click();
     await expect(comboDialog.locator('[data-testid="combo-readiness-panel"]')).toHaveCount(0);
 
+    // New advanced settings: failoverBeforeRetry, maxSetRetries, setRetryDelayMs
+    await comboDialog.locator("#failoverBeforeRetry").check();
+    // maxSetRetries: placeholder "0" is unique (maxRetries uses "1")
+    await comboDialog.locator('input[placeholder="0"]').fill("2");
+    // setRetryDelayMs: placeholder "2000" — last occurrence is the new field
+    await comboDialog.locator('input[placeholder="2000"]').last().fill("1500");
+
     await comboDialog
       .getByRole("button", { name: /create combo|criar combo/i })
       .last()
       .click();
     await expect(comboDialog).toBeHidden();
 
+    // #11433 (PR #11670): a manually typed alias prefix ("cx/") is kept verbatim in
+    // `model` — rebuilding it from the canonical id can collide with a routing-alias
+    // override — while `providerId` still resolves to the canonical "codex".
+    // Same contract as tests/unit/combo-builder-draft.test.ts.
     expect(state.lastPayload?.models).toEqual([
       {
         kind: "model",
         providerId: "codex",
-        model: "codex/gpt-5.5",
+        model: "cx/gpt-5.5",
         weight: 0,
       },
       {
@@ -476,6 +487,9 @@ test.describe("Combos flow", () => {
         weight: 0,
       },
     ]);
+    expect(state.lastPayload?.config?.failoverBeforeRetry).toBe(true);
+    expect(state.lastPayload?.config?.maxSetRetries).toBe(2);
+    expect(state.lastPayload?.config?.setRetryDelayMs).toBe(1500);
   });
 
   test("allows dragging combo cards to persist manual order", async ({ page }) => {

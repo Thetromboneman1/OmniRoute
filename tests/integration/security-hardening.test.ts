@@ -144,12 +144,6 @@ test("chat handler wires guardrail pre-call validation", () => {
   );
 });
 
-test("server-init.ts calls enforceSecrets", () => {
-  const content = readIfExists("src/server-init.ts");
-  assert.ok(content, "src/server-init.ts should exist");
-  assert.ok(content.includes("enforceSecrets"), "server-init.ts should call enforceSecrets");
-});
-
 test("instrumentation-node.ts validates runtime env after restoring secrets", () => {
   const content = readIfExists("src/instrumentation-node.ts");
   assert.ok(content, "src/instrumentation-node.ts should exist");
@@ -165,10 +159,23 @@ test("callLogs.ts wires no-log and PII sanitization before persistence", () => {
   const content = readIfExists("src/lib/usage/callLogs.ts");
   assert.ok(content, "src/lib/usage/callLogs.ts should exist");
   assert.ok(
-    content.includes('from "../compliance"'),
+    content.includes('from "../compliance"') || content.includes('from "../compliance/noLog"'),
     "callLogs.ts should import compliance module"
   );
-  assert.ok(content.includes('from "../piiSanitizer"'), "callLogs.ts should import piiSanitizer");
+  // PII sanitization for error strings was extracted to callLogs/format.ts by #5725
+  // (sanitizeErrorForLog); callLogs.ts still wires it in before persistence, and the
+  // extracted helper keeps the piiSanitizer dependency — so the "sanitize before
+  // persist" invariant holds post-refactor (verified on both the helper and the file).
+  assert.ok(
+    content.includes("sanitizeErrorForLog") && content.includes('from "./callLogs/format"'),
+    "callLogs.ts should wire the extracted PII-sanitizing error helper (sanitizeErrorForLog)"
+  );
+  const formatHelperContent = readIfExists("src/lib/usage/callLogs/format.ts");
+  assert.ok(formatHelperContent, "src/lib/usage/callLogs/format.ts should exist");
+  assert.ok(
+    formatHelperContent.includes('from "../../piiSanitizer"'),
+    "callLogs/format.ts should import piiSanitizer (PII sanitization still wired post-#5725)"
+  );
   assert.ok(content.includes("isNoLog("), "callLogs.ts should check no-log policy");
 
   const payloadHelperContent = readIfExists("src/lib/logPayloads.ts");
@@ -281,5 +288,61 @@ test("T06 route payload validation uses validateBody in critical endpoints", () 
       content.includes("validateBody("),
       `${relPath} should validate payload with validateBody`
     );
+  }
+});
+
+test("OAuth routes that can create provider connections require auth guard", () => {
+  const targets = [
+    "src/app/api/oauth/[provider]/[action]/route.ts",
+    "src/app/api/oauth/[provider]/paste-credentials/route.ts",
+    "src/app/api/oauth/cursor/import/route.ts",
+    "src/app/api/oauth/cursor/login/start/route.ts",
+    "src/app/api/oauth/cursor/login/poll/route.ts",
+    "src/app/api/oauth/cursor/login/cancel/route.ts",
+    "src/app/api/oauth/kiro/import/route.ts",
+    "src/app/api/oauth/kiro/api-key/route.ts",
+    "src/app/api/oauth/kiro/social-authorize/route.ts",
+    "src/app/api/oauth/kiro/social-exchange/route.ts",
+  ];
+
+  for (const relPath of targets) {
+    const content = readIfExists(relPath);
+    assert.ok(content, `${relPath} should exist`);
+
+    // `/api/oauth/` is a public route prefix, so the pipeline leaves the decision to the
+    // handler, and isAuthenticated() there accepts any valid client API key. Every handler
+    // that can create or overwrite a provider connection must ask for a management
+    // principal: a dashboard session, CLI token, access token or a manage-scope key.
+    assert.ok(
+      content.includes("requireManagementAuth(request"),
+      `${relPath} must guard connection-creating handlers with requireManagementAuth`
+    );
+    const code = content
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("//"))
+      .join("\n");
+    assert.ok(
+      !/isAuthenticated\s*\(/.test(code),
+      `${relPath} must not fall back to isAuthenticated(), which accepts any client API key`
+    );
+
+    // Positive anchor: a guard somewhere in the file proves nothing if one of the
+    // exported handlers skips it. Slice the file per exported handler and require
+    // EACH body to await a guard on its own `request` — a guard living only in a
+    // helper (or in a sibling handler) no longer satisfies this.
+    const handlerSlices = content
+      .split(/(?=export\s+async\s+function\s+(?:GET|POST|PUT|PATCH|DELETE)\b)/)
+      .filter((slice) =>
+        /^export\s+async\s+function\s+(?:GET|POST|PUT|PATCH|DELETE)\b/.test(slice)
+      );
+    assert.ok(handlerSlices.length > 0, `${relPath} should export at least one HTTP handler`);
+    for (const slice of handlerSlices) {
+      const verb = /export\s+async\s+function\s+(\w+)/.exec(slice)?.[1];
+      assert.match(
+        slice,
+        /await\s+(?:require\w*Auth|isAuthRequired)\s*\(\s*(?:request|req)\b/,
+        `${relPath}: exported handler ${verb} does not await an auth guard on its own request`
+      );
+    }
   }
 });

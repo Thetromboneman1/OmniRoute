@@ -1,3 +1,7 @@
+import { getPendingById } from "@/lib/usage/usageHistory";
+import { getChatLogMaxDepth, getChatLogArrayTailItems } from "@/lib/logEnv";
+import { sanitizeErrorMessage } from "./error.ts";
+
 type JsonRecord = Record<string, unknown>;
 
 type HeaderInput =
@@ -8,12 +12,14 @@ type HeaderInput =
   | undefined;
 
 export type RequestPipelinePayloads = {
+  routeDecision?: JsonRecord;
   clientRawRequest?: JsonRecord;
   openaiRequest?: JsonRecord;
   providerRequest?: JsonRecord;
   providerResponse?: JsonRecord;
   clientResponse?: JsonRecord;
   error?: JsonRecord;
+  toolLoop?: { legs: JsonRecord[] };
   streamChunks?: {
     provider?: string[];
     openai?: string[];
@@ -23,7 +29,13 @@ export type RequestPipelinePayloads = {
 
 type RequestLogger = {
   sessionPath: null;
-  logClientRawRequest: (endpoint: unknown, body: unknown, headers?: HeaderInput) => void;
+  logClientRawRequest: (
+    endpoint: unknown,
+    body: unknown,
+    headers?: HeaderInput,
+    effectiveInput?: unknown
+  ) => void;
+  logRouteDecision: (decision: unknown) => void;
   logOpenAIRequest: (body: unknown) => void;
   logTargetRequest: (url: unknown, headers: HeaderInput, body: unknown) => void;
   logProviderResponse: (
@@ -37,6 +49,7 @@ type RequestLogger = {
   logConvertedResponse: (body: unknown) => void;
   appendConvertedChunk: (chunk: string) => void;
   logError: (error: unknown, requestBody?: unknown) => void;
+  logToolLoopReceipt: (receipt: unknown) => void;
   getPipelinePayloads: () => RequestPipelinePayloads | null;
 };
 
@@ -45,13 +58,25 @@ type RequestLoggerOptions = {
   captureStreamChunks?: boolean;
   maxStreamChunkBytes?: number;
   maxStreamChunkItems?: number;
+  requestId?: string | null;
+  model?: string;
+  provider?: string;
+  connectionId?: string | null;
 };
 
 const DEFAULT_MAX_STREAM_CHUNK_BYTES = 128 * 1024;
-const DEFAULT_MAX_STREAM_CHUNK_ITEMS = 512;
+const DEFAULT_MAX_STREAM_CHUNK_ITEMS = 10_240;
 const MAX_LOG_STRING_LENGTH = 64 * 1024;
-const MAX_LOG_ARRAY_ITEMS = 24;
+// Was its own separate hardcoded 24, independent of the sibling
+// cloneBoundedChatLogPayload (chatCore/logTruncation.ts) implementation's
+// configurable cap — the two duplicated the same "bound an array for
+// logging" policy with different, drifting limits. Sharing
+// getChatLogArrayTailItems() keeps both bounding passes over the same
+// artifact data consistent. Read once at module load, matching this file's
+// existing plain-constant shape; CHAT_LOG_ARRAY_TAIL_ITEMS still overrides it.
+export const MAX_LOG_ARRAY_ITEMS = getChatLogArrayTailItems();
 const MAX_LOG_OBJECT_KEYS = 80;
+const MAX_TOOL_LOOP_LEGS = 4;
 
 function maskSensitiveHeaders(headers: HeaderInput): Record<string, unknown> {
   if (!headers) return {};
@@ -62,11 +87,31 @@ function maskSensitiveHeaders(headers: HeaderInput): Record<string, unknown> {
       : { ...(headers as Record<string, unknown>) };
 
   const masked = { ...headerEntries };
-  const sensitiveKeys = ["authorization", "x-api-key", "cookie", "token"];
+  const sensitiveKeys = [
+    "authorization",
+    "x-api-key",
+    "apikey",
+    "cookie",
+    "token",
+    "runtimekey",
+    "storage-state",
+    "storagestate",
+    "capability",
+    "x-omniroute-lease-owner",
+  ];
 
   for (const key of Object.keys(masked)) {
     const lowerKey = key.toLowerCase();
-    if (!sensitiveKeys.some((candidate) => lowerKey.includes(candidate))) {
+    // Whitelist x-ratelimit- headers from redaction
+    if (lowerKey.startsWith("x-ratelimit-")) {
+      continue;
+    }
+    if (lowerKey === "x-omniroute-lease-owner") {
+      masked[key] = "[REDACTED]";
+      continue;
+    }
+    const compactedKey = lowerKey.replace(/-/g, "");
+    if (!sensitiveKeys.some((candidate) => compactedKey.includes(candidate.replace(/-/g, "")))) {
       continue;
     }
 
@@ -89,24 +134,70 @@ function createEmptyStreamChunks() {
   };
 }
 
-function truncateLogString(value: string, maxLength = MAX_LOG_STRING_LENGTH): string {
-  if (value.length <= maxLength) return value;
-  return `${value.slice(0, Math.floor(maxLength / 2))}\n[...truncated ${value.length - maxLength} chars...]\n${value.slice(-Math.ceil(maxLength / 2))}`;
+const TRUNCATED_ARRAY_MARKER = "_omniroute_truncated_array";
+const TRUNCATED_KEYS_MARKER = "_omniroute_truncated_keys";
+
+function isTruncatedArrayMarker(value: unknown): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as JsonRecord)[TRUNCATED_ARRAY_MARKER] === true
+  );
 }
 
-function cloneBoundedForLog(value: unknown, depth = 0): unknown {
+function truncateLogString(value: string, maxLength = MAX_LOG_STRING_LENGTH): string {
+  if (value.length <= maxLength) return value;
+  // The marker has to fit INSIDE the budget (#7847): keeping maxLength characters and then
+  // adding the marker produced a result longer than maxLength, so re-bounding an already
+  // bounded string truncated it a second time and the function was not idempotent.
+  const marker = `\n[...truncated ${value.length - maxLength} chars...]\n`;
+  const keep = Math.max(0, maxLength - marker.length);
+  return `${value.slice(0, Math.floor(keep / 2))}${marker}${value.slice(-Math.ceil(keep / 2))}`;
+}
+
+/**
+ * Recursively clone `value` for logging, with size bounds applied:
+ * - Arrays longer than MAX_LOG_ARRAY_ITEMS are truncated to the tail with a
+ *   sentinel marker prepended.
+ * - The `tools` field is exempt from array truncation: the full tool inventory
+ *   is debug-critical for understanding which tools the model had access to,
+ *   and individual tool descriptions are independently bounded by
+ *   truncateLogString, so the total size remains naturally capped.
+ *
+ * The optional `key` parameter carries the parent object's field name when
+ * recursing into an object's values, enabling the per-field exemption above.
+ * Top-level arrays (no key context) remain subject to truncation.
+ */
+export function cloneBoundedForLog(value: unknown, depth = 0, key: string | null = null): unknown {
   if (value === null || value === undefined) return value;
   if (typeof value === "string") return truncateLogString(value);
   if (typeof value !== "object") return value;
-  if (depth >= 6) return "[MaxDepth]";
+  // Binary/opaque byte views (Uint8Array, Buffer, DataView, ...) are not
+  // "real" arrays to Array.isArray(); without this guard they fall through
+  // to the generic-object branch below and get expanded into one JS key per
+  // decoded byte instead of being treated as an opaque buffer (see #7297).
+  if (ArrayBuffer.isView(value)) {
+    return `[binary ${(value as ArrayBufferView).byteLength} bytes]`;
+  }
+  if (depth >= getChatLogMaxDepth()) return "[MaxDepth]";
 
   if (Array.isArray(value)) {
-    const source = value.length > MAX_LOG_ARRAY_ITEMS ? value.slice(-MAX_LOG_ARRAY_ITEMS) : value;
+    // Idempotence (#7847): an already-bounded array is [marker, ...tail] — MAX_LOG_ARRAY_ITEMS + 1
+    // entries, which is over the limit. Re-truncating it would drop the marker plus one real
+    // item and rewrite originalLength with the truncated length (25 instead of the true 800), so
+    // the log would misreport how much was cut. Keep the original marker, re-bound only the tail.
+    if (isTruncatedArrayMarker(value[0])) {
+      return [value[0], ...value.slice(1).map((item) => cloneBoundedForLog(item, depth + 1))];
+    }
+    const exempt = key === "tools";
+    const shouldTruncate = !exempt && value.length > MAX_LOG_ARRAY_ITEMS;
+    const source = shouldTruncate ? value.slice(-MAX_LOG_ARRAY_ITEMS) : value;
     const mapped = source.map((item) => cloneBoundedForLog(item, depth + 1));
-    if (value.length > MAX_LOG_ARRAY_ITEMS) {
+    if (shouldTruncate) {
       return [
         {
-          _omniroute_truncated_array: true,
+          [TRUNCATED_ARRAY_MARKER]: true,
           originalLength: value.length,
           retainedTailItems: MAX_LOG_ARRAY_ITEMS,
         },
@@ -117,12 +208,19 @@ function cloneBoundedForLog(value: unknown, depth = 0): unknown {
   }
 
   const result: JsonRecord = {};
-  const entries = Object.entries(value as JsonRecord);
-  for (const [key, item] of entries.slice(0, MAX_LOG_OBJECT_KEYS)) {
-    result[key] = cloneBoundedForLog(item, depth + 1);
+  // Idempotence (#7847): our own marker key must not be counted as payload, or a re-bounded
+  // object would push a real key out to make room for it and report `1` dropped instead of 20.
+  const carriedDropped = (value as JsonRecord)[TRUNCATED_KEYS_MARKER];
+  const carried = typeof carriedDropped === "number" ? carriedDropped : 0;
+  const entries = Object.entries(value as JsonRecord).filter(
+    ([k]) => !(carried > 0 && k === TRUNCATED_KEYS_MARKER)
+  );
+  for (const [k, item] of entries.slice(0, MAX_LOG_OBJECT_KEYS)) {
+    result[k] = cloneBoundedForLog(item, depth + 1, k);
   }
-  if (entries.length > MAX_LOG_OBJECT_KEYS) {
-    result._omniroute_truncated_keys = entries.length - MAX_LOG_OBJECT_KEYS;
+  const dropped = Math.max(0, entries.length - MAX_LOG_OBJECT_KEYS) + carried;
+  if (dropped > 0) {
+    result[TRUNCATED_KEYS_MARKER] = dropped;
   }
   return result;
 }
@@ -184,31 +282,90 @@ function compactPipelinePayloads(
         )
       );
       if (Object.keys(compactedChunks).length > 0) {
-        result.streamChunks = compactedChunks as RequestPipelinePayloads["streamChunks"];
+        result.streamChunks = compactedChunks;
       }
       continue;
     }
 
-    result[key as keyof RequestPipelinePayloads] = value as never;
+    if (key === "toolLoop" && value && typeof value === "object") {
+      const legs = (value as { legs?: unknown }).legs;
+      if (Array.isArray(legs) && legs.length > 0) {
+        result.toolLoop = { legs: legs as JsonRecord[] };
+      }
+      continue;
+    }
+
+    const payloadKey = key as Exclude<keyof RequestPipelinePayloads, "streamChunks" | "toolLoop">;
+    result[payloadKey] = value as JsonRecord;
   }
 
   return hasOwnValues(result) ? result : null;
 }
+function makeStreamChunkMethods(options: RequestLoggerOptions, captureChunks: boolean) {
+  const streamChunks = createEmptyStreamChunks();
+  const streamChunkBytes = {
+    provider: { value: 0, truncated: false },
+    openai: { value: 0, truncated: false },
+    client: { value: 0, truncated: false },
+  };
+  const maxBytes =
+    Number.isInteger(options.maxStreamChunkBytes) && Number(options.maxStreamChunkBytes) > 0
+      ? Number(options.maxStreamChunkBytes)
+      : DEFAULT_MAX_STREAM_CHUNK_BYTES;
+  const maxItems =
+    Number.isInteger(options.maxStreamChunkItems) && Number(options.maxStreamChunkItems) > 0
+      ? Number(options.maxStreamChunkItems)
+      : DEFAULT_MAX_STREAM_CHUNK_ITEMS;
+  let pendingPushed = false;
 
-function createNoOpLogger(): RequestLogger {
+  const push = () => {
+    if (pendingPushed) return;
+    if (!options.requestId && (!options.connectionId || !options.model)) return;
+    pendingPushed = true;
+    try {
+      const pending = getPendingById();
+      const exactEntry = options.requestId ? pending.get(options.requestId) : null;
+      if (exactEntry) {
+        exactEntry.streamChunks = { ...streamChunks };
+        return;
+      }
+
+      for (const entry of pending.values()) {
+        if (
+          entry?.connectionId === options.connectionId &&
+          entry?.model === options.model &&
+          entry?.provider === (options.provider || "")
+        ) {
+          entry.streamChunks = { ...streamChunks };
+          return;
+        }
+      }
+    } catch (e) {
+      // Do not allow logging failures to disrupt request handling
+      try {
+        console.warn("[requestLogger] updatePendingRequestStreamChunks failed:", e);
+      } catch {}
+    }
+  };
+
+  const append = (arr: string[], bytes: { value: number; truncated: boolean }, chunk: string) => {
+    if (!captureChunks) return;
+    push();
+    const ts = new Date().toISOString().slice(11, 23);
+    appendBoundedChunk(arr, bytes, `[${ts}] ${chunk}`, maxBytes, maxItems);
+  };
+
   return {
-    sessionPath: null,
-    logClientRawRequest() {},
-    logOpenAIRequest() {},
-    logTargetRequest() {},
-    logProviderResponse() {},
-    appendProviderChunk() {},
-    appendOpenAIChunk() {},
-    logConvertedResponse() {},
-    appendConvertedChunk() {},
-    logError() {},
-    getPipelinePayloads() {
-      return null;
+    streamChunks,
+    streamChunkBytes,
+    appendProviderChunk(chunk: string) {
+      append(streamChunks.provider, streamChunkBytes.provider, chunk);
+    },
+    appendOpenAIChunk(chunk: string) {
+      append(streamChunks.openai, streamChunkBytes.openai, chunk);
+    },
+    appendConvertedChunk(chunk: string) {
+      append(streamChunks.client, streamChunkBytes.client, chunk);
     },
   };
 }
@@ -219,39 +376,67 @@ export async function createRequestLogger(
   _model?: string,
   options: RequestLoggerOptions = {}
 ): Promise<RequestLogger> {
+  const captureStreamChunks = options.captureStreamChunks !== false;
+  // Stream chunk capture is always set up — even when the logger is disabled,
+  // so that active requests always have real-time stream data available via
+  // the /api/logs/active endpoint.
+  const chunkMethods = makeStreamChunkMethods(options, captureStreamChunks);
+
   if (options.enabled === false) {
-    return createNoOpLogger();
+    let routeDecision: JsonRecord | null = null;
+    return {
+      sessionPath: null,
+      logClientRawRequest() {},
+      logRouteDecision(decision) {
+        routeDecision = cloneBoundedForLog(decision) as JsonRecord;
+      },
+      logOpenAIRequest() {},
+      logTargetRequest() {},
+      logProviderResponse() {},
+      appendProviderChunk: chunkMethods.appendProviderChunk,
+      appendOpenAIChunk: chunkMethods.appendOpenAIChunk,
+      logConvertedResponse() {},
+      appendConvertedChunk: chunkMethods.appendConvertedChunk,
+      logError() {},
+      logToolLoopReceipt() {},
+      getPipelinePayloads() {
+        return routeDecision ? { routeDecision } : null;
+      },
+    };
   }
 
-  const captureStreamChunks = options.captureStreamChunks !== false;
-  const maxStreamChunkBytes =
-    Number.isInteger(options.maxStreamChunkBytes) && Number(options.maxStreamChunkBytes) > 0
-      ? Number(options.maxStreamChunkBytes)
-      : DEFAULT_MAX_STREAM_CHUNK_BYTES;
-  const maxStreamChunkItems =
-    Number.isInteger(options.maxStreamChunkItems) && Number(options.maxStreamChunkItems) > 0
-      ? Number(options.maxStreamChunkItems)
-      : DEFAULT_MAX_STREAM_CHUNK_ITEMS;
-  const streamChunks = createEmptyStreamChunks();
-  const streamChunkBytes = {
-    provider: { value: 0, truncated: false },
-    openai: { value: 0, truncated: false },
-    client: { value: 0, truncated: false },
-  };
   const payloads: RequestPipelinePayloads = {
-    ...(captureStreamChunks ? { streamChunks } : {}),
+    ...(captureStreamChunks ? { streamChunks: chunkMethods.streamChunks } : {}),
   };
 
   return {
     sessionPath: null,
 
-    logClientRawRequest(endpoint, body, headers = {}) {
+    logClientRawRequest(endpoint, body, headers = {}, effectiveInput) {
       payloads.clientRawRequest = {
         timestamp: new Date().toISOString(),
         endpoint,
         headers: maskSensitiveHeaders(headers),
         body: cloneBoundedForLog(body),
+        // The actual `input` this request dispatched with, captured AFTER
+        // OmniRoute's own previous_response_id reconstruction (see
+        // src/sse/handlers/chat.ts) -- `body` above is deliberately the
+        // pre-reconstruction raw client bytes (captureDeferredClientRawBody's
+        // whole point) and is NOT what got sent for a continued turn.
+        // resolvePreviousResponseState must chain off this field, not
+        // `body.input`: reading the raw pre-reconstruction input for a
+        // request that was itself a continuation compounds into progressively
+        // truncated history a few hops deep (live incident 2026-09-03,
+        // manifested as a malformed request with no leading system/user
+        // message rejected by the upstream provider).
+        ...(effectiveInput !== undefined
+          ? { effectiveInput: cloneBoundedForLog(effectiveInput) }
+          : {}),
       };
+    },
+
+    logRouteDecision(decision) {
+      payloads.routeDecision = cloneBoundedForLog(decision) as JsonRecord;
     },
 
     logOpenAIRequest(body) {
@@ -280,53 +465,30 @@ export async function createRequestLogger(
       };
     },
 
-    appendProviderChunk(chunk) {
-      if (!captureStreamChunks) return;
-      appendBoundedChunk(
-        streamChunks.provider,
-        streamChunkBytes.provider,
-        chunk,
-        maxStreamChunkBytes,
-        maxStreamChunkItems
-      );
-    },
-
-    appendOpenAIChunk(chunk) {
-      if (!captureStreamChunks) return;
-      appendBoundedChunk(
-        streamChunks.openai,
-        streamChunkBytes.openai,
-        chunk,
-        maxStreamChunkBytes,
-        maxStreamChunkItems
-      );
-    },
-
+    appendProviderChunk: chunkMethods.appendProviderChunk,
+    appendOpenAIChunk: chunkMethods.appendOpenAIChunk,
     logConvertedResponse(body) {
       payloads.clientResponse = {
         timestamp: new Date().toISOString(),
         body: cloneBoundedForLog(body),
       };
     },
-
-    appendConvertedChunk(chunk) {
-      if (!captureStreamChunks) return;
-      appendBoundedChunk(
-        streamChunks.client,
-        streamChunkBytes.client,
-        chunk,
-        maxStreamChunkBytes,
-        maxStreamChunkItems
-      );
-    },
+    appendConvertedChunk: chunkMethods.appendConvertedChunk,
 
     logError(error, requestBody = null) {
       payloads.error = {
         timestamp: new Date().toISOString(),
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined,
+        error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
         requestBody: cloneBoundedForLog(requestBody),
       };
+    },
+
+    logToolLoopReceipt(receipt) {
+      const legs = payloads.toolLoop?.legs ?? [];
+      if (legs.length >= MAX_TOOL_LOOP_LEGS) return;
+      const cloned = cloneBoundedForLog(receipt);
+      if (!cloned || typeof cloned !== "object" || Array.isArray(cloned)) return;
+      payloads.toolLoop = { legs: [...legs, cloned as JsonRecord] };
     },
 
     getPipelinePayloads() {
@@ -334,5 +496,3 @@ export async function createRequestLogger(
     },
   };
 }
-
-export function logError(_provider: string, _entry: unknown) {}

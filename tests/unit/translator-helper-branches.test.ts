@@ -6,6 +6,39 @@ const openaiHelper = await import("../../open-sse/translator/helpers/openaiHelpe
 const claudeHelper = await import("../../open-sse/translator/helpers/claudeHelper.ts");
 const geminiHelper = await import("../../open-sse/translator/helpers/geminiHelper.ts");
 const toolCallHelper = await import("../../open-sse/translator/helpers/toolCallHelper.ts");
+const { FORMATS } = await import("../../open-sse/translator/formats.ts");
+const { translateRequest } = await import("../../open-sse/translator/index.ts");
+const {
+  buildAssistantMessageCacheKey,
+  cacheReasoningByKey,
+  clearReasoningCacheAll,
+  getReasoningCacheServiceStats,
+} = await import("../../open-sse/services/reasoningCache.ts");
+const { clearModelsDevCapabilities, saveModelsDevCapabilities } =
+  await import("../../src/lib/modelsDevSync.ts");
+
+function buildCapability(overrides = {}) {
+  return {
+    tool_call: null,
+    reasoning: null,
+    attachment: null,
+    structured_output: null,
+    temperature: null,
+    modalities_input: "[]",
+    modalities_output: "[]",
+    knowledge_cutoff: null,
+    release_date: null,
+    last_updated: null,
+    status: null,
+    family: null,
+    open_weights: null,
+    limit_context: null,
+    limit_input: null,
+    limit_output: null,
+    interleaved_field: null,
+    ...overrides,
+  };
+}
 
 const originalMathRandom = Math.random;
 
@@ -132,14 +165,18 @@ test("schemaCoercion sanitizes descriptions, tool schemas, tool ids and deepseek
       { role: "assistant", tool_calls: [{ id: "call_2" }], reasoning_content: "keep" },
       { role: "user", tool_calls: [{ id: "call_3" }] },
     ],
-    "deepseek"
+    "deepseek",
+    "deepseek-v4-flash"
   );
   assert.equal(injected[0].reasoning_content, "");
   assert.equal(injected[1].reasoning_content, "keep");
   assert.equal(injected[2].reasoning_content, undefined);
   assert.equal(
-    schemaCoercion.injectEmptyReasoningContentForToolCalls([{ role: "assistant" }], "openai")[0]
-      .reasoning_content,
+    schemaCoercion.injectEmptyReasoningContentForToolCalls(
+      [{ role: "assistant" }],
+      "openai",
+      "gpt-4o"
+    )[0].reasoning_content,
     undefined
   );
 });
@@ -226,6 +263,14 @@ test("openaiHelper keeps unmatched tool choices and deletes empty tools arrays",
 test("claudeHelper validates content, ordering and request preparation branches", () => {
   assert.equal(claudeHelper.hasValidContent({ content: " hello " }), true);
   assert.equal(claudeHelper.hasValidContent({ content: [{ type: "tool_use", id: "call" }] }), true);
+  assert.equal(
+    claudeHelper.hasValidContent({ content: [{ type: "thinking", thinking: "reasoning" }] }),
+    true
+  );
+  assert.equal(
+    claudeHelper.hasValidContent({ content: [{ type: "redacted_thinking", data: "opaque" }] }),
+    true
+  );
   assert.equal(claudeHelper.hasValidContent({ content: [{ type: "text", text: "   " }] }), false);
 
   assert.deepEqual(claudeHelper.fixToolUseOrdering([{ role: "user", content: "single" }]), [
@@ -247,6 +292,44 @@ test("claudeHelper validates content, ordering and request preparation branches"
     { type: "tool_result", tool_use_id: "call_1", content: [] },
     { type: "text", text: "before" },
     { type: "tool_use", id: "call_1", name: "lookup", input: {} },
+  ]);
+
+  // splitMisplacedToolResults: a tool_result whose tool_use_id was already
+  // emitted by an earlier assistant turn is moved into the preceding user
+  // message. The trailing tool_use survives on the assistant side. (#2815)
+  const split = claudeHelper.splitMisplacedToolResults([
+    { role: "user", content: [{ type: "text", text: "q" }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "call_x", name: "Read", input: {} }] },
+    {
+      role: "assistant",
+      content: [
+        { type: "tool_result", tool_use_id: "call_x", content: "ok" },
+        { type: "tool_use", id: "call_y", name: "Read", input: {} },
+      ],
+    },
+  ]);
+  assert.deepEqual(split, [
+    { role: "user", content: [{ type: "text", text: "q" }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "call_x", name: "Read", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "call_x", content: "ok" }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "call_y", name: "Read", input: {} }] },
+  ]);
+
+  // tool_result whose id has not been seen earlier is dropped — moving it
+  // would just shift the 400 to "unexpected tool_use_id".
+  const droppedOrphan = claudeHelper.splitMisplacedToolResults([
+    { role: "user", content: [{ type: "text", text: "q" }] },
+    {
+      role: "assistant",
+      content: [
+        { type: "tool_result", tool_use_id: "self-ref", content: "Skill not found" },
+        { type: "tool_use", id: "self-ref", name: "Read", input: {} },
+      ],
+    },
+  ]);
+  assert.deepEqual(droppedOrphan, [
+    { role: "user", content: [{ type: "text", text: "q" }] },
+    { role: "assistant", content: [{ type: "tool_use", id: "self-ref", name: "Read", input: {} }] },
   ]);
 
   const prepared = claudeHelper.prepareClaudeRequest(
@@ -304,12 +387,24 @@ test("claudeHelper validates content, ordering and request preparation branches"
   assert.equal(prepared.messages.length, 6);
   assert.equal(prepared.messages[2].content.at(-1).cache_control.type, "ephemeral");
   assert.equal(prepared.messages[4].content[0].type, "tool_result");
+  // messages[5] is the latest (and last) assistant message; Anthropic enforces
+  // that its thinking blocks must remain verbatim — not rewritten to
+  // redacted_thinking. The guard in prepareClaudeRequest preserves them.
   assert.deepEqual(
     prepared.messages[5].content.map((block) => block.type),
-    ["redacted_thinking", "text"]
+    ["thinking", "text"]
   );
-  assert.ok(prepared.messages[5].content[0].signature);
-  assert.equal(prepared.messages[5].content[0].thinking, undefined);
+  assert.equal(prepared.messages[5].content[0].thinking, "old", "thinking text preserved verbatim");
+  assert.equal(
+    prepared.messages[5].content[0].signature,
+    "replace",
+    "signature preserved verbatim"
+  );
+  assert.equal(
+    prepared.messages[5].content[0].data,
+    undefined,
+    "no data field on verbatim thinking"
+  );
   assert.equal(prepared.tools.length, 2);
   assert.equal(prepared.tools[0].cache_control, undefined);
   assert.deepEqual(prepared.tools[1].cache_control, { type: "ephemeral", ttl: "1h" });
@@ -467,4 +562,334 @@ test("toolCallHelper normalizes ids, links tool responses and inserts missing to
   );
   assert.equal(toolCallHelper.hasToolResults({ role: "user", content: [] }, []), false);
   assert.deepEqual(toolCallHelper.fixMissingToolResponses({ messages: null }), { messages: null });
+});
+
+test("fixMissingToolResponses inserts Claude tool_result block when assistant uses Claude shape", () => {
+  const fixed = toolCallHelper.fixMissingToolResponses({
+    messages: [
+      { role: "user", content: [{ type: "text", text: "do it" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "tool_a", name: "bash", input: { cmd: "ls" } },
+          { type: "tool_use", id: "tool_b", name: "bash", input: { cmd: "pwd" } },
+        ],
+      },
+      { role: "user", content: [{ type: "text", text: "continue" }] },
+    ],
+  });
+
+  assert.equal(fixed.messages.length, 4);
+  const inserted = fixed.messages[2];
+  assert.equal(inserted.role, "user");
+  assert.ok(Array.isArray(inserted.content));
+  assert.equal(inserted.content.length, 2);
+  assert.equal(inserted.content[0].type, "tool_result");
+  assert.equal(inserted.content[0].tool_use_id, "tool_a");
+  assert.equal(inserted.content[0].content, "");
+  assert.equal(inserted.content[1].tool_use_id, "tool_b");
+});
+
+test("fixMissingToolResponses keeps OpenAI role:tool when assistant uses OpenAI tool_calls", () => {
+  const fixed = toolCallHelper.fixMissingToolResponses({
+    messages: [
+      {
+        role: "assistant",
+        tool_calls: [
+          { id: "call_a", type: "function", function: { name: "lookup", arguments: "{}" } },
+          { id: "call_b", type: "function", function: { name: "search", arguments: "{}" } },
+        ],
+      },
+      { role: "user", content: "no tool result here" },
+    ],
+  });
+
+  assert.equal(fixed.messages.length, 4);
+  assert.equal(fixed.messages[1].role, "tool");
+  assert.equal(fixed.messages[1].tool_call_id, "call_a");
+  assert.equal(fixed.messages[2].role, "tool");
+  assert.equal(fixed.messages[2].tool_call_id, "call_b");
+});
+
+test("fallbackToolCallId returns the right id shape with and without an index", () => {
+  const noIndex = toolCallHelper.fallbackToolCallId();
+  assert.match(
+    noIndex,
+    /^call_\d+$/,
+    "no-index form must be `call_<ts>` (matches kiro/openai-responses fallback shape)"
+  );
+
+  const withIndex = toolCallHelper.fallbackToolCallId(2);
+  assert.match(
+    withIndex,
+    /^call_2_\d+$/,
+    "index form must be `call_<i>_<ts>` (matches indexed fallback shape)"
+  );
+
+  // index 0 is falsy but defined — must still produce the indexed form, not the no-index form.
+  const zeroIndex = toolCallHelper.fallbackToolCallId(0);
+  assert.match(zeroIndex, /^call_0_\d+$/, "index 0 must use the indexed form, not the bare form");
+});
+
+test("translateRequest replays cached reasoning-only messages when interleaved field is reasoning_content", () => {
+  clearReasoningCacheAll();
+  clearModelsDevCapabilities();
+  saveModelsDevCapabilities({
+    deepseek: {
+      "deepseek-v4-flash": buildCapability({
+        interleaved_field: "reasoning_content",
+        reasoning: true,
+        tool_call: true,
+      }),
+    },
+  });
+  const scope = "api-key:test:session:helper-deepseek";
+  const messages = [
+    { role: "user", content: "solve this" },
+    { role: "assistant", content: "answer", reasoning_content: "" },
+  ];
+  cacheReasoningByKey(
+    buildAssistantMessageCacheKey(scope, messages, 1),
+    "deepseek",
+    "deepseek-v4-flash",
+    "cached reasoning only"
+  );
+
+  const result = translateRequest(
+    FORMATS.OPENAI,
+    FORMATS.OPENAI,
+    "deepseek-v4-flash",
+    { messages },
+    false,
+    null,
+    "deepseek",
+    null,
+    { reasoningCacheScope: scope }
+  );
+
+  assert.equal(result.messages[1].reasoning_content, "cached reasoning only");
+  assert.equal(getReasoningCacheServiceStats().replays, 1);
+  clearModelsDevCapabilities();
+  clearReasoningCacheAll();
+});
+
+test("translateRequest does not replay reasoning-only messages for non-DeepSeek models", () => {
+  clearReasoningCacheAll();
+  const scope = "api-key:test:session:helper-kimi";
+  const messages = [
+    { role: "user", content: "solve this" },
+    { role: "assistant", content: "answer", reasoning_content: "" },
+  ];
+  cacheReasoningByKey(
+    buildAssistantMessageCacheKey(scope, messages, 1),
+    "kimi",
+    "kimi-k2.6",
+    "cached kimi reasoning"
+  );
+
+  const result = translateRequest(
+    FORMATS.OPENAI,
+    FORMATS.OPENAI,
+    "kimi-k2.6",
+    { messages },
+    false,
+    null,
+    "kimi",
+    null,
+    { reasoningCacheScope: scope }
+  );
+
+  assert.equal(result.messages[1].reasoning_content, undefined);
+  assert.equal(getReasoningCacheServiceStats().replays, 0);
+  clearReasoningCacheAll();
+});
+
+test("translateRequest replays cached reasoning before Kimi Coding's empty fallback", () => {
+  clearReasoningCacheAll();
+  cacheReasoningByKey(
+    "toolu_kimi_claude",
+    "kimi-coding-apikey",
+    "k3-256k",
+    "cached thinking for Kimi tool call"
+  );
+
+  // Claude-format request: assistant has tool_use in content[] but NO thinking block
+  // This simulates the scenario that causes infinite loops
+  const result = translateRequest(
+    FORMATS.OPENAI,
+    FORMATS.CLAUDE,
+    "k3-256k",
+    {
+      reasoning_effort: "high",
+      messages: [
+        { role: "user", content: "read the file" },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_kimi_claude",
+              name: "read_file",
+              input: { path: "test.ts" },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "toolu_kimi_claude", content: "file data" },
+      ],
+    },
+    false,
+    null,
+    "kimi-coding-apikey"
+  );
+
+  const assistantMsg = result.messages.find((m) => m.role === "assistant");
+  assert.ok(assistantMsg, "assistant message should exist");
+  assert.ok(Array.isArray(assistantMsg.content), "content should be array");
+
+  const thinkingBlock = assistantMsg.content.find((b) => b?.type === "thinking");
+  assert.ok(thinkingBlock, "thinking block should be injected");
+  assert.equal(thinkingBlock.thinking, "cached thinking for Kimi tool call");
+
+  // Thinking block should appear before tool_use
+  const thinkingIdx = assistantMsg.content.indexOf(thinkingBlock);
+  const toolUseIdx = assistantMsg.content.findIndex((b) => b?.type === "tool_use");
+  assert.ok(thinkingIdx < toolUseIdx, "thinking block should be before tool_use");
+
+  assert.equal(getReasoningCacheServiceStats().replays, 1);
+  clearReasoningCacheAll();
+});
+
+test("translateRequest uses an empty Kimi Coding thinking marker on cache miss", () => {
+  clearReasoningCacheAll();
+
+  const result = translateRequest(
+    FORMATS.OPENAI,
+    FORMATS.CLAUDE,
+    "k3-256k",
+    {
+      reasoning_effort: "high",
+      messages: [
+        { role: "user", content: "do it" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "toolu_miss", name: "bash", input: { command: "ls" } }],
+        },
+        { role: "tool", tool_call_id: "toolu_miss", content: "output" },
+      ],
+    },
+    false,
+    null,
+    "kimi-coding-apikey"
+  );
+
+  const assistantMsg = result.messages.find((m) => m.role === "assistant");
+  assert.ok(assistantMsg, "assistant message should exist");
+
+  const thinkingBlock =
+    Array.isArray(assistantMsg.content) && assistantMsg.content.find((b) => b?.type === "thinking");
+  assert.ok(thinkingBlock, "thinking block should be injected on cache miss");
+  assert.equal(thinkingBlock.thinking, "");
+
+  clearReasoningCacheAll();
+});
+
+test("translateRequest does NOT inject duplicate thinking for Claude-format messages with existing thinking block", () => {
+  clearReasoningCacheAll();
+  cacheReasoningByKey(
+    "toolu_existing",
+    "kimi-coding-apikey",
+    "k3-256k",
+    "cached thinking must not replace client thinking"
+  );
+
+  const result = translateRequest(
+    FORMATS.OPENAI,
+    FORMATS.CLAUDE,
+    "k3-256k",
+    {
+      messages: [
+        { role: "user", content: "hi" },
+        {
+          role: "assistant",
+          content: [
+            // Signed: a thinking block without a signature is dropped by the request
+            // translator (#12105), which would leave nothing for this test to protect.
+            { type: "thinking", thinking: "I already have this", signature: "sig_existing" },
+            { type: "tool_use", id: "toolu_existing", name: "read", input: {} },
+          ],
+        },
+        { role: "tool", tool_call_id: "toolu_existing", content: "data" },
+      ],
+    },
+    false,
+    null,
+    "kimi-coding-apikey"
+  );
+
+  const assistantMsg = result.messages.find((m) => m.role === "assistant");
+  const thinkingBlocks =
+    Array.isArray(assistantMsg.content) &&
+    assistantMsg.content.filter((b) => b?.type === "thinking");
+  assert.equal(thinkingBlocks?.length, 1, "should have exactly one thinking block (no duplicate)");
+  assert.equal(
+    thinkingBlocks[0].thinking,
+    "I already have this",
+    "original thinking should be preserved"
+  );
+  assert.equal(getReasoningCacheServiceStats().replays, 0);
+
+  clearReasoningCacheAll();
+});
+
+test("translateRequest replays cached reasoning when the client's Claude-format thinking block has no signature", () => {
+  // #12105: an unsigned thinking block cannot be replayed to Claude, so the request
+  // translator drops it instead of stamping a fabricated signature. For Kimi Coding the
+  // tool_use turn still needs a thinking precursor, and the reasoning cache (keyed by the
+  // tool_use id) is the authentic source — it must be re-hydrated exactly once.
+  clearReasoningCacheAll();
+  cacheReasoningByKey("toolu_unsigned", "kimi-coding-apikey", "k3-256k", "cached thinking");
+
+  const result = translateRequest(
+    FORMATS.OPENAI,
+    FORMATS.CLAUDE,
+    "k3-256k",
+    {
+      messages: [
+        { role: "user", content: "hi" },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "unsigned client thinking" },
+            { type: "tool_use", id: "toolu_unsigned", name: "read", input: {} },
+          ],
+        },
+        { role: "tool", tool_call_id: "toolu_unsigned", content: "data" },
+      ],
+    },
+    false,
+    null,
+    "kimi-coding-apikey"
+  );
+
+  const assistantMsg = result.messages.find((m) => m.role === "assistant");
+  const thinkingBlocks =
+    Array.isArray(assistantMsg.content) &&
+    assistantMsg.content.filter((b) => b?.type === "thinking");
+  assert.equal(thinkingBlocks?.length, 1, "should have exactly one thinking block (no duplicate)");
+  assert.equal(
+    thinkingBlocks[0].thinking,
+    "cached thinking",
+    "cached reasoning should be replayed"
+  );
+  assert.equal(
+    thinkingBlocks[0].signature,
+    undefined,
+    "replayed thinking must not carry a fabricated signature"
+  );
+  const thinkingIdx = assistantMsg.content.indexOf(thinkingBlocks[0]);
+  const toolUseIdx = assistantMsg.content.findIndex((b) => b?.type === "tool_use");
+  assert.ok(thinkingIdx < toolUseIdx, "thinking block should be before tool_use");
+  assert.equal(getReasoningCacheServiceStats().replays, 1);
+
+  clearReasoningCacheAll();
 });

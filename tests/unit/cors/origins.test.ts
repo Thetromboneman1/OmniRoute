@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { NextResponse } from "next/server";
 import {
   applyCorsHeaders,
+  getCorsStatus,
   resolveAllowedOrigin,
   setRuntimeAllowedOrigins,
   STATIC_CORS_HEADERS,
@@ -128,6 +129,126 @@ describe("cors/origins.applyCorsHeaders", () => {
     assert.match(res.headers.get("Vary") || "", /Origin/);
   });
 
+  it("CLIENT_API: echoes arbitrary Origin (+Vary) for a token-carrying request (relaxForTokenAuth)", () => {
+    // Token-authenticated /v1/* surface (issue #5242): no allowlist, arbitrary
+    // origin → echo it back so browser/Electron renderers can read the body.
+    const res = NextResponse.json({ ok: true });
+    const req = new Request("https://server.example.com/api/v1/models", {
+      headers: { Origin: "http://localhost", Authorization: "Bearer omr_test_key" },
+    });
+    applyCorsHeaders(res, req, true);
+    assert.equal(res.headers.get("Access-Control-Allow-Origin"), "http://localhost");
+    assert.match(res.headers.get("Vary") || "", /Origin/);
+    // Never paired with Allow-Credentials on the token-auth surface.
+    assert.equal(res.headers.get("Access-Control-Allow-Credentials"), null);
+  });
+
+  it("CLIENT_API: returns '*' when no Origin header is present for a token-carrying request", () => {
+    const res = NextResponse.json({ ok: true });
+    const req = new Request("https://server.example.com/api/v1/models", {
+      headers: { "x-api-key": "omr_test_key" },
+    });
+    applyCorsHeaders(res, req, true);
+    assert.equal(res.headers.get("Access-Control-Allow-Origin"), "*");
+    assert.equal(res.headers.get("Access-Control-Allow-Credentials"), null);
+  });
+
+  it("CLIENT_API: does NOT echo the Origin for a credential-less cross-origin request (GHSA-7px7)", () => {
+    // A keyless install serves /v1 anonymously; echoing the Origin to a
+    // credential-less cross-origin page would let any visited page drive the
+    // gateway. Only token-carrying requests get the permissive echo.
+    const res = NextResponse.json({ ok: true });
+    const req = new Request("https://server.example.com/api/v1/models", {
+      headers: { Origin: "https://evil.example" },
+    });
+    applyCorsHeaders(res, req, true);
+    assert.equal(res.headers.get("Access-Control-Allow-Origin"), null);
+  });
+
+  it("CLIENT_API: a CORS preflight (OPTIONS) is still allowed through (relaxForTokenAuth)", () => {
+    // Preflight never carries the auth header; blocking it would break the
+    // credentialed request that follows, so OPTIONS keeps the permissive echo.
+    const res = new Response(null, { status: 204 });
+    const req = new Request("https://server.example.com/api/v1/models", {
+      method: "OPTIONS",
+      headers: { Origin: "http://localhost" },
+    });
+    applyCorsHeaders(res, req, true);
+    assert.equal(res.headers.get("Access-Control-Allow-Origin"), "http://localhost");
+  });
+
+  it("MANAGEMENT: stays fail-closed for arbitrary Origin with no allowlist (relax off)", () => {
+    const res = NextResponse.json({ ok: true });
+    const req = new Request("https://server.example.com/api/keys", {
+      headers: { Origin: "http://localhost" },
+    });
+    // Default (relaxForTokenAuth = false) — same as MANAGEMENT routes.
+    applyCorsHeaders(res, req);
+    assert.equal(res.headers.get("Access-Control-Allow-Origin"), null);
+    applyCorsHeaders(res, req, false);
+    assert.equal(res.headers.get("Access-Control-Allow-Origin"), null);
+  });
+
+  it("relaxForTokenAuth still honors an explicit allowlist match exactly (no wildcard)", () => {
+    process.env.CORS_ALLOWED_ORIGINS = "https://app.example.com";
+    const res = NextResponse.json({ ok: true });
+    const req = new Request("https://server.example.com/api/v1/models", {
+      headers: { Origin: "https://app.example.com" },
+    });
+    applyCorsHeaders(res, req, true);
+    assert.equal(res.headers.get("Access-Control-Allow-Origin"), "https://app.example.com");
+    assert.match(res.headers.get("Vary") || "", /Origin/);
+  });
+
+  it("CLIENT_API: appends Vary: Accept-Encoding on a 2xx relaxForTokenAuth response (#6737)", () => {
+    const res = NextResponse.json({ ok: true });
+    const req = new Request("https://server.example.com/api/v1/models");
+    applyCorsHeaders(res, req, true);
+    assert.match(res.headers.get("Vary") || "", /Accept-Encoding/);
+  });
+
+  it("CLIENT_API: combines with Vary: Origin into a single comma-joined header (#6737)", () => {
+    process.env.CORS_ALLOWED_ORIGINS = "https://app.example.com";
+    const res = NextResponse.json({ ok: true });
+    const req = new Request("https://server.example.com/api/v1/models", {
+      headers: { Origin: "https://app.example.com" },
+    });
+    applyCorsHeaders(res, req, true);
+    const varyValues = res.headers.getSetCookie ? res.headers.get("Vary") : res.headers.get("Vary");
+    assert.equal(varyValues, "Origin, Accept-Encoding");
+    assert.equal([...res.headers.entries()].filter(([k]) => k.toLowerCase() === "vary").length, 1);
+  });
+
+  it("MANAGEMENT: does not append Vary: Accept-Encoding (relax off) (#6737)", () => {
+    const res = NextResponse.json({ ok: true });
+    const req = new Request("https://server.example.com/api/keys");
+    applyCorsHeaders(res, req);
+    assert.doesNotMatch(res.headers.get("Vary") || "", /Accept-Encoding/);
+    applyCorsHeaders(res, req, false);
+    assert.doesNotMatch(res.headers.get("Vary") || "", /Accept-Encoding/);
+  });
+
+  it("204 response: does not append Vary: Accept-Encoding even with relaxForTokenAuth (#6737)", () => {
+    const res = new NextResponse(null, { status: 204 });
+    const req = new Request("https://server.example.com/api/v1/models", {
+      method: "OPTIONS",
+    });
+    applyCorsHeaders(res, req, true);
+    assert.doesNotMatch(res.headers.get("Vary") || "", /Accept-Encoding/);
+  });
+
+  it("CLIENT_API: appends Vary: Accept-Encoding even without an Origin header (#6737)", () => {
+    const res = NextResponse.json({ ok: true });
+    // Token-carrying request (post-GHSA-7px7 the permissive echo requires a
+    // credential); this test's point is the Vary: Accept-Encoding stamp.
+    const req = new Request("https://server.example.com/api/v1/models", {
+      headers: { "x-api-key": "omr_test_key" },
+    });
+    applyCorsHeaders(res, req, true);
+    assert.equal(res.headers.get("Access-Control-Allow-Origin"), "*");
+    assert.match(res.headers.get("Vary") || "", /Accept-Encoding/);
+  });
+
   it("reflects requested headers from Access-Control-Request-Headers preflight", () => {
     process.env.CORS_ALLOWED_ORIGINS = "https://app.example.com";
     const res = NextResponse.json({ ok: true });
@@ -143,6 +264,48 @@ describe("cors/origins.applyCorsHeaders", () => {
   });
 });
 
+describe("cors/origins.getCorsStatus", () => {
+  let envSnap: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    envSnap = snapshotEnv();
+    for (const key of ENV_KEYS) delete process.env[key];
+    setRuntimeAllowedOrigins("");
+  });
+
+  afterEach(() => {
+    restoreEnv(envSnap);
+    setRuntimeAllowedOrigins("");
+  });
+
+  it("default (no env, no runtime) → allowAll false, empty origins", () => {
+    assert.deepEqual(getCorsStatus(), { allowAll: false, allowedOrigins: [] });
+  });
+
+  it("CORS_ALLOW_ALL=true → allowAll true", () => {
+    process.env.CORS_ALLOW_ALL = "true";
+    assert.equal(getCorsStatus().allowAll, true);
+  });
+
+  it("legacy CORS_ORIGIN=* → allowAll true", () => {
+    process.env.CORS_ORIGIN = "*";
+    assert.equal(getCorsStatus().allowAll, true);
+  });
+
+  it("merges env + runtime allowlists, normalized, sorted, deduped", () => {
+    process.env.CORS_ALLOWED_ORIGINS = "https://Env.Example.com/, https://shared.example.com";
+    setRuntimeAllowedOrigins("https://runtime.example.com, https://shared.example.com/");
+    assert.deepEqual(getCorsStatus(), {
+      allowAll: false,
+      allowedOrigins: [
+        "https://env.example.com",
+        "https://runtime.example.com",
+        "https://shared.example.com",
+      ],
+    });
+  });
+});
+
 describe("cors/origins.STATIC_CORS_HEADERS", () => {
   it("never contains Access-Control-Allow-Origin", () => {
     assert.equal(
@@ -150,5 +313,11 @@ describe("cors/origins.STATIC_CORS_HEADERS", () => {
       false
     );
     assert.match(STATIC_CORS_HEADERS["Access-Control-Allow-Methods"], /OPTIONS/);
+  });
+
+  it("allows the generic managed-lease control headers", () => {
+    const allowedHeaders = STATIC_CORS_HEADERS["Access-Control-Allow-Headers"];
+    assert.match(allowedHeaders, /X-OmniRoute-Lease-Owner/i);
+    assert.match(allowedHeaders, /X-OmniRoute-Lease-Generation/i);
   });
 });

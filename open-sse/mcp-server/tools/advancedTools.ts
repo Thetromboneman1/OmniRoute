@@ -14,11 +14,11 @@
  *   9. omniroute_get_session_snapshot — Full session state snapshot
  *  10. omniroute_db_health_check   — Diagnose and repair DB state drift
  *  11. omniroute_sync_pricing      — Sync provider pricing from external source
- *  12. omniroute_cache_stats       — Cache statistics and hit rates
- *  13. omniroute_cache_flush       — Flush/invalidate cache entries
  */
 
 import { logToolCall } from "../audit.ts";
+import { getMcpHttpAuthHeadersForInternalFetch } from "../httpAuthContext.ts";
+import { getInternalServiceAuthHeaders } from "../../../src/lib/api/internalServiceAuth.ts";
 import { normalizeQuotaResponse } from "../../../src/shared/contracts/quota.ts";
 import { resolveOmniRouteBaseUrl } from "../../../src/shared/utils/resolveOmniRouteBaseUrl.ts";
 import {
@@ -26,6 +26,11 @@ import {
   getComboModelString,
   getComboStepTarget,
 } from "../../../src/lib/combos/steps.ts";
+import type {
+  AutoRoutingStrategyValue,
+  RoutingStrategyValue,
+} from "../../../src/shared/constants/routingStrategies.ts";
+import { normalizeRoutingStrategy } from "../../../src/shared/constants/routingStrategies.ts";
 
 const OMNIROUTE_BASE_URL = resolveOmniRouteBaseUrl();
 const OMNIROUTE_API_KEY = process.env.OMNIROUTE_API_KEY || "";
@@ -34,8 +39,12 @@ async function apiFetch(path: string, options: RequestInit = {}): Promise<unknow
   const url = `${OMNIROUTE_BASE_URL}${path}`;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
+    // Static env key is only a fallback; the per-caller MCP identity forwarded via
+    // withMcpHttpAuthContext must win over it (#5819).
     ...(OMNIROUTE_API_KEY ? { Authorization: `Bearer ${OMNIROUTE_API_KEY}` } : {}),
+    ...getMcpHttpAuthHeadersForInternalFetch(),
     ...((options.headers as Record<string, string>) || {}),
+    ...getInternalServiceAuthHeaders(),
   };
   const response = await fetch(url, { ...options, headers, signal: AbortSignal.timeout(30000) });
   if (!response.ok) {
@@ -372,17 +381,8 @@ export async function handleSetBudgetGuard(args: {
 
 export async function handleSetRoutingStrategy(args: {
   comboId: string;
-  strategy:
-    | "priority"
-    | "weighted"
-    | "round-robin"
-    | "context-relay"
-    | "strict-random"
-    | "random"
-    | "least-used"
-    | "cost-optimized"
-    | "auto";
-  autoRoutingStrategy?: "rules" | "cost" | "eco" | "latency" | "fast";
+  strategy: RoutingStrategyValue;
+  autoRoutingStrategy?: AutoRoutingStrategyValue;
 }) {
   const start = Date.now();
   try {
@@ -424,19 +424,20 @@ export async function handleSetRoutingStrategy(args: {
       Object.keys(toRecord(combo.config)).length > 0 ? combo.config : comboData.config
     );
 
+    const normalizedStrategy = normalizeRoutingStrategy(args.strategy);
     let nextConfig: JsonRecord | undefined = undefined;
-    if (args.strategy === "auto" && args.autoRoutingStrategy) {
+    if (normalizedStrategy === "auto" && args.autoRoutingStrategy) {
       const currentAutoConfig = toRecord(currentConfig.auto);
       nextConfig = {
         ...currentConfig,
         auto: {
           ...currentAutoConfig,
-          routingStrategy: args.autoRoutingStrategy,
+          routerStrategy: args.autoRoutingStrategy,
         },
       };
     }
 
-    const payload: JsonRecord = { strategy: args.strategy };
+    const payload: JsonRecord = { strategy: normalizedStrategy };
     if (nextConfig && Object.keys(nextConfig).length > 0) {
       payload.config = nextConfig;
     }
@@ -450,17 +451,19 @@ export async function handleSetRoutingStrategy(args: {
 
     const updatedConfig = toRecord(updatedCombo.config);
     const resolvedAutoStrategy =
-      toString(toRecord(updatedConfig.auto).routingStrategy) ||
-      (args.strategy === "auto" ? (args.autoRoutingStrategy ?? "rules") : "");
+      toString(toRecord(updatedConfig.auto).routerStrategy) ||
+      (normalizedStrategy === "auto" ? (args.autoRoutingStrategy ?? "rules") : "");
 
     const result = {
       success: true,
       combo: {
         id: toString(updatedCombo.id, comboId),
         name: toString(updatedCombo.name, toString(combo.name, comboId)),
-        strategy: toString(updatedCombo.strategy, args.strategy),
+        strategy: toString(updatedCombo.strategy, normalizedStrategy),
         autoRoutingStrategy:
-          toString(updatedCombo.strategy, args.strategy) === "auto" ? resolvedAutoStrategy : null,
+          toString(updatedCombo.strategy, normalizedStrategy) === "auto"
+            ? resolvedAutoStrategy
+            : null,
       },
     };
 
@@ -547,7 +550,6 @@ export async function handleTestCombo(args: { comboId: string; testPrompt: strin
                 messages: [{ role: "user", content: prompt }],
                 max_tokens: 50,
                 stream: false,
-                "x-provider": model.provider,
               }),
             })
           );
@@ -894,7 +896,7 @@ export async function handleDbHealthCheck(args: { autoRepair?: boolean }) {
 
   try {
     const { runManagedDbHealthCheck } = await import("../../../src/lib/db/core.ts");
-    const result = runManagedDbHealthCheck({ autoRepair });
+    const result = await runManagedDbHealthCheck({ autoRepair });
 
     await logToolCall(
       "omniroute_db_health_check",

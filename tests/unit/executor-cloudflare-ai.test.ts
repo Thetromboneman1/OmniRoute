@@ -5,7 +5,7 @@ import { CloudflareAIExecutor } from "../../open-sse/executors/cloudflare-ai.ts"
 
 test("CloudflareAIExecutor.buildUrl prefers providerSpecificData.accountId", () => {
   const executor = new CloudflareAIExecutor();
-  const url = executor.buildUrl("@cf/meta/llama-3.3-70b-instruct", true, 0, {
+  const url = executor.buildUrl("@cf/meta/llama-3.3-70b-instruct-fp8-fast", true, 0, {
     accountId: "top-level-id",
     providerSpecificData: { accountId: "provider-id" },
   });
@@ -22,10 +22,10 @@ test("CloudflareAIExecutor.buildUrl falls back to top-level credentials and envi
   process.env.CLOUDFLARE_ACCOUNT_ID = "env-account-id";
 
   try {
-    const fromTopLevel = executor.buildUrl("@cf/meta/llama-3.3-70b-instruct", false, 0, {
+    const fromTopLevel = executor.buildUrl("@cf/meta/llama-3.3-70b-instruct-fp8-fast", false, 0, {
       accountId: "top-level-id",
     });
-    const fromEnv = executor.buildUrl("@cf/meta/llama-3.3-70b-instruct", false, 0, {});
+    const fromEnv = executor.buildUrl("@cf/meta/llama-3.3-70b-instruct-fp8-fast", false, 0, {});
 
     assert.equal(
       fromTopLevel,
@@ -48,7 +48,7 @@ test("CloudflareAIExecutor.buildUrl throws when account ID is missing", () => {
 
   try {
     assert.throws(
-      () => executor.buildUrl("@cf/meta/llama-3.3-70b-instruct", true, 0, {}),
+      () => executor.buildUrl("@cf/meta/llama-3.3-70b-instruct-fp8-fast", true, 0, {}),
       /Account ID/
     );
   } finally {
@@ -73,14 +73,41 @@ test("CloudflareAIExecutor.buildHeaders uses API key or access token and stream 
   });
 });
 
-test("CloudflareAIExecutor.transformRequest is a passthrough for full model paths", () => {
+test("CloudflareAIExecutor.transformRequest preserves plain-string content", () => {
   const executor = new CloudflareAIExecutor();
   const body = {
-    model: "@cf/meta/llama-3.3-70b-instruct",
+    model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
     messages: [{ role: "user", content: "hi" }],
   };
+  const out = executor.transformRequest("@cf/meta/llama-3.3-70b-instruct-fp8-fast", body, true, {} as any);
+  assert.deepEqual((out as any).messages, [{ role: "user", content: "hi" }]);
+});
 
-  assert.equal(executor.transformRequest("@cf/meta/llama-3.3-70b-instruct", body, true, {}), body);
+// Regression for #2539: Workers AI /ai/v1/chat/completions rejects OpenAI content-part
+// arrays — flatten [{type:"text", text}] to a plain string so requests don't 400.
+test("CloudflareAIExecutor.transformRequest flattens content-part arrays to strings (#2539)", () => {
+  const executor = new CloudflareAIExecutor();
+  const body = {
+    model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "hello " },
+          { type: "text", text: "world" },
+        ],
+      },
+      { role: "assistant", content: "plain stays plain" },
+    ],
+  };
+  const out = executor.transformRequest(
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    body,
+    false,
+    {} as any
+  ) as any;
+  assert.equal(out.messages[0].content, "hello world");
+  assert.equal(out.messages[1].content, "plain stays plain");
 });
 
 test("CloudflareAIExecutor.execute uses inherited BaseExecutor flow successfully", async () => {
@@ -105,11 +132,11 @@ test("CloudflareAIExecutor.execute uses inherited BaseExecutor flow successfully
 
   try {
     const body = {
-      model: "@cf/meta/llama-3.3-70b-instruct",
+      model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
       messages: [{ role: "user", content: "hello" }],
     };
     const result = await executor.execute({
-      model: "@cf/meta/llama-3.3-70b-instruct",
+      model: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
       body,
       stream: false,
       credentials: {
@@ -123,7 +150,7 @@ test("CloudflareAIExecutor.execute uses inherited BaseExecutor flow successfully
       result.url,
       "https://api.cloudflare.com/client/v4/accounts/account-123/ai/v1/chat/completions"
     );
-    assert.equal(result.transformedBody, body);
+    assert.deepEqual(result.transformedBody, body);
     assert.equal(captured.options.headers.Authorization, "Bearer cf-api-token");
     assert.equal(captured.options.body, JSON.stringify(body));
   } finally {

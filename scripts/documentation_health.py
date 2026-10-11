@@ -64,7 +64,8 @@ def maintained_documents(root: Path) -> list[Path]:
 def is_external_or_generated_document(root: Path, document: Path) -> bool:
     relative = document.relative_to(root).as_posix()
     return (
-        relative.startswith("docs/reference/")
+        relative.startswith("docs/i18n/")
+        or relative.startswith("docs/reference/")
         or relative.startswith(".agents/")
         or relative.startswith(".github/prompts/")
         or relative.startswith(".github/chatmodes/")
@@ -226,7 +227,24 @@ def render_svg(svg_path: Path, png_path: Path) -> None:
 
 
 def mermaid_command(source: Path, output: Path) -> list[str]:
-    command = ["npx", "-y", "@mermaid-js/mermaid-cli@11.10.1", "-i", str(source), "-o", str(output), "-b", "transparent"]
+    # The repository uses legacy-peer-deps=true, so npm does not automatically
+    # install mermaid-cli's Puppeteer peer. Declare both packages explicitly so
+    # npx builds a complete isolated renderer on local machines and CI runners.
+    command = [
+        "npx",
+        "-y",
+        "--package",
+        "@mermaid-js/mermaid-cli@11.10.1",
+        "--package",
+        "puppeteer@23",
+        "mmdc",
+        "-i",
+        str(source),
+        "-o",
+        str(output),
+        "-b",
+        "transparent",
+    ]
     if output.suffix.lower() == ".png":
         command.extend(["--scale", "2"])
     return command
@@ -266,8 +284,15 @@ def render_mermaid(root: Path, source: str, digest: str) -> tuple[Path, Path, Pa
     stamp_path.unlink(missing_ok=True)
     env = os.environ.copy()
     env.setdefault("PUPPETEER_SKIP_DOWNLOAD", "1")
-    chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-    if chrome.exists():
+    chrome_candidates = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+    ]
+    chrome = next((candidate for candidate in chrome_candidates if candidate and Path(candidate).exists()), None)
+    if chrome:
         env.setdefault("PUPPETEER_EXECUTABLE_PATH", str(chrome))
     if not svg_path.exists():
         result = subprocess.run(

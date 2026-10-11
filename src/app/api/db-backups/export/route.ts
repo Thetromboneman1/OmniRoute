@@ -4,6 +4,7 @@ import fs from "fs";
 import os from "os";
 import { getDbInstance, SQLITE_FILE } from "@/lib/db/core";
 import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 /**
  * GET /api/db-backups/export — Download the current database as a .sqlite file.
@@ -14,7 +15,7 @@ import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
  * 🔒 Auth-guarded: requires JWT cookie or Bearer API key (finding #258-2).
  */
 export async function GET(request: Request) {
-  if (await isAuthRequired()) {
+  if (await isAuthRequired(request)) {
     if (!(await isAuthenticated(request))) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
@@ -26,33 +27,59 @@ export async function GET(request: Request) {
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const exportFilename = `omniroute-backup-${timestamp}.sqlite`;
-    const tmpDir = os.tmpdir();
-    const tmpPath = path.join(tmpDir, exportFilename);
+    // Use mkdtempSync (exclusive creation, random suffix) instead of a
+    // deterministic timestamp path — a predictable path lets a local
+    // attacker pre-place a symlink and redirect the write (TOCTOU).
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-backup-"));
+    const tmpPath = path.join(tmpDir, "backup.sqlite");
 
     // Use native SQLite backup API for a consistent snapshot
     const db = getDbInstance();
-    await db.backup(tmpPath);
-
-    const fileBuffer = fs.readFileSync(tmpPath);
-
-    // Cleanup temp file
     try {
-      fs.unlinkSync(tmpPath);
-    } catch {
-      /* best effort */
+      await db.backup(tmpPath);
+    } catch (backupError) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      throw backupError;
     }
 
-    return new Response(fileBuffer, {
+    const { size: fileSize } = fs.statSync(tmpPath);
+    const readStream = fs.createReadStream(tmpPath);
+
+    // Cleanup temp dir (and everything in it) on completion, error, or client abort
+    const cleanup = () => {
+      readStream.destroy();
+      fs.rm(tmpDir, { recursive: true, force: true }, () => {});
+    };
+    request.signal.addEventListener("abort", cleanup, { once: true });
+
+    const webStream = new ReadableStream({
+      start(controller) {
+        readStream.on("data", (chunk) => controller.enqueue(chunk));
+        readStream.on("end", () => {
+          controller.close();
+          cleanup();
+        });
+        readStream.on("error", (err) => {
+          controller.error(err);
+          cleanup();
+        });
+      },
+      cancel() {
+        cleanup();
+      },
+    });
+
+    return new Response(webStream, {
       status: 200,
       headers: {
         "Content-Type": "application/octet-stream",
         "Content-Disposition": `attachment; filename="${exportFilename}"`,
-        "Content-Length": String(fileBuffer.length),
+        "Content-Length": String(fileSize),
         "Cache-Control": "no-cache, no-store",
       },
     });
   } catch (error) {
     console.error("[API] Error exporting database:", error);
-    return NextResponse.json({ error: error.message }, { status: 500 });
+    return NextResponse.json({ error: sanitizeErrorMessage(error) }, { status: 500 });
   }
 }

@@ -13,6 +13,7 @@
  * @see Issue #1628
  */
 
+import { createHash } from "node:crypto";
 import {
   clearAllReasoningCache,
   cleanupExpiredReasoning,
@@ -22,6 +23,7 @@ import {
   getReasoningCacheStats,
   setReasoningCache,
 } from "../../src/lib/db/reasoningCache.ts";
+import { isInternalReasoningPlaceholder } from "../utils/reasoningPlaceholder.ts";
 
 // ──────────────── Provider/Model Detection ────────────────
 
@@ -34,24 +36,89 @@ const REASONING_REPLAY_PROVIDERS = new Set([
   "sambanova",
   "fireworks",
   "together",
+  // Kimi Coding thinking-mode upstreams require reasoning_content replay under
+  // the same strict multi-turn contract as DeepSeek.
+  "kimi-coding",
+  "kimi-coding-apikey",
+  // Xiaomi MiMo enforces the same "pass back reasoning_content on subsequent
+  // turns" contract as DeepSeek/Kimi-thinking. Without replay the upstream
+  // 400s with "Param Incorrect: The reasoning_content in the thinking mode
+  // must be passed back to the API."
+  "xiaomi-mimo",
+  // Command Code routes upstream DeepSeek models and requires the same
+  // reasoning_content replay contract.
+  "command-code",
 ]);
 
 const REASONING_REPLAY_MODEL_PATTERNS = [
   /deepseek-r1/i,
   /deepseek-reasoner/i,
   /deepseek-chat/i,
-  /kimi-k2/i,
+  /deepseek[-/]v4(?:[-.]\d+)?[-.](flash|pro)(-free)?/i,
+  /zen\/deepseek-v4/i,
+  // Match native kimi-kN and namespaced kimi/kN families without treating
+  // generic aliases such as kimi-latest as strict thinking models.
+  /kimi[-/]k\d/i,
   /qwq/i,
   /qwen.*think/i,
   /glm.*think/i,
+  // MiMo (Xiaomi) thinking models — defensive match if a wildcard route
+  // assigns a non-`xiaomi-mimo` provider ID to a mimo-* model alias.
+  /^mimo[-.]?v\d/i,
 ];
+
+const DEEPSEEK_V4_MODEL_PATTERN = /deepseek[-/]v4(?:[-.]\d+)?[-.](flash|pro)/i;
+const K3_REASONING_REPLAY_MODEL_PATTERN = /(?:^|\/)(?:kimi-)?k3(?:$|-)/i;
+const NATIVE_K27_REASONING_REPLAY_MODEL_PATTERN = /(?:^|\/)kimi-k2\.7-code(?:$|-)/i;
+
+export function isDeepSeekReasoningModel(params: {
+  provider: string;
+  model: string;
+  thinkingEnabled?: boolean;
+}): boolean {
+  if (params.thinkingEnabled !== true) return false;
+  return DEEPSEEK_V4_MODEL_PATTERN.test(params.model);
+}
 
 /**
  * Check if a provider/model combination requires reasoning replay.
  */
-export function requiresReasoningReplay(provider: string, model: string): boolean {
-  const normalizedProvider = provider.trim().toLowerCase();
-  const normalizedModel = model.trim();
+export function requiresReasoningReplay(params: {
+  provider: string;
+  model: string;
+  thinkingEnabled?: boolean;
+  supportsReasoning?: boolean;
+  interleavedField?: string | null;
+  allowLegacyFallback?: boolean;
+}): boolean {
+  const normalizedProvider = params.provider.trim().toLowerCase();
+  const normalizedModel = params.model.trim();
+  const normalizedInterleavedField =
+    typeof params.interleavedField === "string" ? params.interleavedField.trim().toLowerCase() : "";
+
+  // Explicit model signal from models.dev (preferred source of truth).
+  if (normalizedInterleavedField === "reasoning_content") return true;
+  if (normalizedInterleavedField === "reasoning_details") return false;
+
+  if (K3_REASONING_REPLAY_MODEL_PATTERN.test(normalizedModel)) return true;
+  if (
+    (normalizedProvider === "moonshot" || normalizedProvider === "kimi") &&
+    NATIVE_K27_REASONING_REPLAY_MODEL_PATTERN.test(normalizedModel)
+  ) {
+    return true;
+  }
+
+  // DeepSeek legacy reasoner family has an inverse contract: do not replay.
+  if (/deepseek-reasoner/i.test(normalizedModel) || /deepseek-r1/i.test(normalizedModel)) {
+    return false;
+  }
+
+  // Explicit known contract: DeepSeek V4 thinking with tool calls requires replay.
+  if (isDeepSeekReasoningModel(params)) return true;
+
+  const useLegacyFallback = params.allowLegacyFallback !== false;
+  if (!useLegacyFallback) return false;
+
   if (REASONING_REPLAY_PROVIDERS.has(normalizedProvider)) return true;
   return REASONING_REPLAY_MODEL_PATTERNS.some((p) => p.test(normalizedModel));
 }
@@ -73,12 +140,19 @@ type AssistantMessageLike = {
   reasoning?: unknown;
 };
 
+type AssistantMessageCacheContext = {
+  scope?: string;
+  historyMessages?: AssistantMessageLike[];
+  videoTranscriptSensitive?: boolean;
+};
+
 type ToolCallLike = {
   id?: unknown;
 };
 
 const memoryCache = new Map<string, MemoryCacheEntry>();
-const MAX_MEMORY_ENTRIES = 2000;
+const MAX_MEMORY_ENTRIES = 200;
+const MAX_ENTRY_BYTES = 10000;
 const TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 // ──────────────── Counters ────────────────
@@ -117,7 +191,7 @@ function purgeExpiredMemory(): void {
 }
 
 /**
- * Cache a reasoning_content string for one or more tool_call IDs.
+ * Cache a reasoning_content string for one tool_call ID.
  * Writes to memory and best-effort DB persistence.
  */
 export function cacheReasoning(
@@ -126,7 +200,23 @@ export function cacheReasoning(
   model: string,
   reasoning: string
 ): void {
-  if (!toolCallId || !reasoning) return;
+  cacheReasoningByKey(toolCallId, provider, model, reasoning);
+}
+
+export function cacheReasoningByKey(
+  key: string,
+  provider: string,
+  model: string,
+  reasoning: string
+): void {
+  if (!key || !reasoning) return;
+  // ponytail: never store the internal replay placeholder — models echo it
+  // and it poisons the cache (upstream echo loop, OmniRoute #9573).
+  if (isInternalReasoningPlaceholder(reasoning)) return;
+
+  if (reasoning.length > MAX_ENTRY_BYTES) {
+    reasoning = reasoning.slice(0, MAX_ENTRY_BYTES);
+  }
 
   const now = Date.now();
 
@@ -134,7 +224,7 @@ export function cacheReasoning(
   if (memoryCache.size >= MAX_MEMORY_ENTRIES) {
     evictOldest();
   }
-  memoryCache.set(toolCallId, {
+  memoryCache.set(key, {
     reasoning,
     provider,
     model,
@@ -143,10 +233,85 @@ export function cacheReasoning(
   });
 
   try {
-    setReasoningCache(toolCallId, provider, model, reasoning, TTL_MS);
+    setReasoningCache(key, provider, model, reasoning, TTL_MS);
   } catch {
     // DB persistence failure is non-fatal; memory cache still serves the hot path.
   }
+}
+
+function stableCacheValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableCacheValue);
+  if (!value || typeof value !== "object") return value;
+
+  const record = value as Record<string, unknown>;
+  return Object.fromEntries(
+    Object.keys(record)
+      .filter((key) => key !== "reasoning" && key !== "reasoning_content")
+      .sort()
+      .map((key) => [key, stableCacheValue(record[key])])
+  );
+}
+
+function canonicalizeMessageContent(content: unknown): unknown {
+  if (!Array.isArray(content)) return stableCacheValue(content ?? null);
+
+  const textParts: string[] = [];
+  for (const part of content) {
+    if (typeof part === "string") {
+      textParts.push(part);
+      continue;
+    }
+    if (!part || typeof part !== "object") return stableCacheValue(content);
+    const record = part as Record<string, unknown>;
+    if (
+      (record.type === "text" || record.type === "input_text" || record.type === "output_text") &&
+      typeof record.text === "string"
+    ) {
+      textParts.push(record.text);
+      continue;
+    }
+    return stableCacheValue(content);
+  }
+  return textParts.join("");
+}
+
+function canonicalizeHistoryMessage(message: AssistantMessageLike): unknown {
+  const record = message as Record<string, unknown>;
+  const toolCalls = Array.isArray(record.tool_calls)
+    ? record.tool_calls.map((toolCall) => {
+        const call = toolCall as Record<string, unknown>;
+        const fn = (call.function ?? {}) as Record<string, unknown>;
+        return stableCacheValue({
+          type: call.type,
+          function: { name: fn.name, arguments: fn.arguments },
+        });
+      })
+    : undefined;
+  return stableCacheValue({
+    role: record.role,
+    name: record.name,
+    content: canonicalizeMessageContent(record.content),
+    tool_calls: toolCalls,
+  });
+}
+
+export function buildAssistantMessageCacheKey(
+  scope: string | null | undefined,
+  messages: AssistantMessageLike[],
+  messageIndex: number
+): string {
+  const normalizedScope = scope?.trim();
+  if (!normalizedScope || !Number.isInteger(messageIndex) || messageIndex < 0) return "";
+  const message = messages[messageIndex];
+  if (!message || message.role !== "assistant") return "";
+
+  const transcript = messages.slice(0, messageIndex + 1).map(canonicalizeHistoryMessage);
+  const digest = createHash("sha256")
+    .update(normalizedScope)
+    .update("\x1f")
+    .update(JSON.stringify(transcript))
+    .digest("hex");
+  return `conversation:${digest}`;
 }
 
 /**
@@ -164,15 +329,17 @@ export function cacheReasoningBatch(
 }
 
 /**
- * Capture reasoning_content from an assistant message with tool calls.
- * Returns the number of tool_call IDs cached.
+ * Capture reasoning_content from an assistant message.
+ * Returns the number of cache keys written.
  */
 export function cacheReasoningFromAssistantMessage(
   message: AssistantMessageLike | null | undefined,
   provider: string,
-  model: string
+  model: string,
+  context?: AssistantMessageCacheContext
 ): number {
-  if (!message || message.role !== "assistant" || !Array.isArray(message.tool_calls)) {
+  if (context?.videoTranscriptSensitive) return 0;
+  if (!message || message.role !== "assistant") {
     return 0;
   }
 
@@ -183,11 +350,30 @@ export function cacheReasoningFromAssistantMessage(
         ? message.reasoning
         : "";
   if (!reasoning) return 0;
+  // ponytail: don't capture the echoed placeholder into the cache.
+  if (isInternalReasoningPlaceholder(reasoning)) return 0;
 
-  const toolCallIds = (message.tool_calls as ToolCallLike[])
-    .map((toolCall) => (typeof toolCall.id === "string" ? toolCall.id : ""))
-    .filter((id) => id.length > 0);
-  if (toolCallIds.length === 0) return 0;
+  const toolCallIds = Array.isArray(message.tool_calls)
+    ? (message.tool_calls as ToolCallLike[])
+        .map((toolCall) => (typeof toolCall.id === "string" ? toolCall.id : ""))
+        .filter((id) => id.length > 0)
+    : [];
+  if (toolCallIds.length === 0) {
+    const scope = context?.scope?.trim();
+    const historyMessages = context?.historyMessages;
+    // A real request always has at least one prior message (the user turn), so an
+    // empty history means the caller could not recover the transcript the read
+    // side keys on (e.g. a Responses-shaped body with `input` and no reported
+    // pivot). Writing a one-message digest then can never match — skip it.
+    if (!scope || !Array.isArray(historyMessages) || historyMessages.length === 0) return 0;
+
+    const messages = [...historyMessages, message];
+    const cacheKey = buildAssistantMessageCacheKey(scope, messages, messages.length - 1);
+    if (!cacheKey) return 0;
+
+    cacheReasoningByKey(cacheKey, provider, model, reasoning);
+    return 1;
+  }
 
   cacheReasoningBatch(toolCallIds, provider, model, reasoning);
   return toolCallIds.length;
@@ -207,6 +393,12 @@ export function lookupReasoning(toolCallId: string): string | null {
   const mem = memoryCache.get(toolCallId);
   if (mem) {
     if (Date.now() < mem.expiresAt) {
+      // ponytail: never replay the internal placeholder from memory.
+      if (isInternalReasoningPlaceholder(mem.reasoning)) {
+        memoryCache.delete(toolCallId);
+        misses++;
+        return null;
+      }
       hits++;
       return mem.reasoning;
     }
@@ -215,23 +407,38 @@ export function lookupReasoning(toolCallId: string): string | null {
   }
 
   // 2. Fallback to DB
-  let dbResult: { reasoning: string; provider: string; model: string } | null = null;
+  let dbResult: { reasoning: string; provider: string; model: string; expiresAt: string } | null =
+    null;
   try {
     dbResult = getReasoningCache(toolCallId);
   } catch {
     // DB lookup failure is non-fatal; treat it as a cache miss.
   }
   if (dbResult) {
+    // ponytail: never promote/replay the internal placeholder from DB.
+    if (isInternalReasoningPlaceholder(dbResult.reasoning)) {
+      misses++;
+      return null;
+    }
+    const persistedExpiresAt = Date.parse(dbResult.expiresAt);
+    if (!Number.isFinite(persistedExpiresAt) || persistedExpiresAt <= Date.now()) {
+      misses++;
+      return null;
+    }
     hits++;
+    let promotedReasoning = dbResult.reasoning;
+    if (promotedReasoning.length > MAX_ENTRY_BYTES) {
+      promotedReasoning = promotedReasoning.slice(0, MAX_ENTRY_BYTES);
+    }
     // Promote back to memory for fast subsequent lookups
     memoryCache.set(toolCallId, {
-      reasoning: dbResult.reasoning,
+      reasoning: promotedReasoning,
       provider: dbResult.provider,
       model: dbResult.model,
-      expiresAt: Date.now() + TTL_MS,
+      expiresAt: persistedExpiresAt,
       createdAt: Date.now(),
     });
-    return dbResult.reasoning;
+    return promotedReasoning;
   }
 
   // 3. Miss
@@ -372,3 +579,53 @@ export function cleanupReasoningCache(): number {
     return 0;
   }
 }
+
+// ──────────────── Auto-start periodic cleanup ────────────────
+//
+// server-init.ts was supposed to start the cleanup job, but that module was
+// never imported anywhere (it was stranded dead code, since removed). As a
+// result, the reasoning_cache SQLite table accumulates expired entries
+// indefinitely.
+//
+// Fix: start the periodic cleanup directly from this module so it runs
+// regardless of how the server boots.  On first import we run one
+// immediate sweep, then schedule a 30-minute interval.
+//
+// See: src/lib/jobs/reasoningCacheCleanupJob.ts (the original job module).
+
+const DEFAULT_CLEANUP_INTERVAL_MS = 30 * 60 * 1000; // 30 min
+
+function getCleanupIntervalMs(): number {
+  const raw = process.env.OMNIROUTE_REASONING_CACHE_CLEANUP_INTERVAL_MS;
+  const parsed = raw ? Number(raw) : Number.NaN;
+  return Number.isFinite(parsed) && parsed >= 60_000 ? parsed : DEFAULT_CLEANUP_INTERVAL_MS;
+}
+
+function startAutoCleanup(): void {
+  // Run once immediately on boot
+  try {
+    const deleted = cleanupReasoningCache();
+    if (deleted > 0) {
+      console.log(`[ReasoningCache] boot cleanup removed ${deleted} expired entries`);
+    }
+  } catch (error) {
+    console.error("[ReasoningCache] boot cleanup failed:", error);
+  }
+
+  // Schedule periodic cleanup
+  const timer = setInterval(() => {
+    try {
+      const deleted = cleanupReasoningCache();
+      if (deleted > 0) {
+        console.log(`[ReasoningCache] periodic cleanup removed ${deleted} expired entries`);
+      }
+    } catch (error) {
+      console.error("[ReasoningCache] periodic cleanup failed:", error);
+    }
+  }, getCleanupIntervalMs());
+
+  timer.unref?.();
+}
+
+// Start on module load — every consumer of reasoning cache benefits.
+startAutoCleanup();

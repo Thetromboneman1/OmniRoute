@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   SUPPORTED_NODE_RANGE,
@@ -22,24 +23,26 @@ test("parseNodeVersion normalizes v-prefixed versions", () => {
   });
 });
 
-test("getNodeRuntimeSupport accepts patched Node 24, 22 and 20 LTS lines", () => {
+test("getNodeRuntimeSupport accepts patched Node 24 and 22 LTS lines", () => {
   assert.deepEqual(getNodeRuntimeSupport("22.22.2"), {
     nodeVersion: "v22.22.2",
     nodeCompatible: true,
     reason: "supported",
     supportedRange: SUPPORTED_NODE_RANGE,
-    supportedDisplay: "Node.js 20.20.2+ (20.x LTS), 22.22.2+ (22.x LTS), or 24.0.0+ (24.x LTS)",
+    supportedDisplay:
+      "Node.js 22.22.2+ (22.x LTS), 24.0.0+ (24.x LTS), 25.0.0+ (25.x), or 26.0.0+ (26.x)",
     recommendedVersion: "v24.14.1",
     minimumSecureVersion: "v22.22.2",
   });
 
-  assert.equal(getNodeRuntimeSupport("20.20.2").nodeCompatible, true);
+  assert.equal(getNodeRuntimeSupport("26.0.0").nodeCompatible, true);
   assert.deepEqual(getNodeRuntimeSupport("24.1.0"), {
     nodeVersion: "v24.1.0",
     nodeCompatible: true,
     reason: "supported",
     supportedRange: SUPPORTED_NODE_RANGE,
-    supportedDisplay: "Node.js 20.20.2+ (20.x LTS), 22.22.2+ (22.x LTS), or 24.0.0+ (24.x LTS)",
+    supportedDisplay:
+      "Node.js 22.22.2+ (22.x LTS), 24.0.0+ (24.x LTS), 25.0.0+ (25.x), or 26.0.0+ (26.x)",
     recommendedVersion: "v24.14.1",
     minimumSecureVersion: "v24.0.0",
   });
@@ -56,22 +59,35 @@ test("getNodeRuntimeSupport rejects versions below the secure floor in a support
 
 test("getNodeRuntimeSupport rejects unsupported major lines", () => {
   const node18 = getNodeRuntimeSupport("18.20.8");
-  const node25 = getNodeRuntimeSupport("25.1.0");
+  const node20 = getNodeRuntimeSupport("20.20.2");
+  const node27 = getNodeRuntimeSupport("27.1.0");
 
   assert.equal(node18.nodeCompatible, false);
   assert.equal(node18.reason, "unsupported-major");
   assert.match(getNodeRuntimeWarning("18.20.8") || "", /outside OmniRoute's approved secure/i);
 
-  assert.equal(node25.nodeCompatible, false);
-  assert.equal(node25.reason, "unreleased-major");
+  // Node 20.x is no longer supported (aligned to package.json engines >=22).
+  assert.equal(node20.nodeCompatible, false);
+  assert.equal(node20.reason, "unsupported-major");
+
+  assert.equal(node27.nodeCompatible, false);
+  assert.equal(node27.reason, "unreleased-major");
   assert.match(
-    getNodeRuntimeWarning("25.1.0") || "",
-    /currently supports Node\.js 20\.x, 22\.x, and 24\.x/i
+    getNodeRuntimeWarning("27.1.0") || "",
+    /currently supports Node\.js 22\.x, 24\.x, 25\.x, and 26\.x/i
   );
 });
 
 test("CLI runtime support stays aligned with the shared runtime policy", () => {
   assert.deepEqual(getCliNodeRuntimeSupport("24.1.0"), getNodeRuntimeSupport("24.1.0"));
   assert.deepEqual(getCliNodeRuntimeSupport("22.22.2"), getNodeRuntimeSupport("22.22.2"));
-  assert.equal(getCliNodeRuntimeWarning("25.1.0"), getNodeRuntimeWarning("25.1.0"));
+  assert.equal(getCliNodeRuntimeWarning("27.1.0"), getNodeRuntimeWarning("27.1.0"));
+});
+
+test("package.json engines.node equals SUPPORTED_NODE_RANGE (install gate == runtime gate)", () => {
+  // Regression guard for #7446: npm consults `engines.node` at install time while the
+  // runtime rejects anything outside SUPPORTED_NODE_RANGE. If the two drift, npm installs
+  // OmniRoute on a Node version the runtime then refuses to run (the Node 22.0.0–22.22.1 gap).
+  const pkg = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
+  assert.equal(pkg.engines.node, SUPPORTED_NODE_RANGE);
 });

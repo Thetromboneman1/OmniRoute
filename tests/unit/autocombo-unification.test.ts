@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 const intelligentRouting = await import("../../src/lib/combos/intelligentRouting.ts");
+const { getModePack } = await import("../../open-sse/services/autoCombo/modePacks.ts");
 
 test("getStrategyCategory classifies intelligent and deterministic strategies correctly", () => {
   assert.equal(intelligentRouting.getStrategyCategory("auto"), "intelligent");
@@ -50,17 +51,19 @@ test("filterCombosByStrategyCategory returns expected combo subsets", () => {
 });
 
 test("combo strategies stay aligned between UI metadata and schema validation", async () => {
-  const { ROUTING_STRATEGIES } = await import("../../src/shared/constants/routingStrategies.ts");
+  const { ROUTING_STRATEGIES, ROUTING_STRATEGY_VALUES, normalizeRoutingStrategy } =
+    await import("../../src/shared/constants/routingStrategies.ts");
   const { comboStrategySchema, createComboSchema } =
     await import("../../src/shared/validation/schemas.ts");
+  const { comboSchema } = await import("../../src/shared/schemas/validation.ts");
+  const { setRoutingStrategyInput } = await import("../../open-sse/mcp-server/schemas/tools.ts");
   const strategyValues = ROUTING_STRATEGIES.map((strategy) => strategy.value);
 
-  assert.equal(strategyValues.length, 13);
-  assert.equal(new Set(strategyValues).size, 13);
+  assert.deepEqual(strategyValues, [...ROUTING_STRATEGY_VALUES]);
+  assert.equal(new Set(strategyValues).size, ROUTING_STRATEGY_VALUES.length);
   assert.equal(strategyValues.includes("auto"), true);
   assert.equal(strategyValues.includes("lkgp"), true);
-  assert.equal(comboStrategySchema.options.length, 13);
-  assert.equal(new Set(comboStrategySchema.options).size, 13);
+  assert.deepEqual(comboStrategySchema.options, [...ROUTING_STRATEGY_VALUES]);
 
   strategyValues.forEach((strategy) => {
     const parsed = createComboSchema.safeParse({
@@ -69,7 +72,26 @@ test("combo strategies stay aligned between UI metadata and schema validation", 
       strategy,
     });
     assert.equal(parsed.success, true, `schema should accept strategy ${strategy}`);
+    assert.equal(
+      comboSchema.safeParse({
+        name: `legacy-combo-${strategy}`,
+        model: "openai/gpt-4o-mini",
+        strategy,
+        nodes: [{ connectionId: crypto.randomUUID() }],
+      }).success,
+      true,
+      `legacy combo schema should accept strategy ${strategy}`
+    );
+    assert.equal(
+      setRoutingStrategyInput.safeParse({ comboId: "combo", strategy }).success,
+      true,
+      `MCP set strategy schema should accept ${strategy}`
+    );
   });
+
+  assert.equal(normalizeRoutingStrategy("usage"), "least-used");
+  assert.equal(normalizeRoutingStrategy("context"), "context-optimized");
+  assert.equal(normalizeRoutingStrategy("unknown"), "priority");
 
   const invalidParse = createComboSchema.safeParse({
     name: "combo-invalid",
@@ -115,17 +137,36 @@ test("intelligent combo selection defaults only inside the intelligent filter", 
 
 test("sidebar visibility excludes the removed auto-combo item", async () => {
   const sidebarVisibility = await import("../../src/shared/constants/sidebarVisibility.ts");
-  const primarySection = sidebarVisibility.SIDEBAR_SECTIONS.find(
-    (section) => section.id === "primary"
+  const omniProxySection = sidebarVisibility.SIDEBAR_SECTIONS.find(
+    (section) => section.id === "omni-proxy"
   );
 
-  assert.equal(sidebarVisibility.HIDEABLE_SIDEBAR_ITEM_IDS.includes("auto-combo"), false);
-  assert.ok(primarySection);
   assert.equal(
-    primarySection.items.some((item) => item.id === "auto-combo"),
+    (sidebarVisibility.HIDEABLE_SIDEBAR_ITEM_IDS as readonly string[]).includes("auto-combo"),
     false
   );
-  assert.deepEqual(sidebarVisibility.normalizeHiddenSidebarItems(["auto-combo", "home"]), ["home"]);
+  assert.ok(omniProxySection);
+  const items = sidebarVisibility.getSectionItems(omniProxySection);
+  assert.equal(
+    items.some((item) => (item.id as string) === "auto-combo"),
+    false
+  );
+  assert.deepEqual(sidebarVisibility.normalizeHiddenSidebarItems(["auto-combo" as any, "home"]), [
+    "home",
+  ]);
+});
+
+test("custom mode-pack selection preserves explicit slider intent", () => {
+  assert.deepEqual(intelligentRouting.MODE_PACK_OPTIONS[0], {
+    id: "custom",
+    label: "Custom / None (Use Sliders)",
+    emoji: "tune",
+  });
+  assert.equal(
+    intelligentRouting.normalizeIntelligentRoutingConfig({ modePack: "custom" }).modePack,
+    "custom"
+  );
+  assert.equal(getModePack("custom"), undefined);
 });
 
 test("intelligent routing helpers normalize config and build provider scores", () => {

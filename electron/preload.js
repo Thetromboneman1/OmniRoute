@@ -11,6 +11,84 @@
 
 const { contextBridge, ipcRenderer } = require("electron");
 
+const MAC_DRAG_STYLE_ID = "omniroute-electron-drag-region-style";
+const MAC_DRAG_FALLBACK_ID = "omniroute-electron-drag-region";
+const MAC_DRAG_OBSERVER_KEY = "__omnirouteMacDragRegionObserver";
+
+function installMacDragRegion() {
+  if (process.platform !== "darwin") return;
+
+  const attach = () => {
+    if (!document.head || !document.body) return;
+
+    document.getElementById(MAC_DRAG_STYLE_ID)?.remove();
+    document.getElementById(MAC_DRAG_FALLBACK_ID)?.remove();
+
+    const style = document.createElement("style");
+    style.id = MAC_DRAG_STYLE_ID;
+    style.textContent = `
+      header,
+      .omniroute-electron-drag-region {
+        app-region: drag;
+        -webkit-app-region: drag;
+        user-select: none;
+      }
+
+      header a,
+      header button,
+      header input,
+      header select,
+      header textarea,
+      header [role="button"],
+      header [role="link"],
+      header [tabindex]:not([tabindex="-1"]) {
+        app-region: no-drag;
+        -webkit-app-region: no-drag;
+      }
+
+      .omniroute-electron-drag-region {
+        position: fixed;
+        top: 0;
+        left: 96px;
+        right: 180px;
+        height: 46px;
+        z-index: 9999;
+      }
+    `;
+
+    const dragRegion = document.createElement("div");
+    dragRegion.id = MAC_DRAG_FALLBACK_ID;
+    dragRegion.className = "omniroute-electron-drag-region";
+    dragRegion.setAttribute("aria-hidden", "true");
+
+    document.head.appendChild(style);
+    document.body.appendChild(dragRegion);
+
+    const syncDragFallback = () => {
+      const hasHeader = Boolean(document.querySelector("header"));
+      dragRegion.hidden = hasHeader;
+      if (hasHeader) observer.disconnect();
+    };
+    const previousObserver = window[MAC_DRAG_OBSERVER_KEY];
+    if (previousObserver) previousObserver.disconnect();
+
+    const observer = new MutationObserver(syncDragFallback);
+    observer.observe(document.body, { childList: true, subtree: true });
+    window[MAC_DRAG_OBSERVER_KEY] = observer;
+    window.setTimeout(() => observer.disconnect(), 5000);
+    window.addEventListener("pagehide", () => observer.disconnect(), { once: true });
+    syncDragFallback();
+  };
+
+  if (document.readyState === "loading") {
+    window.addEventListener("DOMContentLoaded", attach, { once: true });
+  } else {
+    attach();
+  }
+}
+
+installMacDragRegion();
+
 // ── Channel Whitelist ──────────────────────────────────────
 const VALID_CHANNELS = {
   invoke: [
@@ -22,8 +100,18 @@ const VALID_CHANNELS = {
     "download-update",
     "install-update",
     "get-app-version",
+    "get-autostart-status",
+    "enable-autostart",
+    "disable-autostart",
+    "remote-server-prompt:get-initial-url",
   ],
-  send: ["window-minimize", "window-maximize", "window-close"],
+  send: [
+    "window-minimize",
+    "window-maximize",
+    "window-close",
+    "remote-server-prompt:submit",
+    "remote-server-prompt:cancel",
+  ],
   receive: ["server-status", "port-changed", "update-status"],
 };
 
@@ -64,6 +152,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
   downloadUpdate: () => safeInvoke("download-update"),
   installUpdate: () => safeInvoke("install-update"),
 
+  // ── Autostart ────────────────────────────────────────────
+  getAutostartStatus: () => safeInvoke("get-autostart-status"),
+  enableAutostart: () => safeInvoke("enable-autostart"),
+  disableAutostart: () => safeInvoke("disable-autostart"),
+
   // ── Send (fire-and-forget) ───────────────────────────────
   minimizeWindow: () => safeSend("window-minimize"),
   maximizeWindow: () => safeSend("window-maximize"),
@@ -71,6 +164,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   // ── Receive (event listeners) ────────────────────────────
   // Fix #6: Returns a disposer function for precise cleanup
+  // "server-status" payloads include remoteUrl when running in Remote Server
+  // Mode (see electron/main.js setRemoteServerUrl) — surfaced here read-only;
+  // the actual URL is configured via the tray menu, not the renderer.
   onServerStatus: (callback) => safeOn("server-status", callback),
   onPortChanged: (callback) => safeOn("port-changed", callback),
   onUpdateStatus: (callback) => safeOn("update-status", callback),

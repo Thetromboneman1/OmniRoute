@@ -3,34 +3,56 @@ import assert from "node:assert";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { cleanupTempDataDir } from "../_setup/tempDataDir.ts";
 
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-batch-api-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
 process.env.API_KEY_SECRET = process.env.API_KEY_SECRET || "test-secret-123";
 
+const { createFile, getFileContent, getFile, listFiles, formatFileResponse, deleteFile } =
+  await import("@/lib/db/files");
 const {
-  createFile,
   createBatch,
   getBatch,
-  getFileContent,
   updateBatch,
-  createProviderConnection,
-  createApiKey,
-  getFile,
-  listFiles,
-  formatFileResponse,
-  deleteFile,
   getTerminalBatches,
-} = await import("../../src/lib/localDb.ts");
+  ensureBatchItemCheckpoints,
+  markBatchItemResult,
+} = await import("@/lib/db/batches");
+const { createProviderConnection } = await import("@/lib/db/providers");
+const { createApiKey } = await import("@/lib/db/apiKeys");
 const { getDbInstance } = await import("../../src/lib/db/core.ts");
-const { initBatchProcessor, stopBatchProcessor, processPendingBatches } =
-  await import("../../open-sse/services/batchProcessor.ts");
+const {
+  initBatchProcessor,
+  stopBatchProcessor,
+  processPendingBatches,
+  waitForAllBatches,
+  resetBatchProcessorState,
+} = await import("../../open-sse/services/batchProcessor.ts");
 const batchesRoute = await import("../../src/app/api/v1/batches/route.ts");
 const batchByIdRoute = await import("../../src/app/api/v1/batches/[id]/route.ts");
 const batchCancelRoute = await import("../../src/app/api/v1/batches/[id]/cancel/route.ts");
 const filesRoute = await import("../../src/app/api/v1/files/route.ts");
 const fileByIdRoute = await import("../../src/app/api/v1/files/[id]/route.ts");
 const fileContentRoute = await import("../../src/app/api/v1/files/[id]/content/route.ts");
+
+test.afterEach(async () => {
+  stopBatchProcessor();
+  await waitForAllBatches();
+  if (typeof resetBatchProcessorState === "function") {
+    resetBatchProcessorState();
+  }
+  try {
+    const db = getDbInstance();
+    db.prepare("DELETE FROM batch_item_checkpoints").run();
+    db.prepare("DELETE FROM batches").run();
+    db.prepare("DELETE FROM files").run();
+    db.prepare("DELETE FROM provider_connections").run();
+    db.prepare("DELETE FROM api_keys").run();
+  } catch (err) {
+    console.error("Failed to clean up db tables:", err);
+  }
+});
 
 test("Batch API and Processing", async () => {
   // 0. Setup environment, mock provider and API key
@@ -71,10 +93,6 @@ test("Batch API and Processing", async () => {
   });
 
   assert.ok(file.id.startsWith("file-"), "File ID should start with file-");
-  assert.ok(
-    file.status === "validating" || !file.status,
-    "File status should be 'validating' by default or null"
-  );
 
   // 2. Create a batch
   const batch = createBatch({
@@ -151,16 +169,11 @@ test("Batch API and Processing", async () => {
   assert.strictEqual(currentBatch?.requestCountsCompleted, 2);
   assert.ok(currentBatch?.outputFileId, "Should have output file ID");
 
-  // Check file statuses
   const inputFileAfter = getFile(file.id);
-  assert.strictEqual(
-    inputFileAfter?.status,
-    "processed",
-    "Input file should be 'processed' after batch completion"
-  );
+  assert.ok(inputFileAfter, "Input file should exist");
 
   const outputFile = getFile(currentBatch.outputFileId!);
-  assert.strictEqual(outputFile?.status, "completed", "Output file should be 'completed'");
+  assert.ok(outputFile, "Output file should exist");
 
   // 4. Check output file content
   if (currentBatch?.outputFileId) {
@@ -190,6 +203,13 @@ test("Batch API and Processing", async () => {
 });
 
 test("Batch handles and counts failures correctly", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ error: { message: "Model not found" } }), {
+      status: 404,
+      headers: { "Content-Type": "application/json" },
+    });
+
   initBatchProcessor();
   try {
     // 1. Create a file with a request that will fail (invalid provider/model)
@@ -250,21 +270,15 @@ test("Batch handles and counts failures correctly", async () => {
       );
       assert.ok(result.response.body.error, "Should contain error in body");
     }
-
-    // Check file statuses
-    const inputFile = getFile(file.id);
-    assert.strictEqual(inputFile?.status, "processed", "Input file should be 'processed'");
-
-    const errorFile = getFile(currentBatch.errorFileId!);
-    assert.strictEqual(errorFile?.status, "completed", "Error file should be 'completed'");
   } finally {
     stopBatchProcessor();
+    globalThis.fetch = originalFetch;
   }
 });
 
 test("Batch dispatches non-chat endpoints through the matching route handler", async () => {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
+  (globalThis as any).fetch = async () =>
     new Response(
       JSON.stringify({
         object: "list",
@@ -385,6 +399,21 @@ test("Batch rejects input lines whose url does not match the batch endpoint", as
 });
 
 test("Batch forces stream: false for all requests", async () => {
+  const originalFetch = globalThis.fetch;
+  let dispatchedBody: Record<string, unknown> | null = null;
+  globalThis.fetch = async (_input, init) => {
+    dispatchedBody = JSON.parse(String(init?.body));
+    return new Response(
+      JSON.stringify({
+        choices: [{ message: { role: "assistant", content: "batch response" } }],
+      }),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+  };
+
   initBatchProcessor();
   try {
     const batchItems = [
@@ -444,8 +473,10 @@ test("Batch forces stream: false for all requests", async () => {
         "Should not have JSON parsing error from SSE stream"
       );
     }
+    assert.strictEqual(dispatchedBody?.stream, false, "Batch dispatch must disable streaming");
   } finally {
     stopBatchProcessor();
+    globalThis.fetch = originalFetch;
   }
 });
 
@@ -571,7 +602,7 @@ test("List batches pagination and response format", async () => {
   const batchIds = batchOrder.map((entry) => entry.id);
 
   // 2. Test listBatches logic (direct DB call)
-  const { listBatches } = await import("../../src/lib/localDb");
+  const { listBatches } = await import("@/lib/db/batches");
   const allBatches = listBatches(apiKey.id, 10);
   assert.strictEqual(allBatches.length, 5);
   assert.strictEqual(allBatches[0].id, batchIds[0]);
@@ -624,7 +655,6 @@ test("Batch cleanup honors output_expires_after for output artifacts", async () 
     purpose: "batch_output",
     content: Buffer.from("{}"),
     apiKeyId: apiKey.id,
-    status: "completed",
   });
   const errorFile = createFile({
     bytes: 10,
@@ -632,7 +662,6 @@ test("Batch cleanup honors output_expires_after for output artifacts", async () 
     purpose: "batch_output",
     content: Buffer.from("{}"),
     apiKeyId: apiKey.id,
-    status: "completed",
   });
 
   const batch = createBatch({
@@ -659,13 +688,25 @@ test("Batch cleanup honors output_expires_after for output artifacts", async () 
   assert.equal(getFile(errorFile.id), null);
 });
 
-test("Batch processor fails orphaned finalizing batches during startup recovery", async () => {
+test("Batch processor recovers orphaned finalizing batches during startup recovery", async () => {
   const apiKey = await createApiKey("Finalizing Recovery Key", "test-machine");
+  const batchItems = [
+    JSON.stringify({
+      custom_id: "req-recovery",
+      method: "POST",
+      url: "/v1/chat/completions",
+      body: {
+        model: "openai/gpt-4o-mini",
+        messages: [{ role: "user", content: "hi" }],
+      },
+    }),
+  ].join("\n");
+
   const inputFile = createFile({
-    bytes: 2,
+    bytes: Buffer.byteLength(batchItems),
     filename: "finalizing.jsonl",
     purpose: "batch",
-    content: Buffer.from("{}"),
+    content: Buffer.from(batchItems),
     apiKeyId: apiKey.id,
   });
 
@@ -679,20 +720,55 @@ test("Batch processor fails orphaned finalizing batches during startup recovery"
   updateBatch(batch.id, {
     status: "finalizing",
     finalizingAt: Math.floor(Date.now() / 1000),
+    requestCountsTotal: 1,
+    requestCountsCompleted: 1,
   });
+  ensureBatchItemCheckpoints(batch.id, [{ lineNumber: 1, customId: "req-recovery" }]);
+  markBatchItemResult(
+    batch.id,
+    { lineNumber: 1, customId: "req-recovery" },
+    {
+      id: "req_checkpointed_recovery",
+      custom_id: "req-recovery",
+      response: {
+        status_code: 200,
+        body: {
+          id: "chatcmpl-mock-recovery",
+          object: "chat.completion",
+          model: "gpt-4o-mini",
+          choices: [
+            {
+              index: 0,
+              message: { role: "assistant", content: "recovered ok" },
+              finish_reason: "stop",
+            },
+          ],
+          usage: {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+          },
+        },
+      },
+    }
+  );
 
-  initBatchProcessor();
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = (async () => {
+    fetchCount++;
+    throw new Error("checkpointed finalizing batch should not dispatch");
+  }) as typeof fetch;
 
   try {
+    await processPendingBatches();
+    await waitForAllBatches();
+
     const recoveredBatch = getBatch(batch.id);
-    assert.strictEqual(recoveredBatch?.status, "failed");
-    assert.match(
-      String(recoveredBatch?.errors?.[0]?.message || ""),
-      /interrupted during finalization/i
-    );
-    assert.strictEqual(getFile(inputFile.id)?.status, "processed");
+    assert.strictEqual(recoveredBatch?.status, "completed");
+    assert.strictEqual(fetchCount, 0);
   } finally {
-    stopBatchProcessor();
+    globalThis.fetch = originalFetch;
   }
 });
 
@@ -738,6 +814,35 @@ test("Files and batches routes expose explicit CORS preflight handlers", async (
       /Authorization/i
     );
   }
+});
+
+test("Batch by-id route hides ownerless records from anonymous requests (GHSA-2jm2-mpx8-6523)", async () => {
+  const file = createFile({
+    bytes: 2,
+    filename: "ownerless.jsonl",
+    purpose: "batch",
+    content: Buffer.from("{}"),
+    apiKeyId: null,
+  });
+  const batch = createBatch({
+    endpoint: "/v1/chat/completions",
+    completionWindow: "24h",
+    inputFileId: file.id,
+    apiKeyId: null,
+  });
+
+  // A null owner is unattributable: only the operator's dashboard session may
+  // read it. An anonymous caller (no key, no session) gets the same 404 a
+  // foreign key gets — never the record.
+  const response = await batchByIdRoute.GET(
+    new Request(`http://localhost/api/v1/batches/${batch.id}`),
+    { params: Promise.resolve({ id: batch.id }) }
+  );
+  const body = await response.json();
+
+  assert.strictEqual(response.status, 404);
+  assert.strictEqual(body.error?.message, "Batch not found");
+  assert.strictEqual(body.id, undefined, "the ownerless record must not be returned");
 });
 
 test("Batch Cancel API", async () => {
@@ -800,7 +905,7 @@ test("Batch processor keeps cancelled status for in-flight batches", async () =>
       method: "POST",
       url: "/v1/chat/completions",
       body: {
-        model: "openai/gpt-4o-mini",
+        model: "openai/gpt-4.1",
         messages: [{ role: "user", content: "cancel me" }],
       },
     }),
@@ -821,7 +926,7 @@ test("Batch processor keeps cancelled status for in-flight batches", async () =>
     apiKeyId: apiKey.id,
   });
 
-  globalThis.fetch = async () => {
+  (globalThis as any).fetch = async () => {
     updateBatch(batch.id, {
       status: "cancelled",
       cancelledAt: Math.floor(Date.now() / 1000),
@@ -855,8 +960,7 @@ test("Batch processor keeps cancelled status for in-flight batches", async () =>
     while (
       remainingAttempts > 0 &&
       currentBatch &&
-      (!["cancelled", "completed", "failed", "expired"].includes(currentBatch.status) ||
-        getFile(file.id)?.status !== "processed")
+      !["cancelled", "completed", "failed", "expired"].includes(currentBatch.status)
     ) {
       await new Promise((resolve) => setTimeout(resolve, 50));
       currentBatch = getBatch(batch.id);
@@ -866,7 +970,6 @@ test("Batch processor keeps cancelled status for in-flight batches", async () =>
     assert.strictEqual(currentBatch?.status, "cancelled");
     assert.ok(!currentBatch?.outputFileId, "Cancelled batch must not emit an output file");
     assert.ok(!currentBatch?.errorFileId, "Cancelled batch must not emit an error file");
-    assert.strictEqual(getFile(file.id)?.status, "processed");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -958,7 +1061,11 @@ test("File upload with expiration and spec-compliant response", async () => {
   assert.strictEqual(response.id, record.id);
   assert.strictEqual(response.object, "file");
   assert.strictEqual(response.expires_at, expiresAt);
-  assert.strictEqual(response.status, "validating");
+  assert.strictEqual(
+    "status" in response,
+    false,
+    `Response should not contain status (marker: ${new Error().stack})`
+  );
   assert.ok(!("content" in response), "Response should not contain content");
   assert.ok(!("apiKeyId" in response), "Response should not contain apiKeyId");
 });
@@ -972,7 +1079,7 @@ test("Retrieve file spec compliance", async () => {
     purpose: "batch",
     content: Buffer.from("{}"),
     apiKeyId: apiKey.id,
-    status: "processed",
+    expiresAt: null,
   });
 
   const response = formatFileResponse(record);
@@ -984,7 +1091,6 @@ test("Retrieve file spec compliance", async () => {
   assert.strictEqual(response.filename, "retrieve_test.jsonl");
   assert.strictEqual(response.object, "file");
   assert.strictEqual(response.purpose, "batch");
-  assert.strictEqual(response.status, "processed");
   assert.strictEqual(response.expires_at, null);
 
   // Ensure no internal fields leak
@@ -1239,4 +1345,8 @@ test("getTerminalBatches returns only terminal statuses ordered oldest first", a
       "Results should be ordered oldest first"
     );
   }
+});
+
+test.after(async () => {
+  await cleanupTempDataDir(TEST_DATA_DIR);
 });

@@ -13,6 +13,15 @@ export type IntelligentRoutingWeights = {
   taskFit: number;
   stability: number;
   tierPriority: number;
+  tierAffinity: number;
+  specificityMatch: number;
+  contextAffinity: number;
+  cacheAffinity: number;
+  sessionAvailability: number;
+  resetWindowAffinity: number;
+  connectionDensity: number;
+  quality: number;
+  reliability: number;
 };
 
 export type IntelligentRoutingConfig = {
@@ -22,6 +31,10 @@ export type IntelligentRoutingConfig = {
   budgetCap?: number;
   weights: IntelligentRoutingWeights;
   routerStrategy: string;
+  slaTargetP95Ms?: number;
+  slaMaxErrorRate?: number;
+  slaMaxCostPer1MTokens?: number;
+  slaHardConstraints: boolean;
 };
 
 export type IntelligentProviderScore = {
@@ -31,27 +44,49 @@ export type IntelligentProviderScore = {
   factors: IntelligentRoutingWeights;
 };
 
+// Kept in sync with DEFAULT_WEIGHTS by
+// tests/unit/combo-scoring-weights-schema-coverage.test.ts. This is a copy on
+// purpose: this module is imported by a client component, and importing the
+// scorer would pull the tier resolver and per-provider cost data into the
+// browser bundle. The test is what makes the copy safe.
 export const DEFAULT_INTELLIGENT_WEIGHTS: IntelligentRoutingWeights = {
-  quota: 0.2,
-  health: 0.25,
-  costInv: 0.2,
-  latencyInv: 0.15,
-  taskFit: 0.1,
-  stability: 0.05,
-  tierPriority: 0.05,
+  quota: 0.1429,
+  health: 0.1605,
+  costInv: 0.1429,
+  latencyInv: 0.1143,
+  taskFit: 0.0762,
+  stability: 0.0476,
+  tierPriority: 0.0476,
+  tierAffinity: 0.0476,
+  specificityMatch: 0.0476,
+  contextAffinity: 0.0476,
+  cacheAffinity: 0,
+  sessionAvailability: 0.0476,
+  resetWindowAffinity: 0,
+  connectionDensity: 0.0476,
+  quality: 0.03,
+  reliability: 0,
 };
 
 export const MODE_PACK_OPTIONS = [
+  { id: "custom", label: "Custom / None (Use Sliders)", emoji: "tune" },
   { id: "ship-fast", label: "Ship Fast", emoji: "rocket_launch" },
   { id: "cost-saver", label: "Cost Saver", emoji: "savings" },
   { id: "quality-first", label: "Quality First", emoji: "target" },
   { id: "offline-friendly", label: "Offline Friendly", emoji: "cloud_off" },
+  { id: "reliability-first", label: "Reliability First", emoji: "shield" },
+  // Named for what it does: `modePacks.ts` ships it as the fault-injection
+  // profile behind `auto/chaos`. It belongs in the list — the engine offers it —
+  // but not under a label that reads like a routing preference.
+  { id: "chaos-mode", label: "Chaos Mode (fault injection — testing)", emoji: "science" },
 ] as const;
 
 export const ROUTER_STRATEGY_OPTIONS = [
-  { id: "rules", label: "Rules (6-Factor Scoring)" },
+  { id: "rules", label: "Rules (Weighted Scoring)" },
+  { id: "score", label: "Highest Weighted Score" },
   { id: "cost", label: "Cost Optimized" },
   { id: "latency", label: "Latency Optimized" },
+  { id: "sla-aware", label: "SLA-aware" },
   { id: "lkgp", label: "Last Known Good Provider" },
 ] as const;
 
@@ -63,6 +98,15 @@ export const FACTOR_LABELS: Record<keyof IntelligentRoutingWeights, string> = {
   taskFit: "Task Fit",
   stability: "Stability",
   tierPriority: "Tier",
+  tierAffinity: "Tier Affinity",
+  specificityMatch: "Specificity",
+  contextAffinity: "Context Affinity",
+  cacheAffinity: "Cache Hit Affinity",
+  sessionAvailability: "Session Availability",
+  resetWindowAffinity: "Reset Window",
+  connectionDensity: "Connection Spread",
+  quality: "Observed Quality",
+  reliability: "Observed Reliability",
 };
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -105,6 +149,11 @@ export function filterCombosByStrategyCategory<T extends { strategy?: unknown }>
 export function normalizeIntelligentRoutingConfig(config: unknown): IntelligentRoutingConfig {
   const configRecord = isRecord(config) ? config : {};
   const rawWeights = isRecord(configRecord.weights) ? configRecord.weights : {};
+  const rawSla = isRecord(configRecord.sla) ? configRecord.sla : {};
+  const slaTargetP95Ms = configRecord.slaTargetP95Ms ?? rawSla.targetP95Ms;
+  const slaMaxErrorRate = toFiniteNumber(configRecord.slaMaxErrorRate ?? rawSla.maxErrorRate);
+  const slaMaxCostPer1MTokens = configRecord.slaMaxCostPer1MTokens ?? rawSla.maxCostPer1MTokens;
+  const slaHardConstraints = configRecord.slaHardConstraints ?? rawSla.hardConstraints;
 
   return {
     candidatePool: Array.isArray(configRecord.candidatePool)
@@ -125,12 +174,37 @@ export function normalizeIntelligentRoutingConfig(config: unknown): IntelligentR
       stability: toFiniteNumber(rawWeights.stability) ?? DEFAULT_INTELLIGENT_WEIGHTS.stability,
       tierPriority:
         toFiniteNumber(rawWeights.tierPriority) ?? DEFAULT_INTELLIGENT_WEIGHTS.tierPriority,
+      tierAffinity:
+        toFiniteNumber(rawWeights.tierAffinity) ?? DEFAULT_INTELLIGENT_WEIGHTS.tierAffinity,
+      specificityMatch:
+        toFiniteNumber(rawWeights.specificityMatch) ?? DEFAULT_INTELLIGENT_WEIGHTS.specificityMatch,
+      contextAffinity:
+        toFiniteNumber(rawWeights.contextAffinity) ?? DEFAULT_INTELLIGENT_WEIGHTS.contextAffinity,
+      cacheAffinity:
+        toFiniteNumber(rawWeights.cacheAffinity) ?? DEFAULT_INTELLIGENT_WEIGHTS.cacheAffinity,
+      sessionAvailability:
+        toFiniteNumber(rawWeights.sessionAvailability) ??
+        DEFAULT_INTELLIGENT_WEIGHTS.sessionAvailability,
+      resetWindowAffinity:
+        toFiniteNumber(rawWeights.resetWindowAffinity) ??
+        DEFAULT_INTELLIGENT_WEIGHTS.resetWindowAffinity,
+      connectionDensity:
+        toFiniteNumber(rawWeights.connectionDensity) ??
+        DEFAULT_INTELLIGENT_WEIGHTS.connectionDensity,
+      quality: toFiniteNumber(rawWeights.quality) ?? DEFAULT_INTELLIGENT_WEIGHTS.quality,
+      reliability:
+        toFiniteNumber(rawWeights.reliability) ?? DEFAULT_INTELLIGENT_WEIGHTS.reliability,
     },
     routerStrategy:
       typeof configRecord.routerStrategy === "string" &&
       configRecord.routerStrategy.trim().length > 0
         ? configRecord.routerStrategy
         : "rules",
+    slaTargetP95Ms: toPositiveNumber(slaTargetP95Ms),
+    slaMaxErrorRate:
+      slaMaxErrorRate !== null ? Math.min(1, Math.max(0, slaMaxErrorRate)) : undefined,
+    slaMaxCostPer1MTokens: toPositiveNumber(slaMaxCostPer1MTokens),
+    slaHardConstraints: slaHardConstraints === true,
   };
 }
 
@@ -153,4 +227,26 @@ export function buildIntelligentProviderScores(combo: {
     score: baseScore,
     factors: weights,
   }));
+}
+
+/** Manual factor edits select custom scoring; unrelated edits preserve the preset. */
+export function applyIntelligentRoutingConfigPatch(
+  config: Record<string, unknown>,
+  patch: Record<string, unknown>
+): Record<string, unknown> & IntelligentRoutingConfig {
+  const normalized = normalizeIntelligentRoutingConfig(config);
+  const weightPatch = isRecord(patch.weights) ? patch.weights : null;
+  return {
+    ...config,
+    ...normalized,
+    ...patch,
+    modePack:
+      weightPatch !== null
+        ? "custom"
+        : ((patch.modePack as string | undefined) ?? normalized.modePack),
+    weights: {
+      ...normalized.weights,
+      ...(weightPatch ?? {}),
+    },
+  };
 }

@@ -2,16 +2,24 @@
 
 import { useTranslations } from "next-intl";
 
-import { useState, useEffect, useMemo, useCallback } from "react";
-import Image from "next/image";
+import { useState, useEffect, useMemo, useCallback, useRef, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Card, CardSkeleton, Button, Modal } from "@/shared/components";
 import ProviderIcon from "@/shared/components/ProviderIcon";
-import { AI_PROVIDERS, FREE_PROVIDERS, OAUTH_PROVIDERS } from "@/shared/constants/providers";
+import { AI_PROVIDERS, NOAUTH_PROVIDERS, OAUTH_PROVIDERS } from "@/shared/constants/providers";
+import {
+  isProviderConnectionConnected,
+  isProviderConnectionErrored,
+} from "@/shared/utils/providerConnectionStatus";
 import { useNotificationStore } from "@/store/notificationStore";
+import { extractApiErrorMessage } from "@/shared/http/apiErrorMessage";
 import { copyToClipboard } from "@/shared/utils/clipboard";
-import type { NewsAnnouncement } from "@/shared/utils/releaseNotes";
+import { getProviderDisplayLabel } from "@/shared/utils/providerDisplayLabel";
+import { useIsElectron, useOpenExternal } from "@/shared/hooks/useElectron";
+import { HomeProviderTopologySection } from "./HomeProviderTopologySection";
+import { shouldShowProviderTopologyOnHome } from "./homeAppearance";
+import HomeRecentRequests from "../home/HomeRecentRequests";
 
 type UpdateStep = {
   step: string;
@@ -26,7 +34,6 @@ type VersionInfo = {
   channel: string;
   autoUpdateSupported: boolean;
   autoUpdateError?: string | null;
-  news?: NewsAnnouncement | null;
 };
 
 type HomePageClientProps = {
@@ -54,6 +61,10 @@ type ProviderMetricSummary = {
   totalSuccesses?: number;
   successRate?: number;
   avgLatencyMs?: number;
+  lastRequestAt?: string | null;
+  lastErrorAt?: string | null;
+  lastStatus?: number | null;
+  lastErrorStatus?: number | null;
 };
 
 type ProviderModelSummary = {
@@ -61,6 +72,20 @@ type ProviderModelSummary = {
   alias?: string;
   model?: string;
 };
+
+const PROVIDER_ALIAS_TO_ID = new Map(
+  Object.entries(AI_PROVIDERS)
+    .flatMap(([providerId, providerInfo]) =>
+      providerInfo.alias ? [[providerInfo.alias.toLowerCase(), providerId]] : []
+    )
+    .filter((entry): entry is [string, string] => entry.length === 2)
+);
+
+function normalizeProviderId(providerId?: string | null): string {
+  const normalized = typeof providerId === "string" ? providerId.trim().toLowerCase() : "";
+  if (!normalized) return "";
+  return AI_PROVIDERS[normalized] ? normalized : PROVIDER_ALIAS_TO_ID.get(normalized) || normalized;
+}
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -75,34 +100,160 @@ function mergeUpdateStep(steps: UpdateStep[], nextStep: UpdateStep) {
   return next;
 }
 
+// Quick-start link classes, extracted so each <Link> still fits on one line with
+// prefetch={false} (#8281) — this file is size-frozen.
+const INLINE_LINK = "text-primary hover:underline";
+const DOCS_LINK =
+  "hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-border text-text-muted hover:text-text-main hover:bg-bg-subtle transition-colors";
+
+// Stable no-op subscription for useSyncExternalStore reads of never-changing
+// browser globals (location.origin does not change without a full navigation).
+function emptySubscribe() {
+  return () => {};
+}
+
 export default function HomePageClient({ machineId }: HomePageClientProps) {
+  const router = useRouter();
+  const isElectron = useIsElectron();
+  const { openExternal } = useOpenExternal();
   const t = useTranslations("home");
-  const tc = useTranslations("common");
-  const ts = useTranslations("sidebar");
+  const tp = useTranslations("providers");
   const [providerConnections, setProviderConnections] = useState([]);
   const [models, setModels] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [baseUrl, setBaseUrl] = useState("/v1");
+  // useSyncExternalStore keeps SSR/hydration consistent ("/v1" on the server,
+  // the real origin after hydration) without a setState-in-effect round-trip.
+  const baseUrl = useSyncExternalStore(
+    emptySubscribe,
+    () => `${globalThis.location.origin}/v1`,
+    () => "/v1"
+  );
   const [selectedProvider, setSelectedProvider] = useState(null);
-  const [providerMetrics, setProviderMetrics] = useState({});
+  const [providerMetrics, setProviderMetrics] = useState<Record<string, ProviderMetricSummary>>({});
+  const [providerTopology, setProviderTopology] = useState({ lastProvider: "", errorProvider: "" });
+  const [providerNodes, setProviderNodes] = useState<
+    Array<{ id?: string; prefix?: string; name?: string }>
+  >([]);
+
+  // The live in-flight request feed for the Provider Topology pulse animation is owned by
+  // <HomeProviderTopologySection>, which subscribes to it (gated by the `enabled` prop)
+  // only when the topology is actually shown. HomePageClient must NOT open its own
+  // unconditional live socket: the binding here was unused (ReferenceError in prod,
+  // #4759/#4745) and the socket opened even when topology was hidden (#4596).
 
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [updating, setUpdating] = useState(false);
+
+  // Platform detection and download links for Electron
+  const platform =
+    typeof globalThis.window === "undefined" ? undefined : globalThis.window.electronAPI?.platform;
+  // Destructured to locals: `versionInfo?.current` in a dependency array trips
+  // the lint heuristic that treats any `.current` access as a mutable ref read.
+  const installedVersion = versionInfo?.current || "";
+  const latestVersion = versionInfo?.latest || "";
+  const electronDownload = useMemo(() => {
+    const cleanLatest = latestVersion.replace(/^v/, "");
+    if (platform === "darwin") {
+      return {
+        label: t("downloadDmg"),
+        url: `https://github.com/diegosouzapw/OmniRoute/releases/download/v${cleanLatest}/OmniRoute-${cleanLatest}.dmg`,
+        desc: t("downloadDmgDescription", { version: installedVersion }),
+      };
+    }
+    if (platform === "win32") {
+      return {
+        label: t("downloadExe"),
+        url: `https://github.com/diegosouzapw/OmniRoute/releases/download/v${cleanLatest}/OmniRoute.Setup.${cleanLatest}.exe`,
+        desc: t("downloadExeDescription", { version: installedVersion }),
+      };
+    }
+    if (platform === "linux") {
+      return {
+        label: t("downloadAppImage"),
+        url: `https://github.com/diegosouzapw/OmniRoute/releases/download/v${cleanLatest}/OmniRoute-${cleanLatest}.AppImage`,
+        desc: t("downloadAppImageDescription", { version: installedVersion }),
+      };
+    }
+    return {
+      label: t("downloadUpdate"),
+      url: `https://github.com/diegosouzapw/OmniRoute/releases/tag/v${cleanLatest}`,
+      desc: t("downloadUpdateDescription", { version: installedVersion }),
+    };
+  }, [platform, t, latestVersion, installedVersion]);
+
+  // Electron internal auto-updater state and listeners
+  const [electronUpdateStatus, setElectronUpdateStatus] = useState<{
+    status:
+      "idle" | "checking" | "available" | "not-available" | "downloading" | "downloaded" | "error";
+    version?: string;
+    percent?: number;
+    message?: string;
+  }>({ status: "idle" });
+
+  useEffect(() => {
+    if (!isElectron || typeof globalThis.window === "undefined" || !globalThis.window.electronAPI)
+      return;
+
+    // Trigger initial check silently on mount
+    globalThis.window.electronAPI.checkForUpdates().catch((err: any) => {
+      console.error("[Electron] Check for updates failed:", err);
+    });
+
+    const dispose = globalThis.window.electronAPI.onUpdateStatus((data: any) => {
+      setElectronUpdateStatus({
+        status: data.status,
+        version: data.version,
+        percent: data.percent,
+        message: data.message,
+      });
+    });
+
+    return dispose;
+  }, [isElectron]);
+
   const [updateSteps, setUpdateSteps] = useState<UpdateStep[]>([]);
   const [updatePhase, setUpdatePhase] = useState<"idle" | "running" | "done" | "failed">("idle");
 
+  // Appearance settings for home page pinning
+  const [showQuickStartOnHome, setShowQuickStartOnHome] = useState(true); // default on
+  // #4596: default hidden until appearance settings load, so the live-WS
+  // topology connection is never opened before we know the user wants it.
+  const [showProviderTopologyOnHome, setShowProviderTopologyOnHome] = useState(false);
+  const [appearanceSettingsLoaded, setAppearanceSettingsLoaded] = useState(false);
+
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      setBaseUrl(`${window.location.origin}/v1`);
-    }
+    // Fetch the pin settings (lightweight)
+    fetch("/api/settings")
+      .then((r) => (r.ok ? r.json() : {}))
+      .then((data) => {
+        if (data) {
+          if (typeof data.showQuickStartOnHome === "boolean") {
+            setShowQuickStartOnHome(data.showQuickStartOnHome);
+          }
+          // #4596 regression fix: the topology card defaults ON (matches the
+          // AppearanceTab toggle's `!== false`). Honoring only an explicit boolean
+          // left the card hidden whenever the setting was never persisted
+          // (undefined), silently removing it for most installs. The live-WS
+          // connection is still gated by `appearanceSettingsLoaded` in the data
+          // effect, so it is never opened before settings load.
+          setShowProviderTopologyOnHome(
+            shouldShowProviderTopologyOnHome(data.showProviderTopologyOnHome)
+          );
+        }
+      })
+      .catch(() => {
+        /* ignore — defaults stay */
+      })
+      .finally(() => {
+        setAppearanceSettingsLoaded(true);
+      });
   }, []);
 
   const fetchData = useCallback(async () => {
     try {
-      const [provRes, modelsRes, metricsRes, versionRes] = await Promise.all([
+      const [provRes, modelsRes, versionRes] = await Promise.all([
         fetch("/api/providers"),
         fetch("/api/models"),
-        fetch("/api/provider-metrics"),
         fetch("/api/system/version"),
       ]);
       if (provRes.ok) {
@@ -112,10 +263,6 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
       if (modelsRes.ok) {
         const modelsData = await modelsRes.json();
         setModels(modelsData.models || []);
-      }
-      if (metricsRes.ok) {
-        const metricsData = await metricsRes.json();
-        setProviderMetrics(metricsData.metrics || {});
       }
       if (versionRes.ok) {
         const versionData = await versionRes.json();
@@ -129,32 +276,170 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
   }, []);
 
   useEffect(() => {
-    fetchData();
+    void (async () => {
+      await fetchData();
+    })();
   }, [fetchData]);
+
+  // Fetch provider nodes for display labels (compat providers)
+  useEffect(() => {
+    fetch("/api/provider-nodes")
+      .then((r) => (r.ok ? r.json() : { nodes: [] }))
+      .then((d) => setProviderNodes(d.nodes || []))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!appearanceSettingsLoaded || !showProviderTopologyOnHome) {
+      return;
+    }
+
+    let cancelled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    let controller: AbortController | null = null;
+
+    const loadTopologyActivity = async () => {
+      const currentController = new AbortController();
+      controller = currentController;
+      try {
+        const metricsRes = await fetch("/api/provider-metrics", {
+          cache: "no-store",
+          signal: currentController.signal,
+        });
+        if (metricsRes.ok) {
+          const data = await metricsRes.json();
+          if (!cancelled) {
+            setProviderMetrics(data.metrics || {});
+            setProviderTopology({
+              lastProvider: normalizeProviderId(data.topology?.lastProvider),
+              errorProvider: normalizeProviderId(data.topology?.errorProvider),
+            });
+          }
+        }
+      } catch (error) {
+        const isAbortError = error instanceof DOMException && error.name === "AbortError";
+        if (!cancelled && !isAbortError) {
+          console.error("Failed to load topology activity:", error);
+        }
+      } finally {
+        if (controller === currentController) {
+          controller = null;
+        }
+        if (!cancelled) {
+          timeoutId = setTimeout(loadTopologyActivity, 3000);
+        }
+      }
+    };
+
+    loadTopologyActivity();
+    return () => {
+      cancelled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      controller?.abort();
+    };
+  }, [appearanceSettingsLoaded, showProviderTopologyOnHome]);
+
+  // T07: Check for unhealthy API keys and show notification (once per session)
+  const notifiedUnhealthyKeys = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const checkApiKeyHealth = () => {
+      const newUnhealthyKeys = new Set<string>();
+      const unhealthyProviderIds = new Set<string>();
+      const unhealthyConnections: string[] = [];
+      let firstUnhealthyProviderId: string | null = null;
+      let hasWarning = false;
+
+      for (const conn of providerConnections) {
+        const health = conn.providerSpecificData?.apiKeyHealth as
+          | Record<
+              string,
+              {
+                status: "active" | "warning" | "invalid";
+                failures: number;
+                lastFailure: string | null;
+              }
+            >
+          | undefined;
+        if (!health) continue;
+
+        // Defense-in-depth: skip stale extra_N health entries whose index
+        // is out of range of the current extraApiKeys list.
+        // The backend cleans this up on PATCH, but existing stale data from
+        // before the fix or other code paths could still have orphan entries.
+        const extras: string[] = conn.providerSpecificData?.extraApiKeys ?? [];
+        const extraKeyCount = Array.isArray(extras) ? extras.length : 0;
+
+        const unhealthyKeys = Object.entries(health).filter(([keyId, h]) => {
+          if (h.status !== "invalid" && h.status !== "warning") return false;
+          // extra_N entries: only flag if the index is still within bounds
+          if (keyId.startsWith("extra_")) {
+            const idx = Number.parseInt(keyId.slice(6), 10);
+            if (Number.isNaN(idx) || idx >= extraKeyCount) return false;
+          }
+          return true;
+        });
+
+        if (unhealthyKeys.length > 0) {
+          for (const [, h] of unhealthyKeys) {
+            if (h.status === "warning") hasWarning = true;
+            break;
+          }
+          for (const [keyId] of unhealthyKeys) {
+            newUnhealthyKeys.add(`${conn.id}:${keyId}`);
+          }
+          firstUnhealthyProviderId ??= conn.provider;
+          unhealthyConnections.push(conn.name || conn.id);
+          unhealthyProviderIds.add(conn.provider);
+        }
+      }
+
+      // Only notify for newly unhealthy keys (not already notified)
+      const hasNewUnhealthy = Array.from(newUnhealthyKeys).some(
+        (k) => !notifiedUnhealthyKeys.current.has(k)
+      );
+      if (hasNewUnhealthy) {
+        const navigateTo =
+          newUnhealthyKeys.size === 1 && firstUnhealthyProviderId
+            ? `/dashboard/providers/${firstUnhealthyProviderId}`
+            : `/dashboard/providers?search=${encodeURIComponent(Array.from(unhealthyProviderIds).join(" "))}`;
+
+        const notificationType = hasWarning ? "warning" : "error";
+
+        useNotificationStore.getState().addNotification({
+          type: notificationType,
+          message: tp(hasWarning ? "apiKeyWarningAlert" : "apiKeyInvalidAlert", {
+            count: newUnhealthyKeys.size,
+            connections: unhealthyConnections.join(", "),
+          }),
+          title: tp(hasWarning ? "apiKeyWarningAlertTitle" : "apiKeyInvalidAlertTitle"),
+          duration: 10000,
+          onClick: () => router.push(navigateTo),
+        });
+        // Mark all current unhealthy keys as notified
+        newUnhealthyKeys.forEach((k) => notifiedUnhealthyKeys.current.add(k));
+      }
+    };
+
+    if (providerConnections.length > 0) {
+      checkApiKeyHealth();
+    }
+  }, [providerConnections, t, tp, router]);
 
   const providerStats = useMemo(() => {
     return Object.entries(AI_PROVIDERS).map(([providerId, providerInfo]) => {
       const connections = providerConnections.filter((conn) => conn.provider === providerId);
-      const connected = connections.filter(
-        (conn) =>
-          conn.isActive !== false &&
-          (conn.testStatus === "active" ||
-            conn.testStatus === "success" ||
-            conn.testStatus === "unknown")
+      const connected = connections.filter((connection) =>
+        isProviderConnectionConnected(connection)
       ).length;
-      const errors = connections.filter(
-        (conn) =>
-          conn.isActive !== false &&
-          (conn.testStatus === "error" ||
-            conn.testStatus === "expired" ||
-            conn.testStatus === "unavailable")
+      const errors = connections.filter((connection) =>
+        isProviderConnectionErrored(connection)
       ).length;
 
       const providerKeys = new Set([providerId, providerInfo.alias].filter(Boolean));
       const providerModels = models.filter((m) => providerKeys.has(m.provider));
 
-      const authType = FREE_PROVIDERS[providerId]
-        ? "free"
+      const authType = NOAUTH_PROVIDERS[providerId]
+        ? "no-auth"
         : OAUTH_PROVIDERS[providerId]
           ? "oauth"
           : "apikey";
@@ -179,20 +464,65 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
     return models.filter((m) => providerKeys.has(m.provider));
   }, [selectedProvider, models]);
 
-  const quickStartLinks = [
-    { label: t("documentation"), href: "/docs", icon: "menu_book" },
-    { label: ts("providers"), href: "/dashboard/providers", icon: "dns" },
-    { label: ts("combos"), href: "/dashboard/combos", icon: "layers" },
-    { label: ts("analytics"), href: "/dashboard/analytics", icon: "analytics" },
-    { label: t("healthMonitor"), href: "/dashboard/health", icon: "health_and_safety" },
-    { label: ts("cliTools"), href: "/dashboard/cli-tools", icon: "terminal" },
-    {
-      label: t("reportIssue"),
-      href: "https://github.com/diegosouzapw/OmniRoute/issues",
-      external: true,
-      icon: "bug_report",
-    },
-  ];
+  const topologyProviders = useMemo(() => {
+    type ProviderHealth = "active" | "error" | "idle";
+    const byProvider = new Map<
+      string,
+      { id: string; provider: string; name?: string; status: ProviderHealth }
+    >();
+    const providerConfig = AI_PROVIDERS as Record<string, { name?: string }>;
+
+    // Connection-health per provider, so the topology node reflects "what is connected"
+    // at rest (green healthy / red error) instead of going blank between requests. A
+    // provider with ≥1 healthy connection is "active"; if none are healthy but some are
+    // errored it is "error"; otherwise "idle". Live/recent traffic still overrides this.
+    const healthByProvider = new Map<string, ProviderHealth>();
+    for (const stat of providerStats) {
+      const canonical = normalizeProviderId(stat.id);
+      if (!canonical) continue;
+      healthByProvider.set(
+        canonical,
+        stat.connected > 0 ? "active" : stat.errors > 0 ? "error" : "idle"
+      );
+    }
+
+    const addProvider = (providerId?: string | null, name?: string) => {
+      const rawProviderId = typeof providerId === "string" ? providerId.trim() : "";
+      if (!rawProviderId) return;
+
+      const canonicalProviderId = normalizeProviderId(rawProviderId);
+      if (!canonicalProviderId || byProvider.has(canonicalProviderId)) return;
+
+      // Exclude providers with no active connections (or where all connections are deactivated)
+      const hasActiveConn = providerConnections.some(
+        (c) => normalizeProviderId(c.provider) === canonicalProviderId && c.isActive !== false
+      );
+      if (!hasActiveConn) return;
+
+      const resolvedName =
+        getProviderDisplayLabel(rawProviderId, providerNodes) ||
+        name ||
+        providerConfig[canonicalProviderId]?.name ||
+        rawProviderId;
+
+      byProvider.set(canonicalProviderId, {
+        id: canonicalProviderId,
+        provider: canonicalProviderId,
+        name: resolvedName,
+        status: healthByProvider.get(canonicalProviderId) ?? "idle",
+      });
+    };
+
+    providerStats
+      .filter((provider) => provider.total > 0)
+      .forEach((provider) => addProvider(provider.id, provider.provider.name));
+    providerConnections.forEach((conn) => addProvider(conn.provider));
+    Object.keys(providerMetrics).forEach((provider) => addProvider(provider));
+
+    return Array.from(byProvider.values());
+  }, [providerStats, providerMetrics, providerNodes, providerConnections]);
+
+  const { lastProvider, errorProvider } = providerTopology;
 
   const pollBackgroundUpdate = useCallback(
     async ({
@@ -211,29 +541,29 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
               {
                 step: "install",
                 status: "done",
-                message: message || `Queued update to v${targetVersion}.`,
+                message: message || t("updateQueued", { version: targetVersion }),
               },
               {
                 step: "rebuild",
                 status: "running",
-                message: "Docker image is rebuilding in the background.",
+                message: t("updateDockerRebuilding"),
               },
               {
                 step: "restart",
                 status: "pending",
-                message: "Waiting for OmniRoute to restart with the new version.",
+                message: t("updateWaitingRestart"),
               },
             ]
           : [
               {
                 step: "install",
                 status: "running",
-                message: message || `Installing v${targetVersion}.`,
+                message: message || t("updateInstalling", { version: targetVersion }),
               },
               {
                 step: "restart",
                 status: "pending",
-                message: "Waiting for OmniRoute to restart with the new version.",
+                message: t("updateWaitingRestart"),
               },
             ];
 
@@ -265,14 +595,14 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
               next = mergeUpdateStep(next, {
                 step: "complete",
                 status: "done",
-                message: `OmniRoute is now running v${targetVersion}.`,
+                message: t("updateRunning", { version: targetVersion }),
               });
 
               return next;
             });
             setUpdating(false);
             setUpdatePhase("done");
-            notify.success(`OmniRoute updated to v${targetVersion}.`);
+            notify.success(t("updateCompleted", { version: targetVersion }));
             await fetchData();
             return;
           }
@@ -283,20 +613,20 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
               next = mergeUpdateStep(next, {
                 step: "rebuild",
                 status: "running",
-                message: `Docker image is still rebuilding for v${targetVersion}.`,
+                message: t("updateDockerStillRebuilding", { version: targetVersion }),
               });
             } else {
               next = mergeUpdateStep(next, {
                 step: "install",
                 status: "running",
-                message: `Installing v${targetVersion} in the background.`,
+                message: t("updateInstallingBackground", { version: targetVersion }),
               });
             }
 
             next = mergeUpdateStep(next, {
               step: "restart",
               status: "pending",
-              message: `Waiting for OmniRoute to come back on v${targetVersion}.`,
+              message: t("updateWaitingVersion", { version: targetVersion }),
             });
 
             return next;
@@ -308,20 +638,20 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
               next = mergeUpdateStep(next, {
                 step: "rebuild",
                 status: "running",
-                message: "Docker rebuild is still in progress.",
+                message: t("updateDockerStillInProgress"),
               });
             } else {
               next = mergeUpdateStep(next, {
                 step: "install",
                 status: "running",
-                message: `Installing v${targetVersion} in the background.`,
+                message: t("updateInstallingBackground", { version: targetVersion }),
               });
             }
 
             next = mergeUpdateStep(next, {
               step: "restart",
               status: "running",
-              message: "Service restart in progress. Waiting for OmniRoute to come back online...",
+              message: t("updateRestarting"),
             });
 
             return next;
@@ -333,14 +663,14 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
         mergeUpdateStep(prev, {
           step: "error",
           status: "failed",
-          message: `Update started, but v${targetVersion} did not become available before timeout. Refresh the page or check server logs.`,
+          message: t("updateTimeout", { version: targetVersion }),
         })
       );
       setUpdating(false);
       setUpdatePhase("failed");
-      notify.error(`Update to v${targetVersion} timed out.`);
+      notify.error(t("updateTimedOut", { version: targetVersion }));
     },
-    [fetchData]
+    [fetchData, t]
   );
 
   const handleUpdate = async () => {
@@ -357,12 +687,16 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
       if (contentType.includes("application/json")) {
         const data = await res.json();
         if (!res.ok || !data.success) {
-          notify.error(data.error || "Failed to start update.");
+          // #5991: the error envelope is `{ error: { code, message, correlation_id } }`.
+          // Passing the raw object to notify.error() rendered it as a React child →
+          // "Minified React error #31" crash ("Internal Server Error" screen), e.g. on
+          // the 403 from the loopback-only /api/system/version. Extract the string.
+          notify.error(extractApiErrorMessage(data, t("updateStartFailed")));
           setUpdating(false);
           setUpdatePhase("idle");
           return;
         }
-        notify.success(data.message || "Update started.");
+        notify.success(data.message || t("updateStarted"));
         await pollBackgroundUpdate({
           channel: data.channel || "docker-compose",
           message: data.message || "",
@@ -373,7 +707,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
 
       // SSE stream — read progress events
       if (!res.body) {
-        notify.error("No response stream received.");
+        notify.error(t("noResponseStream"));
         setUpdating(false);
         setUpdatePhase("idle");
         return;
@@ -403,10 +737,10 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
             if (event.step === "complete") {
               setUpdatePhase("done");
               setUpdating(false);
-              notify.success(event.message || "Update complete!");
+              notify.success(event.message || t("updateComplete"));
             } else if (event.step === "error") {
               setUpdatePhase("failed");
-              notify.error(event.message || "Update failed.");
+              notify.error(event.message || t("updateFailed"));
               setUpdating(false);
             }
           } catch {
@@ -421,7 +755,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
         {
           step: "error",
           status: "failed",
-          message: "Network error — connection lost during update.",
+          message: t("updateNetworkError"),
         },
       ]);
       setUpdating(false);
@@ -432,25 +766,16 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
   useEffect(() => {
     if (updatePhase !== "done") return;
     const timer = setTimeout(() => {
-      window.location.reload();
+      globalThis.window.location.reload();
     }, 8000);
     return () => clearTimeout(timer);
   }, [updatePhase]);
-
-  const stepIcons: Record<string, string> = {
-    install: "download",
-    rebuild: "build",
-    restart: "restart_alt",
-    complete: "check_circle",
-    error: "error",
-  };
-
   const stepLabels: Record<string, string> = {
-    install: "Install Package",
-    rebuild: "Rebuild Native Modules",
-    restart: "Restart Service",
-    complete: "Complete",
-    error: "Error",
+    install: t("stepInstallPackage"),
+    rebuild: t("stepRebuildNativeModules"),
+    restart: t("stepRestartService"),
+    complete: t("stepComplete"),
+    error: t("stepError"),
   };
   const showUpdateOverlay = updatePhase !== "idle";
 
@@ -478,17 +803,17 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
               <div>
                 <h3 className="text-lg font-bold">
                   {updatePhase === "done"
-                    ? "Update Complete!"
+                    ? t("updateCompleteTitle")
                     : updatePhase === "failed"
-                      ? "Update Failed"
-                      : "Updating OmniRoute..."}
+                      ? t("updateFailedTitle")
+                      : t("updatingTitle")}
                 </h3>
                 <p className="text-xs text-text-muted mt-0.5">
                   {updatePhase === "done"
-                    ? "The page will reload automatically in a few seconds."
+                    ? t("reloadNotice")
                     : updatePhase === "failed"
-                      ? "Please try again or update manually via the CLI."
-                      : "Do not close this page. The system will restart automatically."}
+                      ? t("retryNotice")
+                      : t("restartNotice")}
                 </p>
               </div>
             </div>
@@ -523,7 +848,7 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
                         error
                       </span>
                     ) : (
-                      <span className="material-symbols-outlined text-yellow-500 text-[18px]">
+                      <span className="material-symbols-outlined text-amber-500 text-[18px]">
                         warning
                       </span>
                     )}
@@ -548,9 +873,9 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
                 <div className="mt-1 px-3 py-2.5 rounded-lg border border-green-500/30 bg-green-500/5">
                   <p className="text-sm font-semibold text-green-500 flex items-center gap-2">
                     <span className="material-symbols-outlined text-[18px]">check_circle</span>
-                    {updateSteps.find((s) => s.step === "complete")?.message || "Update complete!"}
+                    {updateSteps.find((s) => s.step === "complete")?.message || t("updateComplete")}
                   </p>
-                  <p className="text-xs text-text-muted mt-1">Reloading page automatically...</p>
+                  <p className="text-xs text-text-muted mt-1">{t("reloadingPageAutomatically")}</p>
                 </div>
               )}
             </div>
@@ -565,14 +890,14 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
                     setUpdating(false);
                     setUpdatePhase("idle");
                     setUpdateSteps([]);
-                    if (updatePhase === "done") window.location.reload();
+                    if (updatePhase === "done") globalThis.window.location.reload();
                   }}
                 >
-                  {updatePhase === "done" ? "Reload Now" : "Close"}
+                  {updatePhase === "done" ? t("reloadNow") : t("closeUpdate")}
                 </Button>
                 {updatePhase === "failed" && (
                   <Button size="sm" variant="secondary" fullWidth onClick={handleUpdate}>
-                    Retry
+                    {t("retryUpdate")}
                   </Button>
                 )}
               </div>
@@ -584,215 +909,245 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
       {/* Update Notification Banner */}
       {versionInfo?.updateAvailable && !showUpdateOverlay && (
         <div className="flex flex-col gap-3">
-          <div className="flex min-h-[64px] items-center justify-between rounded-lg border border-primary/20 bg-primary/10 px-5 py-4 text-primary">
-            <div className="flex min-w-0 items-center gap-4">
-              <span className="material-symbols-outlined shrink-0 text-[24px]">
-                system_update_alt
-              </span>
-              <div>
-                <p className="font-semibold text-sm">Update Available: v{versionInfo.latest}</p>
-                <p className="text-xs opacity-80 mt-0.5">
-                  {versionInfo.autoUpdateSupported
-                    ? t("updateAvailableDesc") ||
-                      `You are currently using v${versionInfo.current}. Update to access the latest features and bug fixes.`
-                    : versionInfo.autoUpdateError ||
-                      "Manual update required for this installation type."}
-                </p>
-              </div>
-            </div>
-            <Button
-              size="sm"
-              onClick={versionInfo.autoUpdateSupported ? handleUpdate : undefined}
-              disabled={updating || !versionInfo.autoUpdateSupported}
-              className="ml-4 shrink-0 font-semibold"
-              title={versionInfo.autoUpdateError || ""}
-            >
-              {versionInfo.autoUpdateSupported ? t("updateNow") || "Update Now" : "Manual Update"}
-            </Button>
-          </div>
-
-          {/* News Notification Banner */}
-          {versionInfo?.news && (
-            <div className="flex min-h-[64px] items-center justify-between rounded-lg border border-border bg-surface px-5 py-4">
+          <div className="flex flex-col gap-3 rounded-lg border border-primary/20 bg-primary/10 px-5 py-4 text-primary">
+            <div className="flex min-h-[48px] items-center justify-between">
               <div className="flex min-w-0 items-center gap-4">
-                <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-bg text-text-muted">
-                  <span className="material-symbols-outlined text-[22px] text-primary">
-                    {versionInfo.news.icon || "campaign"}
-                  </span>
-                </div>
-                <div className="min-w-0">
-                  <p className="text-sm font-semibold text-text-main">{versionInfo.news.title}</p>
-                  <p className="mt-0.5 max-w-[560px] text-xs leading-relaxed text-text-muted">
-                    {versionInfo.news.message}
+                <span className="material-symbols-outlined shrink-0 text-[24px]">
+                  {isElectron && electronUpdateStatus.status === "downloading"
+                    ? "downloading"
+                    : "system_update_alt"}
+                </span>
+                <div>
+                  <p className="font-semibold text-sm">
+                    {t("updateAvailableTitle", {
+                      version: versionInfo.latest,
+                      desktop: isElectron ? ` ${t("desktopAppLabel")}` : "",
+                    })}
+                  </p>
+                  <p className="text-xs opacity-80 mt-0.5">
+                    {isElectron ? (
+                      <>
+                        {electronUpdateStatus.status === "checking" && t("checkingForUpdates")}
+                        {electronUpdateStatus.status === "available" &&
+                          t("versionAvailableForDownload", { version: versionInfo.latest })}
+                        {electronUpdateStatus.status === "downloading" &&
+                          t("downloadingUpdate", { percent: electronUpdateStatus.percent || 0 })}
+                        {electronUpdateStatus.status === "downloaded" && t("updateDownloaded")}
+                        {electronUpdateStatus.status === "error" &&
+                          t("autoUpdateFailed", {
+                            reason: electronUpdateStatus.message || t("unknownUpdateError"),
+                          })}
+                        {(electronUpdateStatus.status === "idle" ||
+                          electronUpdateStatus.status === "not-available") &&
+                          t("versionAvailableDesktop", { version: versionInfo.latest })}
+                      </>
+                    ) : versionInfo.autoUpdateSupported ? (
+                      t("updateAvailableDesc")
+                    ) : (
+                      versionInfo.autoUpdateError || t("manualUpdateRequired")
+                    )}
                   </p>
                 </div>
               </div>
 
-              {versionInfo.news.link && (
-                <a
-                  href={versionInfo.news.link}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="ml-4 inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-border bg-bg px-4 py-2 text-xs font-semibold text-text-main transition-colors hover:border-primary/30 hover:text-primary"
+              {isElectron ? (
+                <div className="flex gap-2 shrink-0 ml-4">
+                  {electronUpdateStatus.status === "available" && (
+                    <Button
+                      size="sm"
+                      onClick={() => globalThis.window.electronAPI?.downloadUpdate()}
+                      className="font-semibold"
+                    >
+                      {t("downloadUpdate")}
+                    </Button>
+                  )}
+                  {electronUpdateStatus.status === "downloading" && (
+                    <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-primary/20">
+                      <span className="material-symbols-outlined text-primary text-[16px] animate-spin">
+                        progress_activity
+                      </span>
+                      <span className="text-xs font-semibold">
+                        {electronUpdateStatus.percent || 0}%
+                      </span>
+                    </div>
+                  )}
+                  {electronUpdateStatus.status === "downloaded" && (
+                    <Button
+                      size="sm"
+                      onClick={() => globalThis.window.electronAPI?.installUpdate()}
+                      className="font-semibold animate-pulse"
+                    >
+                      {t("restartAndInstall")}
+                    </Button>
+                  )}
+                  {(electronUpdateStatus.status === "error" ||
+                    electronUpdateStatus.status === "idle" ||
+                    electronUpdateStatus.status === "not-available") && (
+                    <Button
+                      size="sm"
+                      onClick={() => {
+                        setElectronUpdateStatus({ status: "checking" });
+                        globalThis.window.electronAPI?.checkForUpdates().catch((err: any) => {
+                          setElectronUpdateStatus({ status: "error", message: err.message });
+                        });
+                      }}
+                      className="font-semibold"
+                    >
+                      {t("checkForUpdate")}
+                    </Button>
+                  )}
+                </div>
+              ) : (
+                <Button
+                  size="sm"
+                  onClick={versionInfo.autoUpdateSupported ? handleUpdate : undefined}
+                  disabled={updating || !versionInfo.autoUpdateSupported}
+                  className="ml-4 shrink-0 font-semibold"
+                  title={versionInfo.autoUpdateError || ""}
                 >
-                  {versionInfo.news.linkLabel || "Ler Mais"}
-                  <span className="material-symbols-outlined text-[14px]">arrow_forward</span>
-                </a>
+                  {versionInfo.autoUpdateSupported ? t("updateNow") : t("manualUpdate")}
+                </Button>
               )}
             </div>
-          )}
+
+            {/* Direct download fallback links shown if in Electron and auto-updater has failed, is idle, or has completed check */}
+            {isElectron &&
+              (electronUpdateStatus.status === "error" ||
+                electronUpdateStatus.status === "idle" ||
+                electronUpdateStatus.status === "available" ||
+                electronUpdateStatus.status === "not-available") && (
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between border-t border-primary/20 mt-2 pt-3 gap-2">
+                  <p className="text-xs opacity-75">{t("directDownloadHint")}</p>
+                  <div className="flex gap-2">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() =>
+                        openExternal(
+                          `https://github.com/diegosouzapw/OmniRoute/releases/tag/v${versionInfo.latest}`
+                        )
+                      }
+                      className="font-semibold text-xs py-1"
+                    >
+                      {t("releaseNotes")}
+                    </Button>
+                    <Button
+                      size="sm"
+                      onClick={() => openExternal(electronDownload.url)}
+                      className="font-semibold text-xs py-1"
+                    >
+                      {electronDownload.label}
+                    </Button>
+                  </div>
+                </div>
+              )}
+          </div>
         </div>
       )}
 
-      {/* Quick Start */}
-      <Card>
-        <div className="flex flex-col gap-5">
-          <div className="flex items-center justify-between">
-            <div>
-              <h2 className="text-lg font-semibold">{t("quickStart")}</h2>
-              <p className="text-sm text-text-muted">{t("quickStartDesc")}</p>
+      {/* Quick Start (controlled by Appearance setting, default on) */}
+      {showQuickStartOnHome && (
+        <Card>
+          <div className="flex flex-col gap-5">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-semibold">{t("quickStart")}</h2>
+                <p className="text-sm text-text-muted">{t("quickStartDesc")}</p>
+              </div>
+              <Link href="/docs" prefetch={false} className={DOCS_LINK}>
+                <span className="material-symbols-outlined text-[14px]">menu_book</span>
+                {t("fullDocs")}
+              </Link>
             </div>
-            <Link
-              href="/docs"
-              className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-border text-text-muted hover:text-text-main hover:bg-bg-subtle transition-colors"
-            >
-              <span className="material-symbols-outlined text-[14px]">menu_book</span>
-              {t("fullDocs")}
-            </Link>
-          </div>
 
-          <ol className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
-            <li className="rounded-lg border border-border bg-bg-subtle p-4 flex gap-3">
-              <div className="flex items-center justify-center size-8 rounded-lg bg-primary/10 text-primary shrink-0">
-                <span className="material-symbols-outlined text-[18px]">key</span>
-              </div>
-              <div>
-                <span className="font-semibold">{t("step1Title")}</span>
-                <p className="text-text-muted mt-0.5">
-                  {t.rich("step1Desc", {
-                    endpoint: (chunks) => (
-                      <Link href="/dashboard/endpoint" className="text-primary hover:underline">
-                        {chunks}
-                      </Link>
-                    ),
-                  })}
-                </p>
-              </div>
-            </li>
-            <li className="rounded-lg border border-border bg-bg-subtle p-4 flex gap-3">
-              <div className="flex items-center justify-center size-8 rounded-lg bg-green-500/10 text-green-500 shrink-0">
-                <span className="material-symbols-outlined text-[18px]">dns</span>
-              </div>
-              <div>
-                <span className="font-semibold">{t("step2Title")}</span>
-                <p className="text-text-muted mt-0.5">
-                  {t.rich("step2Desc", {
-                    providers: (chunks) => (
-                      <Link href="/dashboard/providers" className="text-primary hover:underline">
-                        {chunks}
-                      </Link>
-                    ),
-                  })}
-                </p>
-              </div>
-            </li>
-            <li className="rounded-lg border border-border bg-bg-subtle p-4 flex gap-3">
-              <div className="flex items-center justify-center size-8 rounded-lg bg-blue-500/10 text-blue-500 shrink-0">
-                <span className="material-symbols-outlined text-[18px]">link</span>
-              </div>
-              <div>
-                <span className="font-semibold">{t("step3Title")}</span>
-                <p className="text-text-muted mt-0.5">{t("step3Desc", { url: currentEndpoint })}</p>
-              </div>
-            </li>
-            <li className="rounded-lg border border-border bg-bg-subtle p-4 flex gap-3">
-              <div className="flex items-center justify-center size-8 rounded-lg bg-amber-500/10 text-amber-500 shrink-0">
-                <span className="material-symbols-outlined text-[18px]">analytics</span>
-              </div>
-              <div>
-                <span className="font-semibold">{t("step4Title")}</span>
-                <p className="text-text-muted mt-0.5">
-                  {t.rich("step4Desc", {
-                    logs: (chunks) => (
-                      <Link href="/dashboard/logs" className="text-primary hover:underline">
-                        {chunks}
-                      </Link>
-                    ),
-                    analytics: (chunks) => (
-                      <Link href="/dashboard/analytics" className="text-primary hover:underline">
-                        {chunks}
-                      </Link>
-                    ),
-                  })}
-                </p>
-              </div>
-            </li>
-          </ol>
-
-          <div className="flex flex-wrap gap-2">
-            {quickStartLinks.map((link) => (
-              <a
-                key={link.href}
-                href={link.href}
-                target={link.external ? "_blank" : undefined}
-                rel={link.external ? "noopener noreferrer" : undefined}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-border text-text-muted hover:text-text-main hover:bg-bg-subtle transition-colors"
-              >
-                <span className="material-symbols-outlined text-[14px]">
-                  {link.icon || (link.external ? "open_in_new" : "arrow_forward")}
-                </span>
-                {link.label}
-              </a>
-            ))}
+            <ol className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+              <li className="rounded-lg border border-border bg-bg-subtle p-4 flex gap-3">
+                <div className="flex items-center justify-center size-8 rounded-lg bg-primary/10 text-primary shrink-0">
+                  <span className="material-symbols-outlined text-[18px]">key</span>
+                </div>
+                <div>
+                  <span className="font-semibold">{t("step1Title")}</span>
+                  <p className="text-text-muted mt-0.5">
+                    {t.rich("step1Desc", {
+                      endpoint: (chunks) => (
+                        <Link
+                          href="/dashboard/api-manager"
+                          prefetch={false}
+                          className={INLINE_LINK}
+                        >
+                          {chunks}
+                        </Link>
+                      ),
+                    })}
+                  </p>
+                </div>
+              </li>
+              <li className="rounded-lg border border-border bg-bg-subtle p-4 flex gap-3">
+                <div className="flex items-center justify-center size-8 rounded-lg bg-green-500/10 text-green-500 shrink-0">
+                  <span className="material-symbols-outlined text-[18px]">dns</span>
+                </div>
+                <div>
+                  <span className="font-semibold">{t("step2Title")}</span>
+                  <p className="text-text-muted mt-0.5">
+                    {t.rich("step2Desc", {
+                      providers: (chunks) => (
+                        <Link href="/dashboard/providers" prefetch={false} className={INLINE_LINK}>
+                          {chunks}
+                        </Link>
+                      ),
+                    })}
+                  </p>
+                </div>
+              </li>
+              <li className="rounded-lg border border-border bg-bg-subtle p-4 flex gap-3">
+                <div className="flex items-center justify-center size-8 rounded-lg bg-blue-500/10 text-blue-500 shrink-0">
+                  <span className="material-symbols-outlined text-[18px]">link</span>
+                </div>
+                <div>
+                  <span className="font-semibold">{t("step3Title")}</span>
+                  <p className="text-text-muted mt-0.5">
+                    {t("step3Desc", { url: currentEndpoint })}
+                  </p>
+                </div>
+              </li>
+              <li className="rounded-lg border border-border bg-bg-subtle p-4 flex gap-3">
+                <div className="flex items-center justify-center size-8 rounded-lg bg-amber-500/10 text-amber-500 shrink-0">
+                  <span className="material-symbols-outlined text-[18px]">analytics</span>
+                </div>
+                <div>
+                  <span className="font-semibold">{t("step4Title")}</span>
+                  <p className="text-text-muted mt-0.5">
+                    {t.rich("step4Desc", {
+                      logs: (chunks) => (
+                        <Link href="/dashboard/logs" prefetch={false} className={INLINE_LINK}>
+                          {chunks}
+                        </Link>
+                      ),
+                      analytics: (chunks) => (
+                        <Link href="/dashboard/analytics" prefetch={false} className={INLINE_LINK}>
+                          {chunks}
+                        </Link>
+                      ),
+                    })}
+                  </p>
+                </div>
+              </li>
+            </ol>
           </div>
+        </Card>
+      )}
+
+      {showProviderTopologyOnHome && (
+        <div className="grid grid-cols-1 lg:grid-cols-[2fr_1fr] gap-3">
+          <HomeProviderTopologySection
+            providers={topologyProviders}
+            lastProvider={lastProvider}
+            errorProvider={errorProvider}
+            enabled={showProviderTopologyOnHome}
+          />
+          <HomeRecentRequests enabled={showProviderTopologyOnHome} />
         </div>
-      </Card>
-
-      {/* Providers Overview */}
-      <Card>
-        <div className="flex items-center justify-between mb-4">
-          <div>
-            <h2 className="text-lg font-semibold">{t("providersOverview")}</h2>
-            <p className="text-sm text-text-muted">
-              {t("configuredOf", {
-                configured: providerStats.filter((item) => item.total > 0).length,
-                total: providerStats.length,
-              })}
-            </p>
-          </div>
-          <div className="flex items-center gap-4">
-            <div className="hidden sm:flex items-center gap-3 text-[11px] text-text-muted">
-              <span className="flex items-center gap-1">
-                <span className="size-2 rounded-full bg-green-500" /> {tc("free")}
-              </span>
-              <span className="flex items-center gap-1">
-                <span className="size-2 rounded-full bg-blue-500" /> {t("oauthLabel")}
-              </span>
-              <span className="flex items-center gap-1">
-                <span className="size-2 rounded-full bg-amber-500" /> {t("apiKeyLabel")}
-              </span>
-            </div>
-            <Link
-              href="/dashboard/providers"
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-border text-text-muted hover:text-text-main hover:bg-bg-subtle transition-colors"
-            >
-              <span className="material-symbols-outlined text-[14px]">settings</span>
-              {tc("manage")}
-            </Link>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-          {providerStats.map((item) => (
-            <ProviderOverviewCard
-              key={item.id}
-              item={item}
-              metrics={providerMetrics[item.provider.alias] || providerMetrics[item.id]}
-              onClick={() => setSelectedProvider(item)}
-            />
-          ))}
-        </div>
-      </Card>
+      )}
 
       {/* Provider Models Modal */}
       {selectedProvider && (
@@ -822,6 +1177,7 @@ function ProviderOverviewCard({
     item.errors > 0 ? "text-red-500" : item.connected > 0 ? "text-green-500" : "text-text-muted";
 
   const authTypeConfig = {
+    "no-auth": { color: "bg-stone-500", label: t("noAuthLabel") },
     free: { color: "bg-green-500", label: tc("free") },
     oauth: { color: "bg-blue-500", label: t("oauthLabel") },
     apikey: { color: "bg-amber-500", label: t("apiKeyLabel") },

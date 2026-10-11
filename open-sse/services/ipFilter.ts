@@ -5,30 +5,97 @@
  */
 
 import { isIP } from "node:net";
+import { getDbInstance } from "../../src/lib/db/core.ts";
 
 // In-memory IP lists
 let _config = {
   enabled: false,
-  mode: "blacklist", // "blacklist" | "whitelist" | "whitelist-priority"
+  mode: "blacklist",
   blacklist: new Set(),
   whitelist: new Set(),
-  tempBans: new Map(), // IP → { until: timestamp, reason: string }
+  tempBans: new Map(),
 };
+
+// Persistence (#6131): the config used to live in memory only, so every restart
+// (i.e. every OmniRoute update) reset it to Disabled + empty lists. It is now
+// persisted to the key_value table (namespace 'ipFilter', key 'config') and
+// lazily loaded on first access. better-sqlite3 is synchronous, so both the load
+// and the save stay in the sync hot path without extra startup wiring. tempBans
+// are intentionally NOT persisted — they are ephemeral, TTL-swept runtime state.
+//
+// D2 (#9033): the _loaded one-shot gate was removed so a config persisted by the
+// dashboard settings route (a separate module instance, since @omniroute/open-sse
+// is bundled per-entry via transpilePackages) propagates to the proxy runtime
+// without a restart. A DB failure still degrades to the in-memory defaults, and
+// tempBans remain in-memory-only as before.
+const IP_FILTER_NAMESPACE = "ipFilter";
+const IP_FILTER_KEY = "config";
+
+function ensureLoaded() {
+  try {
+    const row = getDbInstance()
+      .prepare("SELECT value FROM key_value WHERE namespace = ? AND key = ?")
+      .get(IP_FILTER_NAMESPACE, IP_FILTER_KEY) as { value?: string } | undefined;
+    if (!row?.value) return;
+    const parsed = JSON.parse(row.value) as {
+      enabled?: boolean;
+      mode?: string;
+      blacklist?: string[];
+      whitelist?: string[];
+    };
+    _config.enabled = parsed.enabled === true;
+    if (typeof parsed.mode === "string") _config.mode = parsed.mode;
+    _config.blacklist = new Set(Array.isArray(parsed.blacklist) ? parsed.blacklist : []);
+    _config.whitelist = new Set(Array.isArray(parsed.whitelist) ? parsed.whitelist : []);
+  } catch {
+    // No DB / table yet — keep the in-memory defaults.
+  }
+}
+
+function persist() {
+  try {
+    const payload = JSON.stringify({
+      enabled: _config.enabled,
+      mode: _config.mode,
+      blacklist: Array.from(_config.blacklist),
+      whitelist: Array.from(_config.whitelist),
+    });
+    getDbInstance()
+      .prepare("INSERT OR REPLACE INTO key_value (namespace, key, value) VALUES (?, ?, ?)")
+      .run(IP_FILTER_NAMESPACE, IP_FILTER_KEY, payload);
+  } catch {
+    // Best-effort persistence: never let a DB write failure break the request path.
+  }
+}
+
+const _tempBanSweep = setInterval(() => {
+  const now = Date.now();
+  const bans = _config.tempBans as Map<string, { until: number; reason: string }>;
+  for (const [ip, entry] of bans) {
+    if (now >= entry.until) bans.delete(ip);
+  }
+}, 60_000);
+if (typeof _tempBanSweep === "object" && "unref" in _tempBanSweep) {
+  (_tempBanSweep as { unref?: () => void }).unref?.();
+}
 
 /**
  * Configure the IP filter
  */
 export function configureIPFilter(config) {
+  ensureLoaded();
   if (config.enabled !== undefined) _config.enabled = config.enabled;
   if (config.mode) _config.mode = config.mode;
   if (config.blacklist) _config.blacklist = new Set(config.blacklist);
   if (config.whitelist) _config.whitelist = new Set(config.whitelist);
+  persist();
 }
 
 /**
  * Get current IP filter config (for API)
  */
 export function getIPFilterConfig() {
+  ensureLoaded();
   return {
     enabled: _config.enabled,
     mode: _config.mode,
@@ -49,6 +116,7 @@ export function getIPFilterConfig() {
  * @returns {{ allowed: boolean, reason?: string }}
  */
 export function checkIP(ip) {
+  ensureLoaded();
   if (!_config.enabled) return { allowed: true };
   if (!ip) return { allowed: true };
 
@@ -65,7 +133,13 @@ export function checkIP(ip) {
 
   switch (_config.mode) {
     case "whitelist":
-      // Only whitelisted IPs allowed
+      // Only whitelisted IPs allowed — but if the whitelist is empty the admin
+      // has just switched to this mode and has not added IPs yet.  Allow the
+      // request through so the admin can still reach the dashboard to populate
+      // the list.  Once at least one entry exists, enforcement kicks in.
+      if (_config.whitelist.size === 0) {
+        return { allowed: true };
+      }
       if (!matchesAny(normalizedIP, _config.whitelist)) {
         return { allowed: false, reason: "IP not in whitelist" };
       }
@@ -113,28 +187,36 @@ export function removeTempBan(ip) {
  * Add IP to blacklist
  */
 export function addToBlacklist(ip) {
+  ensureLoaded();
   _config.blacklist.add(normalizeIP(ip));
+  persist();
 }
 
 /**
  * Remove IP from blacklist
  */
 export function removeFromBlacklist(ip) {
+  ensureLoaded();
   _config.blacklist.delete(normalizeIP(ip));
+  persist();
 }
 
 /**
  * Add IP to whitelist
  */
 export function addToWhitelist(ip) {
+  ensureLoaded();
   _config.whitelist.add(normalizeIP(ip));
+  persist();
 }
 
 /**
  * Remove IP from whitelist
  */
 export function removeFromWhitelist(ip) {
+  ensureLoaded();
   _config.whitelist.delete(normalizeIP(ip));
+  persist();
 }
 
 /**
@@ -160,9 +242,17 @@ export function createIPFilterMiddleware() {
 
 /**
  * For Next.js App Router — check IP from request object
+ *
+ * D1 (#9033): accepts an optional trustedPeerIp (resolved from the authenticated
+ * peer stamp, available on direct connections where the proxy runtime has no
+ * socket). When provided, it is checked FIRST before falling through to the
+ * forwarding headers, so a blacklisted IP on a direct connection (no XFF, no
+ * socket) is blocked. When behind a reverse proxy (via-proxy marker set), the
+ * caller passes null so the XFF path continues to work.
  */
-export function checkRequestIP(request) {
+export function checkRequestIP(request, trustedPeerIp) {
   const ip =
+    pickFirstValidIp(trustedPeerIp || null) ||
     pickFirstValidIp(request.headers?.get?.("cf-connecting-ip")) ||
     pickFirstValidIp(request.headers?.get?.("x-forwarded-for")) ||
     pickFirstValidIp(request.headers?.get?.("x-real-ip")) ||

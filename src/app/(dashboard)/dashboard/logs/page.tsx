@@ -1,12 +1,10 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
-import { RequestLoggerV2, ProxyLogger, SegmentedControl } from "@/shared/components";
-import ConsoleLogViewer from "@/shared/components/ConsoleLogViewer";
-import ActiveRequestsPanel from "@/shared/components/ActiveRequestsPanel";
-import AuditLogTab from "./AuditLogTab";
+import { ConfirmModal, RequestLoggerV2 } from "@/shared/components";
 import { useTranslations } from "next-intl";
+import { buildLogExportUrl, readLogExportTruncation } from "@/shared/utils/logExport";
 
 const TIME_RANGES = [
   { label: "1h", hours: 1 },
@@ -15,29 +13,41 @@ const TIME_RANGES = [
   { label: "24h", hours: 24 },
 ];
 
-const TAB_TO_LOG_TYPE: Record<string, string> = {
-  "request-logs": "request-logs",
-  "proxy-logs": "proxy-logs",
-  "audit-logs": "call-logs",
-  console: "call-logs",
+type LogsTranslator = ((key: string, values?: Record<string, unknown>) => string) & {
+  has?: (key: string) => boolean;
 };
 
-export default function LogsPage() {
+function logsText(
+  t: LogsTranslator,
+  key: string,
+  fallback: string,
+  values?: Record<string, unknown>
+) {
+  if (typeof t.has !== "function" || !t.has(key)) return fallback;
+  return values ? t(key, values) : t(key);
+}
+
+function LogsPageContent() {
   const searchParams = useSearchParams();
-  const requestedTab = searchParams.get("tab");
-  const [activeTab, setActiveTab] = useState(
-    requestedTab && TAB_TO_LOG_TYPE[requestedTab] ? requestedTab : "request-logs"
-  );
+  // Read ONCE: #6830 fixed the detail modal reopening on first close by freezing this
+  // value, and the #8354 page rewrite regressed it by reading the live searchParams on
+  // every render — the prop flips mid-session and re-fires the child's deep-link effect
+  // exactly when the modal closes. Same freeze applies to ?correlationId=: a same-page
+  // navigation to a new correlation link needs a full remount (key change) to take
+  // effect — mirrored from initialId on purpose.
+  const [initialId] = useState(() => searchParams.get("id"));
+  const [initialCorrelationId] = useState(() => searchParams.get("correlationId"));
+
   const [showExport, setShowExport] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [exportStatus, setExportStatus] = useState<string | null>(null);
+  const [showCleanHistory, setShowCleanHistory] = useState(false);
+  const [cleaningHistory, setCleaningHistory] = useState(false);
+  const [cleanHistoryStatus, setCleanHistoryStatus] = useState<string | null>(null);
+  const [requestLogKey, setRequestLogKey] = useState(0);
   const dropdownRef = useRef<HTMLDivElement>(null);
-  const t = useTranslations("logs");
-
-  useEffect(() => {
-    if (requestedTab && TAB_TO_LOG_TYPE[requestedTab] && requestedTab !== activeTab) {
-      setActiveTab(requestedTab);
-    }
-  }, [activeTab, requestedTab]);
+  const requestLoggerRef = useRef<any>(null);
+  const t = useTranslations("logs") as LogsTranslator;
 
   useEffect(() => {
     function handleClickOutside(e: MouseEvent) {
@@ -52,10 +62,13 @@ export default function LogsPage() {
   async function handleExport(hours: number) {
     setExporting(true);
     setShowExport(false);
+    setExportStatus(null);
     try {
-      const logType = TAB_TO_LOG_TYPE[activeTab] || "call-logs";
-      const res = await fetch(`/api/logs/export?hours=${hours}&type=${logType}`);
+      const logType = "request-logs";
+      // #13999: ask for the server's maximum row cap instead of silently getting the 10k default.
+      const res = await fetch(buildLogExportUrl(hours, logType));
       if (!res.ok) throw new Error(t("exportFailed"));
+      const truncation = readLogExportTruncation(res.headers);
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -65,6 +78,11 @@ export default function LogsPage() {
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
+      if (truncation) {
+        const { exported, total } = truncation;
+        const fallback = `Export truncated: only ${exported} of ${total} log entries were included. Pick a shorter time range to export the rest.`;
+        setExportStatus(logsText(t, "exportTruncated", fallback, { exported, total }));
+      }
     } catch (err) {
       console.error(t("exportFailed"), err);
     } finally {
@@ -72,29 +90,63 @@ export default function LogsPage() {
     }
   }
 
+  async function handleCleanHistory() {
+    setCleaningHistory(true);
+    setShowCleanHistory(false);
+    setCleanHistoryStatus(null);
+    try {
+      const res = await fetch("/api/settings/purge-request-history", { method: "POST" });
+      const data = await res.json().catch(() => null);
+
+      if (!res.ok) {
+        throw new Error(
+          data?.error || logsText(t, "cleanHistoryFailed", "Failed to clean log history.")
+        );
+      }
+
+      const deleted = typeof data?.deleted === "number" ? data.deleted : 0;
+      const deletedArtifacts =
+        typeof data?.deletedArtifacts === "number" ? data.deletedArtifacts : 0;
+      const deletedDetailedLogs =
+        typeof data?.deletedDetailedLogs === "number" ? data.deletedDetailedLogs : 0;
+      const successFallback = `Cleaned ${deleted} log entr${deleted === 1 ? "y" : "ies"}, ${deletedArtifacts} artifact${
+        deletedArtifacts === 1 ? "" : "s"
+      }, and ${deletedDetailedLogs} legacy detail row${deletedDetailedLogs === 1 ? "" : "s"}.`;
+      setRequestLogKey((key) => key + 1);
+      setCleanHistoryStatus(
+        deleted || deletedArtifacts || deletedDetailedLogs
+          ? logsText(t, "cleanHistorySuccess", successFallback, {
+              deleted,
+              deletedArtifacts,
+              deletedDetailedLogs,
+            })
+          : logsText(t, "cleanHistoryEmpty", "No request log history was found.")
+      );
+    } catch (err) {
+      console.error(logsText(t, "cleanHistoryFailed", "Failed to clean log history."), err);
+      setCleanHistoryStatus(
+        err instanceof Error
+          ? err.message
+          : logsText(t, "cleanHistoryFailed", "Failed to clean log history.")
+      );
+    } finally {
+      setCleaningHistory(false);
+    }
+  }
+
   return (
     <div className="flex flex-col gap-6">
-      <div className="flex items-center justify-between gap-4 flex-wrap">
-        <SegmentedControl
-          options={[
-            { value: "request-logs", label: t("requestLogs") },
-            { value: "proxy-logs", label: t("proxyLogs") },
-            { value: "audit-logs", label: t("auditLog") },
-            { value: "console", label: t("console") },
-          ]}
-          value={activeTab}
-          onChange={setActiveTab}
-        />
+      <div className="flex-shrink-0 flex items-center justify-between gap-4 flex-wrap">
+        <h2 className="text-lg font-semibold text-text-main">{t("requestLogs")}</h2>
 
-        <div className="relative" ref={dropdownRef}>
+        <div className="flex items-center gap-2">
           <button
-            id="export-logs-btn"
-            onClick={() => setShowExport(!showExport)}
-            disabled={exporting}
+            id="clean-log-history-btn"
+            onClick={() => setShowCleanHistory(true)}
+            disabled={cleaningHistory}
             className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg
-              bg-[var(--card-bg,#1e1e2e)] border border-[var(--border,#333)]
-              text-[var(--text-secondary,#aaa)] hover:text-[var(--text-primary,#fff)]
-              hover:border-[var(--accent,#7c3aed)] transition-all duration-200
+              border border-red-500/30 bg-red-500/10 text-red-700 hover:bg-red-500/15
+              hover:border-red-500/50 dark:text-red-300 dark:hover:bg-red-500/20 transition-all duration-200
               disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <svg
@@ -106,53 +158,125 @@ export default function LogsPage() {
               strokeWidth="1.5"
             >
               <path
-                d="M8 2v8m0 0l-3-3m3 3l3-3M3 12h10"
+                d="M6 2h4m-5 2h6m-7 0h8m-1 0-.5 9a1 1 0 0 1-1 1h-3a1 1 0 0 1-1-1L5 4m2 3v4m2-4v4"
                 strokeLinecap="round"
                 strokeLinejoin="round"
               />
             </svg>
-            {exporting ? t("exporting") : t("export")}
+            {logsText(t, "cleanHistoryButton", "Clean history")}
           </button>
 
-          {showExport && (
-            <div
-              className="absolute right-0 top-full mt-1 z-50 min-w-[140px] rounded-lg
+          <div className="relative" ref={dropdownRef}>
+            <button
+              id="export-logs-btn"
+              onClick={() => setShowExport(!showExport)}
+              disabled={exporting}
+              className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg
                 bg-[var(--card-bg,#1e1e2e)] border border-[var(--border,#333)]
-                shadow-xl overflow-hidden animate-in fade-in"
+                text-[var(--text-secondary,#aaa)] hover:text-[var(--text-primary,#fff)]
+                hover:border-[var(--accent,#7c3aed)] transition-all duration-200
+                disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              <div className="px-3 py-2 text-xs text-[var(--text-muted,#666)] border-b border-[var(--border,#333)] font-medium">
-                {t("timeRange")}
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 16 16"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.5"
+              >
+                <path
+                  d="M8 2v8m0 0l-3-3m3 3l3-3M3 12h10"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+              {exporting ? t("exporting") : t("export")}
+            </button>
+
+            {showExport && (
+              <div
+                className="absolute right-0 top-full mt-1 z-50 min-w-[140px] rounded-lg
+                  bg-[var(--card-bg,#1e1e2e)] border border-[var(--border,#333)]
+                  shadow-xl overflow-hidden animate-in fade-in"
+              >
+                <div className="px-3 py-2 text-xs text-[var(--text-muted,#666)] border-b border-[var(--border,#333)] font-medium">
+                  {t("timeRange")}
+                </div>
+                {TIME_RANGES.map((range) => (
+                  <button
+                    key={range.hours}
+                    id={`export-${range.hours}h-btn`}
+                    onClick={() => handleExport(range.hours)}
+                    className="w-full px-3 py-2 text-sm text-left hover:bg-[var(--hover-bg,#2a2a3e)]
+                      text-[var(--text-secondary,#aaa)] hover:text-[var(--text-primary,#fff)]
+                      transition-colors flex items-center justify-between"
+                  >
+                    <span>{t("lastNHours", { hours: range.label })}</span>
+                    <span className="text-xs text-[var(--text-muted,#666)]">
+                      {range.hours === 24 ? t("defaultRange") : ""}
+                    </span>
+                  </button>
+                ))}
               </div>
-              {TIME_RANGES.map((range) => (
-                <button
-                  key={range.hours}
-                  id={`export-${range.hours}h-btn`}
-                  onClick={() => handleExport(range.hours)}
-                  className="w-full px-3 py-2 text-sm text-left hover:bg-[var(--hover-bg,#2a2a3e)]
-                    text-[var(--text-secondary,#aaa)] hover:text-[var(--text-primary,#fff)]
-                    transition-colors flex items-center justify-between"
-                >
-                  <span>{t("lastNHours", { hours: range.label })}</span>
-                  <span className="text-xs text-[var(--text-muted,#666)]">
-                    {range.hours === 24 ? t("defaultRange") : ""}
-                  </span>
-                </button>
-              ))}
-            </div>
-          )}
+            )}
+          </div>
         </div>
       </div>
 
-      {/* Content */}
-      {activeTab === "request-logs" && (
-        <div className="flex flex-col gap-6">
-          <ActiveRequestsPanel />
-          <RequestLoggerV2 />
+      {exportStatus && (
+        <div
+          id="export-logs-status"
+          role="status"
+          className="flex-shrink-0 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-300"
+        >
+          {exportStatus}
         </div>
       )}
-      {activeTab === "proxy-logs" && <ProxyLogger />}
-      {activeTab === "audit-logs" && <AuditLogTab />}
-      {activeTab === "console" && <ConsoleLogViewer />}
+
+      {cleanHistoryStatus && (
+        <div className="flex-shrink-0 rounded-lg border border-[var(--border,#333)] bg-[var(--card-bg,#1e1e2e)] px-4 py-3 text-sm text-[var(--text-secondary,#aaa)]">
+          {cleanHistoryStatus}
+        </div>
+      )}
+
+      <div className="min-h-0">
+        <RequestLoggerV2
+          key={requestLogKey}
+          ref={requestLoggerRef}
+          initialSelectedId={initialId}
+          initialCorrelationId={initialCorrelationId}
+        />
+      </div>
+
+      <ConfirmModal
+        isOpen={showCleanHistory}
+        onClose={() => setShowCleanHistory(false)}
+        onConfirm={handleCleanHistory}
+        title={logsText(t, "cleanHistoryTitle", "Clean log history?")}
+        message={logsText(
+          t,
+          "cleanHistoryMessage",
+          "This permanently clears all request log rows, legacy detail rows, and local artifact files under DATA_DIR/call_logs. The live page will refresh after cleanup."
+        )}
+        confirmText={logsText(t, "cleanHistoryConfirm", "Clean history")}
+        cancelText={logsText(t, "cleanHistoryCancel", "Cancel")}
+        loading={cleaningHistory}
+      />
     </div>
+  );
+}
+
+export default function LogsPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex items-center justify-center py-12 text-text-muted text-sm">
+          Loading logs...
+        </div>
+      }
+    >
+      <LogsPageContent />
+    </Suspense>
   );
 }

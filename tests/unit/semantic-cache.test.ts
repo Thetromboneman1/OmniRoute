@@ -1,8 +1,21 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { generateSignature, isCacheable } from "../../src/lib/semanticCache.ts";
+import {
+  generateSignature,
+  isCacheableForRead,
+  isCacheableForWrite,
+} from "../../src/lib/semanticCache.ts";
+
+const semanticCachePublicApi = await import("../../src/lib/semanticCache.ts");
 
 describe("Semantic Cache", () => {
+  it("public surface excludes unused maintenance timer helpers", () => {
+    assert.equal("startAutoCleanup" in semanticCachePublicApi, false);
+    assert.equal("stopAutoCleanup" in semanticCachePublicApi, false);
+    assert.equal("cleanExpiredEntries" in semanticCachePublicApi, false);
+    assert.equal("cleanOldMetrics" in semanticCachePublicApi, false);
+  });
+
   describe("generateSignature", () => {
     it("generates consistent signatures for same inputs", () => {
       const messages = [{ role: "user", content: "hello" }];
@@ -67,37 +80,154 @@ describe("Semantic Cache", () => {
       const sig2 = generateSignature("gpt-5", input2, 0, 1);
       assert.equal(sig1, sig2);
     });
+
+    // #3740: cross-user cache isolation — different API keys must not share cached responses
+    it("generates different signatures for different API key IDs (#3740)", () => {
+      const messages = [{ role: "user", content: "what is 2+2?" }];
+      const sigKeyA = generateSignature("gpt-4o", messages, 0, 1, "key-id-alice");
+      const sigKeyB = generateSignature("gpt-4o", messages, 0, 1, "key-id-bob");
+      assert.notEqual(
+        sigKeyA,
+        sigKeyB,
+        "different API keys must produce different cache signatures"
+      );
+    });
+
+    it("generates consistent signatures for same API key ID (#3740)", () => {
+      const messages = [{ role: "user", content: "what is 2+2?" }];
+      const sig1 = generateSignature("gpt-4o", messages, 0, 1, "key-id-alice");
+      const sig2 = generateSignature("gpt-4o", messages, 0, 1, "key-id-alice");
+      assert.equal(sig1, sig2);
+    });
+
+    it("matches keyless signature when apiKeyId is undefined (#3740)", () => {
+      const messages = [{ role: "user", content: "hello" }];
+      // Unauthenticated requests (apiKeyId=undefined) must not collide with keyed requests
+      const sigKeyed = generateSignature("gpt-4o", messages, 0, 1, "some-key-id");
+      const sigKeyless = generateSignature("gpt-4o", messages, 0, 1, undefined);
+      assert.notEqual(sigKeyed, sigKeyless);
+    });
+
+    // #12734: tool_choice/tools/response_format change model behavior and must not be
+    // ignored by the signature — otherwise a cached tool_calls response can be replayed
+    // for a request whose tool policy forbids it.
+    describe("tool_choice / tools / response_format (#12734)", () => {
+      const messages = [{ role: "user", content: "what is 2+2?" }];
+
+      it("generates different signatures for different tool_choice ('auto' vs 'none')", () => {
+        const sig1 = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          toolChoice: "auto",
+        });
+        const sig2 = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          toolChoice: "none",
+        });
+        assert.notEqual(sig1, sig2);
+      });
+
+      it("generates different signatures for a forced-function tool_choice", () => {
+        const sig1 = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          toolChoice: "auto",
+        });
+        const sig2 = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          toolChoice: { type: "function", function: { name: "get_weather" } },
+        });
+        assert.notEqual(sig1, sig2);
+      });
+
+      it("generates different signatures for no tool_choice vs an explicit one (the #12734 collision)", () => {
+        const sigNoToolChoice = generateSignature("gpt-4o", messages, 0, 1);
+        const sigWithToolChoice = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          toolChoice: "none",
+        });
+        assert.notEqual(sigNoToolChoice, sigWithToolChoice);
+      });
+
+      it("generates different signatures for different tools arrays", () => {
+        const tools1 = [{ type: "function", function: { name: "get_weather", parameters: {} } }];
+        const tools2 = [{ type: "function", function: { name: "get_stock_price", parameters: {} } }];
+        const sig1 = generateSignature("gpt-4o", messages, 0, 1, undefined, { tools: tools1 });
+        const sig2 = generateSignature("gpt-4o", messages, 0, 1, undefined, { tools: tools2 });
+        assert.notEqual(sig1, sig2);
+      });
+
+      it("generates different signatures for different response_format", () => {
+        const sig1 = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          responseFormat: { type: "text" },
+        });
+        const sig2 = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          responseFormat: { type: "json_object" },
+        });
+        assert.notEqual(sig1, sig2);
+      });
+
+      it("generates identical signatures when constraints are identical (no hit-rate regression)", () => {
+        const tools = [{ type: "function", function: { name: "get_weather", parameters: {} } }];
+        const constraints = {
+          toolChoice: "auto",
+          tools,
+          responseFormat: { type: "json_object" },
+        };
+        const sig1 = generateSignature("gpt-4o", messages, 0, 1, undefined, constraints);
+        const sig2 = generateSignature("gpt-4o", messages, 0, 1, undefined, {
+          toolChoice: "auto",
+          tools: [{ type: "function", function: { name: "get_weather", parameters: {} } }],
+          responseFormat: { type: "json_object" },
+        });
+        assert.equal(sig1, sig2);
+      });
+
+      it("generates identical signatures for omitted constraints vs an explicitly empty constraints object", () => {
+        const sig1 = generateSignature("gpt-4o", messages, 0, 1, undefined);
+        const sig2 = generateSignature("gpt-4o", messages, 0, 1, undefined, {});
+        assert.equal(sig1, sig2);
+      });
+    });
   });
 
-  describe("isCacheable", () => {
-    it("returns true for non-streaming temp=0 requests", () => {
-      assert.equal(isCacheable({ stream: false, temperature: 0 }, null), true);
+  describe("isCacheableForRead", () => {
+    // #2536 superseded isCacheable with read/write variants that cache both
+    // streaming and non-streaming requests and require an explicit numeric
+    // temperature: 0 (omitted temperature is treated as non-deterministic).
+    it("returns true for temperature=0 (streaming or not)", () => {
+      assert.equal(isCacheableForRead({ stream: false, temperature: 0 }, null), true);
+      assert.equal(isCacheableForRead({ stream: true, temperature: 0 }, null), true);
     });
 
-    it("returns true when temperature is undefined (defaults to 0)", () => {
-      assert.equal(isCacheable({ stream: false }, null), true);
-    });
-
-    it("returns false for streaming requests", () => {
-      assert.equal(isCacheable({ stream: true, temperature: 0 }, null), false);
-    });
-
-    it("returns false when stream is not explicitly false", () => {
-      assert.equal(isCacheable({ temperature: 0 }, null), false);
+    it("returns false when temperature is omitted (provider default may be non-deterministic)", () => {
+      assert.equal(isCacheableForRead({ stream: false }, null), false);
     });
 
     it("returns false for non-zero temperature", () => {
-      assert.equal(isCacheable({ stream: false, temperature: 0.7 }, null), false);
+      assert.equal(isCacheableForRead({ temperature: 0.7 }, null), false);
     });
 
     it("returns false when no-cache header is set", () => {
       const headers = new Headers({ "x-omniroute-no-cache": "true" });
-      assert.equal(isCacheable({ stream: false, temperature: 0 }, headers), false);
+      assert.equal(isCacheableForRead({ temperature: 0 }, headers), false);
     });
 
     it("returns true when no-cache header is absent", () => {
       const headers = new Headers({});
-      assert.equal(isCacheable({ stream: false, temperature: 0 }, headers), true);
+      assert.equal(isCacheableForRead({ temperature: 0 }, headers), true);
+    });
+  });
+
+  describe("isCacheableForWrite", () => {
+    it("returns true for temperature=0 responses", () => {
+      assert.equal(isCacheableForWrite({ temperature: 0 }, null), true);
+    });
+
+    it("returns false when temperature is omitted", () => {
+      assert.equal(isCacheableForWrite({ stream: false }, null), false);
+    });
+
+    it("returns false for non-zero temperature", () => {
+      assert.equal(isCacheableForWrite({ temperature: 0.7 }, null), false);
+    });
+
+    it("returns false when no-cache header is set", () => {
+      const headers = new Headers({ "x-omniroute-no-cache": "true" });
+      assert.equal(isCacheableForWrite({ temperature: 0 }, headers), false);
     });
   });
 });

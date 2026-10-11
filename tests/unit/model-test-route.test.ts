@@ -24,7 +24,7 @@ async function resetStorage() {
   core.resetDbInstance();
   delete process.env.INITIAL_PASSWORD;
   delete process.env.REQUIRE_API_KEY;
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -35,7 +35,7 @@ function makeRequest(headers?: HeadersInit) {
       "content-type": "application/json",
       ...headers,
     },
-    body: JSON.stringify({ providerId: "openai", modelId: "gpt-4o-mini" }),
+    body: JSON.stringify({ providerId: "openai", modelId: "gpt-4o-2024-11-20" }),
   });
 }
 
@@ -51,7 +51,7 @@ test.afterEach(() => {
 test.after(async () => {
   globalThis.fetch = originalFetch;
   await resetStorage();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 
   if (ORIGINAL_DATA_DIR === undefined) {
     delete process.env.DATA_DIR;
@@ -135,7 +135,7 @@ test("model test route ignores forwarded hosts and works in strict API-key mode"
         "x-forwarded-host": "evil.example",
         "x-forwarded-proto": "https",
       },
-      body: { providerId: "openai", modelId: "gpt-4o-mini" },
+      body: { providerId: "openai", modelId: "gpt-4o-2024-11-20" },
     })
   );
   const body = (await response.json()) as any;

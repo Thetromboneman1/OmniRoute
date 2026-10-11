@@ -2,25 +2,28 @@
  * Usage Fetcher - Get usage data from provider APIs
  */
 
-import { GEMINI_CONFIG } from "@/lib/oauth/constants/oauth";
 import {
   getGitHubCopilotInternalUserHeaders,
   getKiroServiceHeaders,
 } from "@omniroute/open-sse/config/providerHeaderProfiles.ts";
 import {
-  getAntigravityHeaders,
-  antigravityUserAgent,
-  googApiClientHeader,
-} from "@omniroute/open-sse/services/antigravityHeaders.ts";
+  applyAntigravityClientProfileHeaders,
+  getAntigravityClientProfile,
+} from "@omniroute/open-sse/services/antigravityClientProfile.ts";
+import { getAntigravityContentHeaders } from "@omniroute/open-sse/services/antigravityHeaders.ts";
 import {
   getAntigravityFetchAvailableModelsUrls,
-  ANTIGRAVITY_BASE_URLS,
+  ANTIGRAVITY_RUNTIME_BASE_URLS,
 } from "@omniroute/open-sse/config/antigravityUpstream.ts";
 import {
   getAntigravityRemainingCredits,
   updateAntigravityRemainingCredits,
 } from "@omniroute/open-sse/executors/antigravity.ts";
 import { getCreditsMode } from "@omniroute/open-sse/services/antigravityCredits.ts";
+import {
+  generateAntigravityRequestId,
+  getAntigravitySessionId,
+} from "@omniroute/open-sse/services/antigravityIdentity.ts";
 
 /**
  * Get usage data for a provider connection
@@ -33,9 +36,8 @@ export async function getUsageForProvider(connection) {
   switch (provider) {
     case "github":
       return await getGitHubUsage(accessToken, providerSpecificData);
-    case "gemini-cli":
-      return await getGeminiUsage(accessToken);
     case "antigravity":
+    case "agy":
       return await getAntigravityUsage(
         accessToken,
         providerSpecificData,
@@ -46,8 +48,6 @@ export async function getUsageForProvider(connection) {
       return await getClaudeUsage(accessToken);
     case "codex":
       return await getCodexUsage(accessToken, providerSpecificData);
-    case "qwen":
-      return await getQwenUsage(accessToken, providerSpecificData);
     case "qoder":
       return await getQoderUsage(accessToken);
     case "kiro":
@@ -134,36 +134,6 @@ function formatGitHubQuotaSnapshot(quota) {
 }
 
 /**
- * Gemini CLI Usage (Google Cloud)
- */
-async function getGeminiUsage(accessToken) {
-  try {
-    // Gemini CLI uses Google Cloud quotas
-    // Try to get quota info from Cloud Resource Manager
-    const response = await fetch(
-      "https://cloudresourcemanager.googleapis.com/v1/projects?filter=lifecycleState:ACTIVE",
-      {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: "application/json",
-        },
-      }
-    );
-
-    if (!response.ok) {
-      // Quota API may not be accessible, return generic message
-      return {
-        message: "Gemini CLI uses Google Cloud quotas. Check Google Cloud Console for details.",
-      };
-    }
-
-    return { message: "Gemini CLI connected. Usage tracked via Google Cloud Console." };
-  } catch (error) {
-    return { message: "Unable to fetch Gemini usage. Check Google Cloud Console." };
-  }
-}
-
-/**
  * Proactive credit balance probe for Antigravity.
  *
  * Fires a minimal streamGenerateContent request with GOOGLE_ONE_AI credits enabled
@@ -176,12 +146,13 @@ async function getGeminiUsage(accessToken) {
 async function probeAntigravityCreditBalance(
   accessToken: string,
   accountId: string,
-  projectId?: string | null
+  projectId?: string | null,
+  providerSpecificData: Record<string, unknown> = {}
 ): Promise<number | null> {
   try {
     if (!projectId) return null; // Can't call streamGenerateContent without a projectId
 
-    const baseUrl = ANTIGRAVITY_BASE_URLS[0];
+    const baseUrl = ANTIGRAVITY_RUNTIME_BASE_URLS[0];
     const url = `${baseUrl}/v1internal:streamGenerateContent?alt=sse`;
 
     const body = {
@@ -189,22 +160,26 @@ async function probeAntigravityCreditBalance(
       model: "gemini-2-flash",
       userAgent: "antigravity",
       requestType: "agent",
-      requestId: `credits-probe-${Date.now()}`,
+      requestId: generateAntigravityRequestId(),
       enabledCreditTypes: ["GOOGLE_ONE_AI"],
       request: {
         model: "gemini-2-flash",
         contents: [{ role: "user", parts: [{ text: "hi" }] }],
         generationConfig: { maxOutputTokens: 1 },
+        sessionId: getAntigravitySessionId({ connectionId: accountId, projectId }),
       },
     };
 
-    const headers = {
+    const headers: Record<string, string> = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${accessToken}`,
-      "User-Agent": antigravityUserAgent(),
-      "X-Goog-Api-Client": googApiClientHeader(),
       Accept: "text/event-stream",
     };
+    applyAntigravityClientProfileHeaders(
+      headers,
+      { connectionId: accountId, projectId, providerSpecificData },
+      body
+    );
 
     const res = await fetch(url, {
       method: "POST",
@@ -256,8 +231,8 @@ async function probeAntigravityCreditBalance(
  * Calls fetchAvailableModels to get per-model quota fractions.
  * Credit balance (GOOGLE_ONE_AI) is read from the executor's in-memory cache,
  * which is populated automatically after each successful credit-injected SSE call.
- * If the cache is empty and credits mode is enabled, fires a minimal probe request
- * to fetch the balance proactively.
+ * If the cache is empty and credits mode is `always`, fires a minimal probe request
+ * to fetch the balance proactively. `retry` mode never probes from the dashboard.
  */
 async function getAntigravityUsage(
   accessToken: string,
@@ -266,16 +241,23 @@ async function getAntigravityUsage(
   connectionId?: string | null
 ) {
   try {
+    const clientProfile = getAntigravityClientProfile({ providerSpecificData });
     // Use connectionId as the cache key — matches executor's credentials.connectionId
     const accountId: string = connectionId || "unknown";
 
     // Read cached credit balance from executor module (populated from SSE remainingCredits)
     let creditBalance = getAntigravityRemainingCredits(accountId);
 
-    // If no cached balance and credits mode is enabled, fire a minimal probe
+    // Only always mode may proactively spend credits to discover the balance.
+    // Retry mode must wait for an eligible user request quota failure.
     const creditsMode = getCreditsMode();
-    if (creditBalance === null && creditsMode !== "off") {
-      creditBalance = await probeAntigravityCreditBalance(accessToken, accountId, projectId);
+    if (creditBalance === null && creditsMode === "always") {
+      creditBalance = await probeAntigravityCreditBalance(
+        accessToken,
+        accountId,
+        projectId,
+        providerSpecificData
+      );
     }
 
     // fetchAvailableModels — resolves project from token, no projectId needed
@@ -286,7 +268,7 @@ async function getAntigravityUsage(
       try {
         res = await fetch(endpoint, {
           method: "POST",
-          headers: getAntigravityHeaders("fetchAvailableModels", accessToken),
+          headers: getAntigravityContentHeaders(clientProfile, accessToken),
           body: JSON.stringify({}),
           signal: AbortSignal.timeout(15_000),
         });
@@ -337,9 +319,13 @@ async function getAntigravityUsage(
       if (info.isInternal) continue;
       const quotaInfo = (info.quotaInfo as Record<string, unknown>) ?? {};
 
-      if ("remainingFraction" in quotaInfo) {
+      // Process models with any quota metadata (exhausted models may have only resetTime, active models have remainingFraction, credit-based models have empty quotaInfo)
+      if (Object.keys(quotaInfo).length > 0) {
+        // Default to 0 when remainingFraction is undefined/null/invalid, clamp to valid range [0, 1]
         const fraction =
-          typeof quotaInfo.remainingFraction === "number" ? quotaInfo.remainingFraction : 1;
+          typeof quotaInfo.remainingFraction === "number"
+            ? Math.max(0, Math.min(1, quotaInfo.remainingFraction))
+            : 0;
         const resetTime = typeof quotaInfo.resetTime === "string" ? quotaInfo.resetTime : null;
         modelQuotas[modelId] = {
           remaining: Math.round(fraction * 100),
@@ -349,7 +335,7 @@ async function getAntigravityUsage(
         quotaModelsTotal++;
         if (fraction > 0) quotaModelsAvailable++;
       }
-      // Credit-based models have no remainingFraction — their availability is
+      // Credit-based models have empty quotaInfo — their availability is
       // tracked via the GOOGLE_ONE_AI credit balance cached from SSE responses.
     }
 
@@ -416,23 +402,6 @@ async function getCodexUsage(accessToken, providerSpecificData: Record<string, a
     return { message: "Codex connected. Check OpenAI dashboard for usage." };
   } catch (error) {
     return { message: "Unable to fetch Codex usage." };
-  }
-}
-
-/**
- * Qwen Usage
- */
-async function getQwenUsage(accessToken, providerSpecificData) {
-  try {
-    const resourceUrl = providerSpecificData?.resourceUrl;
-    if (!resourceUrl) {
-      return { message: "Qwen connected. No resource URL available." };
-    }
-
-    // Qwen may have usage endpoint at resource URL
-    return { message: "Qwen connected. Usage tracked per request." };
-  } catch (error) {
-    return { message: "Unable to fetch Qwen usage." };
   }
 }
 

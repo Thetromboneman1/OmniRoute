@@ -35,6 +35,11 @@ const imageOnlyProviders = {
     header: "X-API-Key",
     value: "topaz-key",
   },
+  magnific: {
+    url: "https://api.magnific.com/v1/ai/flows",
+    header: "x-magnific-api-key",
+    value: "magnific-key",
+  },
 };
 
 const expectedValidationError = (status: number) =>
@@ -96,52 +101,19 @@ for (const provider of Object.keys(imageOnlyProviders)) {
   }
 }
 
-test("NanoBanana API key validator returns valid on 200", async () => {
+test("freepik alias validates through the Magnific Flows endpoint", async () => {
   let fetchCalled = false;
   globalThis.fetch = async (url, init = {}) => {
     fetchCalled = true;
-    assert.match(String(url), /nanobanana/i);
-    assert.equal((init.headers as Record<string, string>).Authorization, "Bearer nb-key");
-    return new Response(JSON.stringify({ taskId: "task-1" }), { status: 200 });
+    assert.equal(String(url), "https://api.magnific.com/v1/ai/flows");
+    assert.equal((init.headers as Record<string, string>)["x-magnific-api-key"], "legacy-key");
+    return new Response(JSON.stringify({ data: [] }), { status: 200 });
   };
 
-  const result = await validateProviderApiKey({ provider: "nanobanana", apiKey: "nb-key" });
+  const result = await validateProviderApiKey({ provider: "freepik", apiKey: "legacy-key" });
 
   assert.equal(result.valid, true);
   assert.equal(result.error, null);
+  assert.notEqual(result.unsupported, true);
   assert.equal(fetchCalled, true);
 });
-
-for (const status of [401, 403]) {
-  test(`NanoBanana API key validator returns invalid on ${status}`, async () => {
-    let fetchCalled = false;
-    globalThis.fetch = async (url) => {
-      fetchCalled = true;
-      assert.match(String(url), /nanobanana/i);
-      return new Response(JSON.stringify({ error: "unauthorized" }), { status });
-    };
-
-    const result = await validateProviderApiKey({ provider: "nanobanana", apiKey: "nb-key" });
-
-    assert.equal(result.valid, false, `NanoBanana should reject ${status}`);
-    assert.equal(result.error, "Invalid API key");
-    assert.equal(fetchCalled, true);
-  });
-}
-
-for (const status of [400, 404, 429]) {
-  test(`NanoBanana API key validator returns validation failed on ${status}`, async () => {
-    let fetchCalled = false;
-    globalThis.fetch = async (url) => {
-      fetchCalled = true;
-      assert.match(String(url), /nanobanana/i);
-      return new Response(JSON.stringify({ error: "validation failed" }), { status });
-    };
-
-    const result = await validateProviderApiKey({ provider: "nanobanana", apiKey: "nb-key" });
-
-    assert.equal(result.valid, false, `NanoBanana should reject ${status}`);
-    assert.equal(result.error, expectedValidationError(status));
-    assert.equal(fetchCalled, true);
-  });
-}

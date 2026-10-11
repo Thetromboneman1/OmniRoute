@@ -11,6 +11,7 @@
 
 import { useNotificationStore } from "@/store/notificationStore";
 import { useEffect, useState } from "react";
+import { useTranslations } from "next-intl";
 
 const ICONS = {
   success: "✓",
@@ -19,30 +20,55 @@ const ICONS = {
   info: "ℹ",
 };
 
+/**
+ * Coerce a toast title/message to a string. `message`/`title` are typed as
+ * `string`, but callers occasionally pass a raw API error body (an object) —
+ * rendering that object directly throws React #31 ("Objects are not valid as a
+ * React child") and freezes the whole page. This keeps the toast resilient no
+ * matter what a caller hands it.
+ */
+export function toToastText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  if (typeof value === "object") {
+    const message = (value as { message?: unknown }).message;
+    if (typeof message === "string") return message;
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+const BG_DARK = "rgba(30, 30, 30, 0.95)";
+
 const COLORS = {
   success: {
-    bg: "rgba(16, 185, 129, 0.15)",
-    border: "rgba(16, 185, 129, 0.4)",
+    bg: BG_DARK,
+    border: "rgba(16, 185, 129, 0.6)",
     icon: "#10b981",
   },
   error: {
-    bg: "rgba(239, 68, 68, 0.15)",
-    border: "rgba(239, 68, 68, 0.4)",
+    bg: BG_DARK,
+    border: "rgba(239, 68, 68, 0.6)",
     icon: "#ef4444",
   },
   warning: {
-    bg: "rgba(245, 158, 11, 0.15)",
-    border: "rgba(245, 158, 11, 0.4)",
-    icon: "#f59e0b",
+    bg: BG_DARK,
+    border: "rgba(245, 158, 11, 0.6)",
+    icon: "#fbbf24",
   },
   info: {
-    bg: "rgba(59, 130, 246, 0.15)",
-    border: "rgba(59, 130, 246, 0.4)",
+    bg: BG_DARK,
+    border: "rgba(59, 130, 246, 0.6)",
     icon: "#3b82f6",
   },
 };
 
 function Toast({ notification, onDismiss }) {
+  const t = useTranslations("common");
   const [isExiting, setIsExiting] = useState(false);
 
   const handleDismiss = () => {
@@ -51,11 +77,16 @@ function Toast({ notification, onDismiss }) {
   };
 
   const color = COLORS[notification.type] || COLORS.info;
+  const textColors = {
+    title: "var(--text-primary, #fff)",
+    message: "var(--text-secondary, #ccc)",
+  };
 
   return (
     <div
       role="alert"
       aria-live="polite"
+      onClick={notification.onClick}
       style={{
         display: "flex",
         alignItems: "flex-start",
@@ -68,6 +99,7 @@ function Toast({ notification, onDismiss }) {
         boxShadow: "0 8px 32px rgba(0,0,0,0.2)",
         minWidth: "320px",
         maxWidth: "420px",
+        cursor: notification.onClick ? "pointer" : "default",
         animation: isExiting ? "toastOut 0.2s ease-in forwards" : "toastIn 0.3s ease-out forwards",
         transition: "all 0.2s ease",
       }}
@@ -89,27 +121,30 @@ function Toast({ notification, onDismiss }) {
             style={{
               fontWeight: 600,
               fontSize: "14px",
-              color: "var(--text-primary, #fff)",
+              color: textColors.title,
               marginBottom: "2px",
             }}
           >
-            {notification.title}
+            {toToastText(notification.title)}
           </div>
         )}
         <div
           style={{
             fontSize: "13px",
-            color: "var(--text-secondary, #ccc)",
+            color: textColors.message,
             lineHeight: 1.4,
           }}
         >
-          {notification.message}
+          {toToastText(notification.message)}
         </div>
       </div>
       {notification.dismissible && (
         <button
-          onClick={handleDismiss}
-          aria-label="Dismiss notification"
+          onClick={(e) => {
+            e.stopPropagation();
+            handleDismiss();
+          }}
+          aria-label={t("dismissNotification")}
           style={{
             background: "none",
             border: "none",

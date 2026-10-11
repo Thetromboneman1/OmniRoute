@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { getAuditRequestContext, logAuditEvent } from "@/lib/compliance/index";
 import { validateClaudeCodeCompatibleProvider } from "@/lib/providers/validation";
 import {
@@ -7,13 +8,52 @@ import {
   getSafeOutboundFetchErrorStatus,
   safeOutboundFetch,
 } from "@/shared/network/safeOutboundFetch";
-import {
-  PROVIDER_URL_BLOCKED_MESSAGE,
-  getProviderOutboundGuard,
-} from "@/shared/network/outboundUrlGuard";
+import { getProviderValidationGuard } from "@/shared/network/outboundUrlGuardPolicy";
 import { isCcCompatibleProviderEnabled } from "@/shared/utils/featureFlags";
 import { providerNodeValidateSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+
+// Matches a base URL whose host is localhost / 127.0.0.1 (with an optional port).
+const LOCALHOST_BASE_URL_RE = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?(?:[/?#]|$)/i;
+
+// Extract the underlying network error code from a SafeOutboundFetchError chain.
+// safeOutboundFetch wraps fetch failures and preserves the original error as `cause`,
+// so a connection-refused surfaces as cause.code === "ECONNREFUSED".
+function getOutboundCauseCode(error: unknown): string | undefined {
+  const cause = (error as { cause?: unknown })?.cause;
+  if (cause && typeof cause === "object") {
+    const direct = (cause as { code?: unknown }).code;
+    if (typeof direct === "string") return direct;
+    const nested = (cause as { cause?: { code?: unknown } }).cause?.code;
+    if (typeof nested === "string") return nested;
+  }
+  return undefined;
+}
+
+// When a connection error happens against a localhost base URL, the most common
+// cause is running OmniRoute in Docker — `localhost` then points at the container,
+// not the host. Augment the surfaced message with an actionable hint in that case.
+// Ported from decolua/9router#642.
+export function augmentDockerLocalhostHint(
+  error: unknown,
+  baseUrl: string | undefined,
+  fallbackMessage: string
+): string {
+  if (!baseUrl || !LOCALHOST_BASE_URL_RE.test(baseUrl)) return fallbackMessage;
+
+  const code =
+    error instanceof SafeOutboundFetchError && error.code === "TIMEOUT"
+      ? "ETIMEDOUT"
+      : getOutboundCauseCode(error);
+
+  if (code === "ECONNREFUSED") {
+    return "Connection refused — are you running OmniRoute in Docker? localhost points to the container, not your host. Use your host IP (e.g. http://192.168.x.x:11434) or http://host.docker.internal:11434 on Linux/Mac.";
+  }
+  if (code === "ETIMEDOUT") {
+    return "Connection timeout — are you running OmniRoute in Docker? Use your host IP (e.g. http://192.168.x.x:11434) or http://host.docker.internal:11434 on Linux/Mac.";
+  }
+  return fallbackMessage;
+}
 
 function sanitizeAnthropicBaseUrl(baseUrl: string) {
   return (baseUrl || "")
@@ -29,6 +69,99 @@ function sanitizeClaudeCodeCompatibleBaseUrl(baseUrl: string) {
     .replace(/\/(?:v\d+\/)?messages(?:\?[^#]*)?$/i, "");
 }
 
+// Status-specific error message for /models probe failures.
+function getModelsErrorMessage(status: number) {
+  if (status === 401 || status === 403) return "API key unauthorized";
+  if (status === 404) {
+    return "/models endpoint not found - enter a Model ID to validate via chat/completions instead";
+  }
+  if (status >= 500) return "Server error - try again later";
+  return `Unexpected response (${status})`;
+}
+
+// Status-specific error message for the /chat/completions fallback probe.
+function getChatErrorMessage(status: number) {
+  if (status === 401 || status === 403) return "API key unauthorized";
+  if (status === 400) return "Invalid model or bad request";
+  if (status === 404) return "Chat endpoint not found";
+  if (status >= 500) return "Server error - try again later";
+  return `Chat request failed (${status})`;
+}
+
+// Status-specific error message for the /audio/transcriptions fallback probe.
+function getAudioTranscriptionErrorMessage(status: number) {
+  if (status === 401 || status === 403) return "API key unauthorized";
+  if (status === 400) return "Invalid transcription model or bad audio request";
+  if (status === 404) return "Audio transcriptions endpoint not found";
+  if (status >= 500) return "Server error - try again later";
+  return `Audio transcription request failed (${status})`;
+}
+
+function buildTinyWavFile(): File {
+  return new File(
+    [
+      new Uint8Array([
+        0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45, 0x66, 0x6d, 0x74,
+        0x20, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x40, 0x1f, 0x00, 0x00, 0x80, 0x3e,
+        0x00, 0x00, 0x02, 0x00, 0x10, 0x00, 0x64, 0x61, 0x74, 0x61, 0x00, 0x00, 0x00, 0x00,
+      ]),
+    ],
+    "omniroute-validation.wav",
+    { type: "audio/wav" }
+  );
+}
+
+async function probeChatFallback({
+  baseUrl,
+  apiKey,
+  modelId,
+  extraHeaders = {},
+}: {
+  baseUrl: string;
+  apiKey: string;
+  modelId: string;
+  extraHeaders?: Record<string, string>;
+}) {
+  const chatUrl = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
+  return safeOutboundFetch(chatUrl, {
+    ...SAFE_OUTBOUND_FETCH_PRESETS.validationRead,
+    guard: getProviderValidationGuard(),
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      ...extraHeaders,
+    },
+    body: JSON.stringify({
+      model: modelId,
+      messages: [{ role: "user", content: "ping" }],
+      max_tokens: 1,
+    }),
+  });
+}
+
+async function probeAudioTranscriptionFallback({
+  baseUrl,
+  apiKey,
+  modelId,
+}: {
+  baseUrl: string;
+  apiKey: string;
+  modelId: string;
+}) {
+  const formData = new FormData();
+  formData.set("model", modelId);
+  formData.set("file", buildTinyWavFile());
+  const transcriptionUrl = `${baseUrl.replace(/\/$/, "")}/audio/transcriptions`;
+  return safeOutboundFetch(transcriptionUrl, {
+    ...SAFE_OUTBOUND_FETCH_PRESETS.validationRead,
+    guard: getProviderValidationGuard(),
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: formData,
+  });
+}
+
 function sanitizeAuditBaseUrl(baseUrl: string) {
   if (!baseUrl) return null;
   try {
@@ -41,6 +174,9 @@ function sanitizeAuditBaseUrl(baseUrl: string) {
 
 // POST /api/provider-nodes/validate - Validate API key against base URL
 export async function POST(request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
   const auditContext = getAuditRequestContext(request);
   let rawBody;
   try {
@@ -62,7 +198,9 @@ export async function POST(request) {
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
-    const { baseUrl, apiKey, type, compatMode, chatPath, modelsPath } = validation.data;
+    const { baseUrl, apiKey, type, compatMode, apiType, chatPath, modelsPath, modelId } =
+      validation.data;
+    const trimmedModelId = typeof modelId === "string" ? modelId.trim() : "";
 
     // Anthropic Compatible Validation
     if (type === "anthropic-compatible") {
@@ -98,7 +236,7 @@ export async function POST(request) {
 
       const res = await safeOutboundFetch(modelsUrl, {
         ...SAFE_OUTBOUND_FETCH_PRESETS.validationRead,
-        guard: getProviderOutboundGuard(),
+        guard: getProviderValidationGuard(),
         method: "GET",
         headers: {
           "x-api-key": apiKey,
@@ -107,31 +245,96 @@ export async function POST(request) {
         },
       });
 
-      return NextResponse.json({ valid: res.ok, error: res.ok ? null : "Invalid API key" });
+      if (res.ok) return NextResponse.json({ valid: true, error: null });
+      // Auth errors: chat fallback would not recover. Skip and surface clear message.
+      if (res.status === 401 || res.status === 403) {
+        return NextResponse.json({ valid: false, error: "API key unauthorized" });
+      }
+      // Optional /chat/completions fallback when caller supplied a model ID
+      // (some Anthropic-compatible proxies expose only the chat endpoint).
+      if (trimmedModelId) {
+        const chatRes = await probeChatFallback({
+          baseUrl: normalizedBase,
+          apiKey: apiKey ?? "",
+          modelId: trimmedModelId,
+          extraHeaders: { "x-api-key": apiKey ?? "", "anthropic-version": "2023-06-01" },
+        });
+        if (chatRes.ok) return NextResponse.json({ valid: true, error: null, method: "chat" });
+        return NextResponse.json({
+          valid: false,
+          error: getChatErrorMessage(chatRes.status),
+          method: "chat",
+        });
+      }
+      return NextResponse.json({ valid: false, error: getModelsErrorMessage(res.status) });
     }
 
     // OpenAI Compatible Validation (Default)
-    const modelsUrl = `${baseUrl.replace(/\/$/, "")}${modelsPath || "/models"}`;
+    const openAiBase = baseUrl.replace(/\/$/, "");
+
+    if (apiType === "audio-transcriptions") {
+      if (!trimmedModelId) {
+        return NextResponse.json({
+          valid: false,
+          error: "Model ID required to validate audio transcriptions",
+          method: "audio-transcriptions",
+        });
+      }
+      const transcriptionRes = await probeAudioTranscriptionFallback({
+        baseUrl: openAiBase,
+        apiKey: apiKey ?? "",
+        modelId: trimmedModelId,
+      });
+      if (transcriptionRes.ok) {
+        return NextResponse.json({ valid: true, error: null, method: "audio-transcriptions" });
+      }
+      return NextResponse.json({
+        valid: false,
+        error: getAudioTranscriptionErrorMessage(transcriptionRes.status),
+        method: "audio-transcriptions",
+      });
+    }
+
+    const modelsUrl = `${openAiBase}${modelsPath || "/models"}`;
     const res = await safeOutboundFetch(modelsUrl, {
       ...SAFE_OUTBOUND_FETCH_PRESETS.validationRead,
-      guard: getProviderOutboundGuard(),
+      guard: getProviderValidationGuard(),
       headers: { Authorization: `Bearer ${apiKey}` },
     });
 
-    return NextResponse.json({ valid: res.ok, error: res.ok ? null : "Invalid API key" });
+    if (res.ok) return NextResponse.json({ valid: true, error: null });
+    if (res.status === 401 || res.status === 403) {
+      return NextResponse.json({ valid: false, error: "API key unauthorized" });
+    }
+    if (trimmedModelId) {
+      const chatRes = await probeChatFallback({
+        baseUrl: openAiBase,
+        apiKey: apiKey ?? "",
+        modelId: trimmedModelId,
+      });
+      if (chatRes.ok) return NextResponse.json({ valid: true, error: null, method: "chat" });
+      return NextResponse.json({
+        valid: false,
+        error: getChatErrorMessage(chatRes.status),
+        method: "chat",
+      });
+    }
+    return NextResponse.json({ valid: false, error: getModelsErrorMessage(res.status) });
   } catch (error) {
+    const attemptedBaseUrl =
+      rawBody && typeof rawBody === "object" && "baseUrl" in rawBody
+        ? String((rawBody as { baseUrl?: unknown }).baseUrl || "")
+        : "";
     const status = getSafeOutboundFetchErrorStatus(error);
     if (status) {
-      const message = error instanceof Error ? error.message : "Validation failed";
-      if (
-        error instanceof SafeOutboundFetchError &&
-        error.code === "URL_GUARD_BLOCKED" &&
-        message.includes(PROVIDER_URL_BLOCKED_MESSAGE)
-      ) {
-        const attemptedBaseUrl =
-          rawBody && typeof rawBody === "object" && "baseUrl" in rawBody
-            ? String((rawBody as { baseUrl?: unknown }).baseUrl || "")
-            : "";
+      const rawMessage =
+        error instanceof SafeOutboundFetchError && error.code === "INVALID_URL"
+          ? "Invalid provider base URL format"
+          : error instanceof Error
+            ? error.message
+            : "Validation failed";
+      const message = augmentDockerLocalhostHint(error, attemptedBaseUrl, rawMessage);
+      if (error instanceof SafeOutboundFetchError && error.code === "URL_GUARD_BLOCKED") {
         logAuditEvent({
           action: "provider.validation.ssrf_blocked",
           actor: "admin",
@@ -150,6 +353,7 @@ export async function POST(request) {
       return NextResponse.json({ error: message }, { status });
     }
     console.log("Error validating provider node:", error);
-    return NextResponse.json({ error: "Validation failed" }, { status: 500 });
+    const message = augmentDockerLocalhostHint(error, attemptedBaseUrl, "Validation failed");
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }

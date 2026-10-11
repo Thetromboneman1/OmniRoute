@@ -3,22 +3,28 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const ROOT = join(__dirname, "..");
 
-function resolveMcpEntry(rootDir = ROOT) {
+/**
+ * @param {string} [rootDir] - project root directory (defaults to package root)
+ * @param {(path: string) => boolean} [existsSyncFn] - injectable fs.existsSync
+ *   for testing; defaults to the real existsSync
+ * @returns {string|null} resolved absolute path to the MCP server entry, or null
+ */
+export function resolveMcpEntry(rootDir = ROOT, existsSyncFn = existsSync) {
   const candidates = [
-    // Preferred distributable JS entry (npm publish artifact)
-    join(rootDir, "app", "open-sse", "mcp-server", "server.js"),
+    // Preferred distributable JS entry (npm publish artifact, built by prepublish.ts)
+    join(rootDir, "dist", "open-sse", "mcp-server", "server.js"),
     // Local workspace TypeScript source fallback
     join(rootDir, "open-sse", "mcp-server", "server.ts"),
   ];
 
   for (const entry of candidates) {
-    if (existsSync(entry)) return entry;
+    if (existsSyncFn(entry)) return entry;
   }
   return null;
 }
@@ -32,12 +38,20 @@ export async function startMcpCli(rootDir = ROOT) {
   const mcpEntry = resolveMcpEntry(rootDir);
   if (!mcpEntry) {
     throw new Error(
-      "MCP server entrypoint not found. Expected app/open-sse/mcp-server/server.js or open-sse/mcp-server/server.ts."
+      "MCP server entrypoint not found. Expected dist/open-sse/mcp-server/server.js or open-sse/mcp-server/server.ts."
     );
   }
 
   // `tsx` loader is only required for local `.ts` fallback; JS entry works without it.
-  const loaderArgs = mcpEntry.endsWith(".ts") ? ["--import", "tsx/esm"] : [];
+  const tsxLoaderArgs = mcpEntry.endsWith(".ts") ? ["--import", "tsx"] : [];
+  // Preload the stdout/stderr console guard before mcpEntry's own module graph evaluates —
+  // DB init (a side effect of createMcpServer()'s tool registration) logs via plain
+  // console.log, and by the time any code inside mcpEntry itself could redirect it, that
+  // module's own (hoisted) imports have already run. Loading the guard first, in a separate
+  // module, is the only point early enough to guarantee it never leaks into the JSON-RPC
+  // stream on stdout.
+  const consoleGuard = pathToFileURL(join(__dirname, "mcpStdioConsoleGuard.mjs")).href;
+  const loaderArgs = ["--import", consoleGuard, ...tsxLoaderArgs];
 
   await new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [...loaderArgs, mcpEntry], {

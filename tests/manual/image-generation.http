@@ -51,15 +51,15 @@ Content-Type: application/json
 }
 
 ###
-# @name Omniroute - Codex image via /v1/images/generations (DALL-E shim)
-# Translates a DALL-E-style request into a /responses call with the
+# @name Omniroute - Codex image via /v1/images/generations (GPT-Image shim)
+# Translates a GPT-Image-style request into a /responses call with the
 # image_generation hosted tool. Use with OpenWebUI's image generation feature.
 POST {{omniroute-address}}/v1/images/generations
 Authorization: Bearer {{OMNIROUTE_API_KEY}}
 Content-Type: application/json
 
 {
-  "model": "codex/gpt-5.4",
+  "model": "codex/gpt-5.6-sol",
   "prompt": "A happy red kitten, highly detailed fur, studio lighting",
   "n": 1,
   "size": "1024x1024",

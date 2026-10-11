@@ -10,20 +10,23 @@ process.env.DATA_DIR = TEST_DATA_DIR;
 process.env.API_KEY_SECRET = "test-secret";
 
 const apiKeysDb = await import("../../../src/lib/db/apiKeys.ts");
+const featureFlagsDb = await import("../../../src/lib/db/featureFlags.ts");
 const core = await import("../../../src/lib/db/core.ts");
 
 const ORIGINAL_OMNIROUTE_API_KEY = process.env.OMNIROUTE_API_KEY;
 const ORIGINAL_ROUTER_API_KEY = process.env.ROUTER_API_KEY;
 const ORIGINAL_JWT_SECRET = process.env.JWT_SECRET;
+const ORIGINAL_REQUIRE_API_KEY = process.env.REQUIRE_API_KEY;
 
 function resetStorage() {
   core.resetDbInstance();
   apiKeysDb.resetApiKeyState();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
   delete process.env.OMNIROUTE_API_KEY;
   delete process.env.ROUTER_API_KEY;
   delete process.env.JWT_SECRET;
+  process.env.REQUIRE_API_KEY = "true";
 }
 
 test.beforeEach(() => {
@@ -31,13 +34,15 @@ test.beforeEach(() => {
 });
 
 test.after(() => {
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   if (ORIGINAL_OMNIROUTE_API_KEY === undefined) delete process.env.OMNIROUTE_API_KEY;
   else process.env.OMNIROUTE_API_KEY = ORIGINAL_OMNIROUTE_API_KEY;
   if (ORIGINAL_ROUTER_API_KEY === undefined) delete process.env.ROUTER_API_KEY;
   else process.env.ROUTER_API_KEY = ORIGINAL_ROUTER_API_KEY;
   if (ORIGINAL_JWT_SECRET === undefined) delete process.env.JWT_SECRET;
   else process.env.JWT_SECRET = ORIGINAL_JWT_SECRET;
+  if (ORIGINAL_REQUIRE_API_KEY === undefined) delete process.env.REQUIRE_API_KEY;
+  else process.env.REQUIRE_API_KEY = ORIGINAL_REQUIRE_API_KEY;
 });
 
 async function loadPolicy() {
@@ -46,12 +51,30 @@ async function loadPolicy() {
 }
 
 function ctx(headers: Headers, method = "POST", normalizedPath = "/api/v1/chat/completions") {
+  const pathOnly = normalizedPath.split("?")[0];
   return {
     request: { method, headers, url: `http://localhost${normalizedPath}` },
     classification: {
       routeClass: "CLIENT_API" as const,
       reason: "client_api_v1" as const,
-      normalizedPath,
+      normalizedPath: pathOnly,
+    },
+    requestId: "req_test",
+  };
+}
+
+function relativeUrlCtx(
+  headers: Headers,
+  method = "POST",
+  normalizedPath = "/api/v1/chat/completions"
+) {
+  const pathOnly = normalizedPath.split("?")[0];
+  return {
+    request: { method, headers, url: normalizedPath },
+    classification: {
+      routeClass: "CLIENT_API" as const,
+      reason: "client_api_v1" as const,
+      normalizedPath: pathOnly,
     },
     requestId: "req_test",
   };
@@ -77,6 +100,54 @@ test("clientApiPolicy: missing bearer is rejected with 401", async () => {
   }
 });
 
+test("clientApiPolicy: websocket descriptor handshake can reach the route handler", async () => {
+  const policy = await loadPolicy();
+  const out = await policy.evaluate(ctx(new Headers(), "GET", "/api/v1/ws?handshake=1"));
+
+  assert.equal(out.allow, true);
+  if (out.allow) {
+    assert.equal(out.subject.kind, "anonymous");
+    assert.equal(out.subject.id, "ws-handshake");
+  }
+});
+
+test("clientApiPolicy: websocket descriptor handshake accepts relative request URLs", async () => {
+  const policy = await loadPolicy();
+  const out = await policy.evaluate(relativeUrlCtx(new Headers(), "GET", "/api/v1/ws?handshake=1"));
+
+  assert.equal(out.allow, true);
+  if (out.allow) {
+    assert.equal(out.subject.kind, "anonymous");
+    assert.equal(out.subject.id, "ws-handshake");
+  }
+});
+
+test("clientApiPolicy: REQUIRE_API_KEY DB feature flag override rejects anonymous", async () => {
+  process.env.REQUIRE_API_KEY = "false";
+  featureFlagsDb.setFeatureFlagOverride("REQUIRE_API_KEY", "true");
+
+  const policy = await loadPolicy();
+  const out = await policy.evaluate(ctx(new Headers()));
+  assert.equal(out.allow, false);
+  if (!out.allow) {
+    assert.equal(out.status, 401);
+    assert.equal(out.code, "AUTH_002");
+  }
+});
+
+test("clientApiPolicy: REQUIRE_API_KEY DB feature flag override can disable env requirement", async () => {
+  process.env.REQUIRE_API_KEY = "true";
+  featureFlagsDb.setFeatureFlagOverride("REQUIRE_API_KEY", "false");
+
+  const policy = await loadPolicy();
+  const out = await policy.evaluate(ctx(new Headers()));
+  assert.equal(out.allow, true);
+  if (out.allow) {
+    assert.equal(out.subject.kind, "anonymous");
+    assert.equal(out.subject.id, "local");
+  }
+});
+
 test("clientApiPolicy: dashboard session can read the model catalog without bearer", async () => {
   const policy = await loadPolicy();
   const out = await policy.evaluate(
@@ -90,16 +161,16 @@ test("clientApiPolicy: dashboard session can read the model catalog without bear
   }
 });
 
-test("clientApiPolicy: dashboard session does not bypass non-catalog client API auth", async () => {
+test("clientApiPolicy: dashboard session is accepted for client API routes without bearer", async () => {
   const policy = await loadPolicy();
   const out = await policy.evaluate(
     ctx(new Headers({ cookie: await dashboardCookie() }), "POST", "/api/v1/chat/completions")
   );
 
-  assert.equal(out.allow, false);
-  if (!out.allow) {
-    assert.equal(out.status, 401);
-    assert.equal(out.code, "AUTH_002");
+  assert.equal(out.allow, true);
+  if (out.allow) {
+    assert.equal(out.subject.kind, "dashboard_session");
+    assert.equal(out.subject.id, "dashboard");
   }
 });
 
@@ -144,6 +215,93 @@ test("clientApiPolicy: environment API key remains accepted for client API route
   const policy = await loadPolicy();
   const out = await policy.evaluate(
     ctx(new Headers({ authorization: "Bearer sk-env-policy-test" }))
+  );
+
+  assert.equal(out.allow, true);
+  if (out.allow) {
+    assert.equal(out.subject.kind, "client_api_key");
+  }
+});
+
+test("clientApiPolicy: x-api-key header is accepted as client_api_key subject", async () => {
+  const created = await apiKeysDb.createApiKey("policy-test-xkey", "machine-xkey-1234");
+  assert.ok(created?.key, "createApiKey must return a key");
+
+  const policy = await loadPolicy();
+  const headers = new Headers({ "x-api-key": created.key });
+  const out = await policy.evaluate(ctx(headers));
+  assert.equal(out.allow, true);
+  if (out.allow) {
+    assert.equal(out.subject.kind, "client_api_key");
+    assert.match(out.subject.id, /^key_/);
+  }
+});
+
+test("clientApiPolicy: x-goog-api-key header is accepted as client_api_key subject (#7034)", async () => {
+  const created = await apiKeysDb.createApiKey("policy-test-googkey", "machine-googkey-1234");
+  assert.ok(created?.key, "createApiKey must return a key");
+
+  const policy = await loadPolicy();
+  const headers = new Headers({ "x-goog-api-key": created.key });
+  const out = await policy.evaluate(ctx(headers));
+  assert.equal(out.allow, true);
+  if (out.allow) {
+    assert.equal(out.subject.kind, "client_api_key");
+    assert.match(out.subject.id, /^key_/);
+  }
+});
+
+test("clientApiPolicy: Authorization Bearer wins over x-goog-api-key when both present (#7034)", async () => {
+  const created = await apiKeysDb.createApiKey("policy-test-goog-precedence", "machine-goog-2345");
+  assert.ok(created?.key, "createApiKey must return a key");
+
+  const policy = await loadPolicy();
+  const headers = new Headers({
+    authorization: `Bearer ${created.key}`,
+    "x-goog-api-key": "sk-goog-should-lose",
+  });
+  const out = await policy.evaluate(ctx(headers));
+  assert.equal(out.allow, true);
+  if (out.allow) {
+    assert.equal(out.subject.kind, "client_api_key");
+    assert.match(out.subject.id, /^key_/);
+  }
+});
+
+test("clientApiPolicy: existing x-api-key still wins over x-goog-api-key when both present (#7034)", async () => {
+  const created = await apiKeysDb.createApiKey("policy-test-xkey-precedence", "machine-xkey-2345");
+  assert.ok(created?.key, "createApiKey must return a key");
+
+  const policy = await loadPolicy();
+  const headers = new Headers({
+    "x-api-key": created.key,
+    "x-goog-api-key": "sk-goog-should-lose",
+  });
+  const out = await policy.evaluate(ctx(headers));
+  assert.equal(out.allow, true);
+  if (out.allow) {
+    assert.equal(out.subject.kind, "client_api_key");
+    assert.match(out.subject.id, /^key_/);
+  }
+});
+
+test("clientApiPolicy: invalid x-goog-api-key is rejected with 401 AUTH_002 (#7034)", async () => {
+  const policy = await loadPolicy();
+  const headers = new Headers({ "x-goog-api-key": "sk-invalid-goog-key" });
+  const out = await policy.evaluate(ctx(headers));
+  assert.equal(out.allow, false);
+  if (!out.allow) {
+    assert.equal(out.status, 401);
+    assert.equal(out.code, "AUTH_002");
+  }
+});
+
+test("clientApiPolicy: ROUTER_API_KEY remains accepted for client API routes", async () => {
+  process.env.ROUTER_API_KEY = "sk-router-policy-test";
+
+  const policy = await loadPolicy();
+  const out = await policy.evaluate(
+    ctx(new Headers({ authorization: "Bearer sk-router-policy-test" }))
   );
 
   assert.equal(out.allow, true);

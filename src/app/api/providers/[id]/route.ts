@@ -4,12 +4,11 @@ import {
   getProviderAuditTarget,
   summarizeProviderConnectionForAudit,
 } from "@/lib/compliance/providerAudit";
-import {
-  getProviderConnectionById,
-  updateProviderConnection,
-  deleteProviderConnection,
-  isCloudEnabled,
-} from "@/models";
+import { getCachedProviderConnectionById } from "@/lib/db/readCache";
+import { updateProviderConnection } from "@/lib/db/providers";
+import { clearRequestRejectedStreak } from "@omniroute/open-sse/services/requestRejectedStreak.ts";
+import { deleteProviderConnection } from "@/lib/db/providers/deletion";
+import { isCloudEnabled } from "@/lib/db/settings";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { syncToCloud } from "@/lib/cloudSync";
 import { updateProviderConnectionSchema } from "@/shared/validation/schemas";
@@ -23,6 +22,27 @@ import {
   isClaudeExtraUsageBlockEnabled,
 } from "@/lib/providers/claudeExtraUsage";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
+import { isApiKeyRevealEnabled, maskStoredApiKey } from "@/lib/apiKeyExposure";
+import { cleanupProviderModelsAfterConnectionDelete } from "@/lib/db/models";
+import { canUpdateProviderApiKey } from "@/shared/providers/webSessionCredentials";
+import {
+  refreshConnectionRateLimits,
+  enableRateLimitProtection,
+  disableRateLimitProtection,
+} from "@/../open-sse/services/rateLimitManager";
+// Dynamically imported below, inside the one `provider === "chatgpt-web-codex"`
+// branch that needs it -- same fix as #12355 (src/app/api/providers/route.ts),
+// which missed this identical pattern in the by-id route. This module's
+// transitive chain pulls in tiktoken's WASM tokenizer, which Turbopack dev
+// mode fails to resolve for this graph even with `tiktoken` listed in
+// serverExternalPackages. A static top-level import evaluates that whole
+// chain on EVERY PUT to this route regardless of provider, turning an
+// unrelated-provider bundling bug into a route-wide 500 (observed live: PUT
+// on a plain openai-compatible connection's rename failed with "Missing
+// tiktoken_bg.wasm" after 17-50s, never touching chatgpt-web-codex at all).
+import { rejectRetiredCommonChatGptWebProvider } from "@/lib/providers/chatgptWebRetirementResponse";
+import { chatGptWebStorageStateFromCookieHeader } from "@omniroute/open-sse/utils/chatgptWebExecutorAdapter.ts";
+import { applyOperatorActivationIntent } from "@/lib/providers/operatorDisable";
 
 function normalizeCodexLimitPolicy(
   incoming: unknown,
@@ -55,15 +75,19 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
 
   try {
     const { id } = await params;
-    const connection = await getProviderConnectionById(id);
+    const connection = await getCachedProviderConnectionById(id);
 
     if (!connection) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 });
     }
 
-    // Hide sensitive fields
+    const revealKeys = isApiKeyRevealEnabled();
+
+    // Hide or mask sensitive fields
     const result: Record<string, any> = { ...connection };
-    delete result.apiKey;
+    if (!revealKeys) {
+      result.apiKey = result.apiKey ? maskStoredApiKey(result.apiKey) : undefined;
+    }
     delete result.accessToken;
     delete result.refreshToken;
     delete result.idToken;
@@ -105,7 +129,14 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
     const { id } = await params;
     const validation = validateBody(updateProviderConnectionSchema, rawBody);
     if (isValidationFailure(validation)) {
-      return NextResponse.json({ error: validation.error }, { status: 400 });
+      // never drop an operator's intent silently. Surface the rejected
+      // keys (field paths and unrecognized-key names) alongside the existing
+      // error envelope so clients and the UI can tell exactly what was refused.
+      const rejected = [
+        ...validation.error.details.map((d) => d.field).filter(Boolean),
+        ...validation.error.details.flatMap((d) => d.keys ?? []),
+      ];
+      return NextResponse.json({ error: { ...validation.error, rejected } }, { status: 400 });
     }
     const body = validation.data;
     const {
@@ -124,13 +155,23 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       rateLimitedUntil,
       lastTested,
       healthCheckInterval,
+      group,
+      maxConcurrent,
+      quotaWindowThresholds: incomingWindowThresholds,
+      proxyEnabled,
+      perKeyProxyEnabled,
+      quotaVisible,
+      projectId,
       providerSpecificData: incomingPsd,
+      rateLimitOverrides,
     } = body;
 
-    const existing = await getProviderConnectionById(id);
+    const existing = (await getCachedProviderConnectionById(id)) as Record<string, any> | null;
     if (!existing) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 });
     }
+    const retirementResponse = rejectRetiredCommonChatGptWebProvider(existing.provider);
+    if (retirementResponse) return retirementResponse;
 
     const updateData: Record<string, any> = {};
     if (name !== undefined) updateData.name = name;
@@ -138,7 +179,57 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
     if (globalPriority !== undefined) updateData.globalPriority = globalPriority;
     if (defaultModel !== undefined) updateData.defaultModel = defaultModel;
     if (isActive !== undefined) updateData.isActive = isActive;
-    if (apiKey && existing.authType === "apikey") updateData.apiKey = apiKey;
+    if (apiKey && canUpdateProviderApiKey(existing.authType, existing.provider)) {
+      if (existing.provider === "chatgpt-web-codex") {
+        const validationId =
+          incomingPsd && typeof incomingPsd.validationId === "string"
+            ? incomingPsd.validationId
+            : "";
+        try {
+          const {
+            finalizeValidatedChatGptWebCodexSecrets,
+            decodeChatGptWebCodexSecrets,
+            encodeChatGptWebCodexSecrets,
+          } = await import("@omniroute/open-sse/services/chatgptWebCodexAdmin.ts");
+          const incomingSecrets = decodeChatGptWebCodexSecrets(apiKey);
+          const existingSecrets = decodeChatGptWebCodexSecrets(existing.apiKey || "");
+          const encoded = encodeChatGptWebCodexSecrets({
+            cookie: incomingSecrets.cookie,
+            runtimeKey: incomingSecrets.runtimeKey || existingSecrets.runtimeKey,
+          });
+          updateData.apiKey = finalizeValidatedChatGptWebCodexSecrets(
+            encoded,
+            validationId
+          ).encodedCredential;
+        } catch (error) {
+          return NextResponse.json(
+            {
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Die ChatGPT-Browserprüfung konnte nicht abgeschlossen werden.",
+            },
+            { status: 400 }
+          );
+        }
+      } else if (existing.provider === "chatgpt-web") {
+        try {
+          JSON.parse(apiKey);
+          updateData.apiKey = apiKey;
+        } catch {
+          try {
+            updateData.apiKey = JSON.stringify(chatGptWebStorageStateFromCookieHeader(apiKey));
+          } catch {
+            return NextResponse.json(
+              { error: "ChatGPT Web storage state JSON or Cookie header is invalid" },
+              { status: 400 }
+            );
+          }
+        }
+      } else {
+        updateData.apiKey = apiKey;
+      }
+    }
     if (testStatus !== undefined) updateData.testStatus = testStatus;
     if (lastError !== undefined) updateData.lastError = lastError;
     if (lastErrorAt !== undefined) updateData.lastErrorAt = lastErrorAt;
@@ -146,8 +237,46 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
     if (lastErrorSource !== undefined) updateData.lastErrorSource = lastErrorSource;
     if (errorCode !== undefined) updateData.errorCode = errorCode;
     if (rateLimitedUntil !== undefined) updateData.rateLimitedUntil = rateLimitedUntil;
+    // Clearing the cooldown by hand also forgets the refusal streak (#12859).
+    if (rateLimitedUntil === null || testStatus === "active") clearRequestRejectedStreak(id);
     if (lastTested !== undefined) updateData.lastTested = lastTested;
-    if (healthCheckInterval !== undefined) updateData.healthCheckInterval = healthCheckInterval;
+    // healthCheckInterval PATCH semantics: undefined = leave as-is; null = clear
+    // the override (connection follows the global default); 0-1440 = explicit
+    // per-connection minutes (0 opts this connection out of the sweep).
+    if (healthCheckInterval === null) updateData.healthCheckInterval = null;
+    else if (healthCheckInterval !== undefined)
+      updateData.healthCheckInterval = healthCheckInterval;
+    if (group !== undefined) updateData.group = group;
+    if (maxConcurrent !== undefined) updateData.maxConcurrent = maxConcurrent;
+    if (incomingWindowThresholds !== undefined) {
+      // PATCH semantics:
+      //   • null            → clear every per-window override on this connection
+      //   • {} (empty map)  → no-op (no keys to merge); existing overrides preserved
+      //   • partial map     → merge into the existing map; a `null` value at any
+      //                        key clears just that window's override
+      if (incomingWindowThresholds === null) {
+        updateData.quotaWindowThresholds = null;
+      } else {
+        const existingMap =
+          existing.quotaWindowThresholds && typeof existing.quotaWindowThresholds === "object"
+            ? { ...(existing.quotaWindowThresholds as Record<string, number>) }
+            : {};
+        for (const [window, value] of Object.entries(incomingWindowThresholds)) {
+          if (value === null) {
+            delete existingMap[window];
+          } else if (typeof value === "number") {
+            existingMap[window] = value;
+          }
+        }
+        updateData.quotaWindowThresholds =
+          Object.keys(existingMap).length === 0 ? null : existingMap;
+      }
+    }
+    if (projectId !== undefined) updateData.projectId = projectId;
+    if (rateLimitOverrides !== undefined) updateData.rateLimitOverrides = rateLimitOverrides;
+    if (proxyEnabled !== undefined) updateData.proxyEnabled = proxyEnabled;
+    if (perKeyProxyEnabled !== undefined) updateData.perKeyProxyEnabled = perKeyProxyEnabled;
+    if (quotaVisible !== undefined) updateData.quotaVisible = quotaVisible;
 
     // Merge providerSpecificData (partial update — preserve existing keys not sent by caller)
     if (incomingPsd !== undefined && incomingPsd !== null && typeof incomingPsd === "object") {
@@ -156,6 +285,8 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
           ? existing.providerSpecificData
           : {};
       const mergedPsd = { ...existingPsd, ...incomingPsd };
+      delete mergedPsd.validationId;
+      delete mergedPsd.runtimeKey;
 
       // Deep-merge and normalize Codex limit policy defaults.
       if (existing.provider === "codex") {
@@ -170,6 +301,57 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
 
       updateData.providerSpecificData =
         normalizeProviderSpecificData(existing.provider, mergedPsd) || {};
+
+      const psd = updateData.providerSpecificData as Record<string, any>;
+      if (psd.apiKeyHealth) {
+        const health = psd.apiKeyHealth as Record<string, any>;
+
+        // If the primary API key was explicitly replaced in this request,
+        // clear stale health.primary — it no longer corresponds to the
+        // current key. The next health check will regenerate it.
+        if (updateData.apiKey !== undefined && updateData.apiKey !== existing.apiKey) {
+          delete health.primary;
+        }
+
+        // Stale primary guard: no valid primary key → no primary health.
+        const currentApiKey = updateData.apiKey ?? existing.apiKey ?? null;
+        if (typeof currentApiKey !== "string" || currentApiKey.length === 0) {
+          delete health.primary;
+        }
+
+        // Detect whether the extras list was explicitly changed by the caller.
+        // The index-based mapping (extra_0, extra_1, …) drifts when a key is
+        // inserted or removed mid-list, so we clear ALL extra health entries
+        // when the list actually changes and let the next health check regen.
+        const existingExtras = existingPsd.extraApiKeys;
+        const incomingExtras = incomingPsd?.extraApiKeys;
+        const extrasChanged =
+          Array.isArray(incomingExtras) &&
+          (!Array.isArray(existingExtras) ||
+            existingExtras.length !== incomingExtras.length ||
+            existingExtras.some((v: string, i: number) => v !== incomingExtras[i]));
+
+        const extras = psd.extraApiKeys;
+        const maxExtraIdx = Array.isArray(extras) ? extras.length : 0;
+        for (const key of Object.keys(health)) {
+          if (key.startsWith("extra_")) {
+            if (extrasChanged) {
+              // Extras modified — index drift possible. Clear all to be safe.
+              delete health[key];
+            } else {
+              // Extras unchanged: only clean out-of-range indices.
+              const idx = parseInt(key.slice(6), 10);
+              if (isNaN(idx) || idx >= maxExtraIdx) {
+                delete health[key];
+              }
+            }
+          }
+        }
+
+        if (Object.keys(health).length === 0) {
+          delete psd.apiKeyHealth;
+        }
+      }
 
       if (!isClaudeExtraUsageBlockEnabled(existing.provider, updateData.providerSpecificData)) {
         const clearExtraUsageUpdate = buildClaudeExtraUsageStateClearUpdate({
@@ -189,7 +371,37 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       }
     }
 
+    // Fields the caller changed, for the audit trail. Captured before the
+    // operator-intent marker below, which is bookkeeping for isActive and not a
+    // providerSpecificData edit by the caller.
+    const changedFields = Object.keys(updateData);
+
+    // Record the operator's explicit on/off intent so automated activation paths
+    // (the connection test) do not turn a deliberately disabled connection back on.
+    if (typeof isActive === "boolean") {
+      updateData.providerSpecificData = applyOperatorActivationIntent(
+        updateData.providerSpecificData ?? existing.providerSpecificData,
+        isActive
+      );
+    }
+
     const updated = await updateProviderConnection(id, updateData);
+
+    // If rateLimitOverrides was included in the request, refresh the in-memory
+    // rate limiter state so the change takes effect without a server restart.
+    // Only (re)enable enforcement when rate limit protection is actually
+    // persisted for this connection — this route never lets a caller flip
+    // `rateLimitProtection` itself, so any drift here would silently start
+    // queuing requests through Bottleneck for a connection whose DB row (and
+    // the dashboard toggle reading it) both still say "off" (#11278).
+    if (rateLimitOverrides !== undefined) {
+      refreshConnectionRateLimits(id, updated?.rateLimitOverrides ?? null);
+      if (updated?.rateLimitProtection === true) {
+        enableRateLimitProtection(id);
+      } else {
+        disableRateLimitProtection(id);
+      }
+    }
 
     // Hide sensitive fields
     const result: Record<string, any> = { ...updated };
@@ -216,7 +428,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       requestId: auditContext.requestId,
       metadata: {
         provider: existing.provider,
-        changedFields: Object.keys(updateData),
+        changedFields,
         before: summarizeProviderConnectionForAudit(existing),
         after: summarizeProviderConnectionForAudit(updated),
       },
@@ -227,6 +439,15 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
     console.log("Error updating connection:", error);
     return NextResponse.json({ error: "Failed to update connection" }, { status: 500 });
   }
+}
+
+// PATCH /api/providers/[id] - Update connection (partial)
+// The OpenAPI spec and the CLI (`omniroute providers rotate`, generated
+// api-commands) both use PATCH, but only PUT was implemented — PATCH requests
+// 405'd. PATCH and PUT share the same update semantics here (the schema only
+// applies provided fields), so delegate to the PUT handler.
+export async function PATCH(request: Request, ctx: { params: Promise<{ id: string }> }) {
+  return PUT(request, ctx);
 }
 
 // DELETE /api/providers/[id] - Delete connection
@@ -240,7 +461,7 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
     const { id } = await params;
 
     // Fetch connection before deleting to check provider type
-    const connection = await getProviderConnectionById(id);
+    const connection = (await getCachedProviderConnectionById(id)) as Record<string, any> | null;
     if (!connection) {
       return NextResponse.json({ error: "Connection not found" }, { status: 404 });
     }
@@ -250,15 +471,12 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       return NextResponse.json({ error: "Connection not found" }, { status: 404 });
     }
 
-    // Clean up synced available models for this connection
+    // Remove this connection's synced models. Provider-level imported models
+    // are removed only when this was the provider's final connection.
     try {
-      const { deleteSyncedAvailableModelsForConnection } = await import("@/lib/db/models");
-      await deleteSyncedAvailableModelsForConnection(connection.provider, id);
+      await cleanupProviderModelsAfterConnectionDelete(connection.provider, id);
     } catch (e) {
-      console.error(
-        `Failed to clean up synced models for deleted ${connection.provider} connection:`,
-        e
-      );
+      console.error(`Failed to clean up models for deleted ${connection.provider} connection:`, e);
     }
 
     // Auto sync to Cloud if enabled

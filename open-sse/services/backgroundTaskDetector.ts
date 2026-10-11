@@ -45,32 +45,49 @@ const DEFAULT_DETECTION_PATTERNS = [
   "label this",
 ];
 
+// Every source and target must be absent from the retired-id snapshot: a retired source is
+// a dead row (checkLifecycle answers 410 before the redirect runs), while a retired target
+// is normally rejected with 410 when lifecycle validation runs again after the redirect
+// (unless alias resolution maps it to an accepted id). `npm run check:model-lifecycle`
+// diffs this map against config/quality/model-lifecycle.json.
 const DEFAULT_DEGRADATION_MAP: Record<string, string> = {
   // Premium → Cheap alternatives
   "claude-opus-4-6": "gemini-3-flash",
   "claude-opus-4-6-thinking": "gemini-3-flash",
   "claude-opus-4-5-20251101": "gemini-3-flash",
   "claude-sonnet-4-5-20250929": "gemini-3-flash",
-  "claude-sonnet-4-20250514": "gemini-3-flash",
   "claude-sonnet-4": "gemini-3-flash",
   "gemini-3.1-pro": "gemini-3-flash",
   "gemini-3.1-pro-high": "gemini-3-flash",
-  "gemini-3-pro-preview": "gemini-3-flash-preview",
   "gemini-2.5-pro": "gemini-3-flash",
   "gpt-4o": "gpt-4o-mini",
   "gpt-5": "gpt-5-mini",
   "gpt-5.1": "gpt-5-mini",
-  "gpt-5.1-codex": "gpt-5.1-codex-mini",
 };
 
 // ── State ───────────────────────────────────────────────────────────────────
 
-let _config: DegradationConfig = {
-  enabled: false, // Disabled by default — user must opt in
-  degradationMap: { ...DEFAULT_DEGRADATION_MAP },
-  detectionPatterns: [...DEFAULT_DETECTION_PATTERNS],
-  stats: { detected: 0, tokensSaved: 0 },
-};
+// Backed by globalThis so the singleton is shared across the SEPARATE webpack
+// module graphs Next.js builds for `instrumentation.ts` (boot-time hydration via
+// applyRuntimeSettings → setBackgroundDegradationConfig) and the app-route /
+// open-sse executors (per-request reads in the chat handler). A module-local `let`
+// is duplicated per graph, so the operator's opt-in (`enabled:true`) applied at boot
+// never reaches the request path — the degradation silently never fires (the
+// #5312-class module-graph bug). Mirrors systemPrompt.ts (#2470) and thinkingBudget.ts.
+const GLOBAL_KEY = "__omniroute_backgroundDegradation_config__";
+const _store = globalThis as unknown as Record<string, DegradationConfig | undefined>;
+
+function getConfig(): DegradationConfig {
+  if (!_store[GLOBAL_KEY]) {
+    _store[GLOBAL_KEY] = {
+      enabled: false, // Disabled by default — user must opt in
+      degradationMap: { ...DEFAULT_DEGRADATION_MAP },
+      detectionPatterns: [...DEFAULT_DETECTION_PATTERNS],
+      stats: { detected: 0, tokensSaved: 0 },
+    };
+  }
+  return _store[GLOBAL_KEY]!;
+}
 
 // ── Config Management ───────────────────────────────────────────────────────
 
@@ -78,10 +95,10 @@ let _config: DegradationConfig = {
  * Set the background degradation config (called from settings API or startup).
  */
 export function setBackgroundDegradationConfig(config: Partial<DegradationConfig>): void {
-  _config = {
-    ..._config,
+  _store[GLOBAL_KEY] = {
+    ...getConfig(),
     ...config,
-    stats: _config.stats, // preserve stats across config changes
+    stats: getConfig().stats, // preserve stats across config changes
   };
 }
 
@@ -90,10 +107,10 @@ export function setBackgroundDegradationConfig(config: Partial<DegradationConfig
  */
 export function getBackgroundDegradationConfig(): DegradationConfig {
   return {
-    ..._config,
-    degradationMap: { ..._config.degradationMap },
-    detectionPatterns: [..._config.detectionPatterns],
-    stats: { ..._config.stats },
+    ...getConfig(),
+    degradationMap: { ...getConfig().degradationMap },
+    detectionPatterns: [...getConfig().detectionPatterns],
+    stats: { ...getConfig().stats },
   };
 }
 
@@ -101,7 +118,7 @@ export function getBackgroundDegradationConfig(): DegradationConfig {
  * Reset stats counters.
  */
 export function resetStats(): void {
-  _config.stats = { detected: 0, tokensSaved: 0 };
+  getConfig().stats = { detected: 0, tokensSaved: 0 };
 }
 
 // ── Detection ───────────────────────────────────────────────────────────────
@@ -175,19 +192,35 @@ export function getBackgroundTaskReason(
   const messages = toMessageArray(typedBody.messages ?? typedBody.input ?? []);
   if (!Array.isArray(messages) || messages.length === 0) return null;
 
-  // Find system message
+  // Derive system content from messages array (OpenAI format) or top-level
+  // system field (Anthropic format).
   const systemMsg = messages.find(
     (message: BackgroundMessage) => message.role === "system" || message.role === "developer"
   );
-  if (!systemMsg) return null;
-
-  const systemContent =
-    typeof systemMsg.content === "string" ? systemMsg.content.toLowerCase() : "";
-
+  let systemContent = "";
+  if (systemMsg && typeof systemMsg.content === "string") {
+    systemContent = systemMsg.content.toLowerCase();
+  } else if (!systemMsg) {
+    // Anthropic top-level system field: string or array of text blocks
+    const raw = (typedBody as Record<string, unknown>).system;
+    if (typeof raw === "string") {
+      systemContent = raw.toLowerCase();
+    } else if (Array.isArray(raw)) {
+      systemContent = raw
+        .map((part) =>
+          part && typeof (part as { text?: unknown }).text === "string"
+            ? (part as { text: string }).text
+            : ""
+        )
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+    }
+  }
   if (!systemContent) return null;
 
   // Check against detection patterns
-  const matched = _config.detectionPatterns.some((pattern) =>
+  const matched = getConfig().detectionPatterns.some((pattern) =>
     systemContent.includes(pattern.toLowerCase())
   );
 
@@ -224,9 +257,9 @@ export function isBackgroundTask(
 export function getDegradedModel(originalModel: string): string {
   if (!originalModel) return originalModel;
 
-  const degraded = _config.degradationMap[originalModel];
+  const degraded = getConfig().degradationMap[originalModel];
   if (degraded) {
-    _config.stats.detected++;
+    getConfig().stats.detected++;
     return degraded;
   }
 

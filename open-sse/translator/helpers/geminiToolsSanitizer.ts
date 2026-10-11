@@ -25,6 +25,29 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Gemini/Vertex requires every functionDeclaration.parameters to be an OBJECT-typed schema
+ * (#3357: "functionDeclaration parameters schema should be of type OBJECT"). Some clients
+ * (e.g. GitHub Copilot's `terminal_last_command`) send a `parameters` that is present but
+ * lacks a top-level `type: "object"` — just `{ properties }`, a scalar/array type, or `{}`.
+ * Coerce the parameters root to an object schema before it is cleaned; a falsy/non-record
+ * schema becomes an empty object schema. Only the top level is touched — nested property
+ * schemas are left to cleanJSONSchemaForAntigravity.
+ */
+function toGeminiParametersSchema(raw: unknown): Record<string, unknown> {
+  if (!isRecord(raw)) {
+    return { type: "object", properties: {} };
+  }
+  if (raw.type === "object") {
+    return raw;
+  }
+  return {
+    ...raw,
+    type: "object",
+    properties: isRecord(raw.properties) ? raw.properties : {},
+  };
+}
+
 function normalizeGeminiToolName(
   name: string,
   options: GeminiToolSanitizationOptions = {}
@@ -37,10 +60,21 @@ function normalizeGeminiToolName(
         return namespaceIndex >= 0 ? trimmed.slice(namespaceIndex + 1) : trimmed;
       })();
 
-  return namespaceStripped
-    .replace(/[^a-zA-Z0-9_]/g, "_")
-    .replace(/_+/g, "_")
-    .replace(/^_+|_+$/g, "");
+  return (
+    namespaceStripped
+      .replace(/[^a-zA-Z0-9_]/g, "_")
+      .replace(/_+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      // Google rejects the WHOLE GenerateContentRequest when any one
+      // functionDeclaration name fails its grammar, and that grammar requires a
+      // letter or an underscore first. The strip above has just removed any
+      // leading underscore, so a name like `1c_plugin_reload` reached Google
+      // unchanged and took the other 108 tools down with it (#13715). Prefixing
+      // here rather than at the call site keeps the guarantee on the one value
+      // every path reads: the length cap and the collision hash both build on
+      // this string, and a hashed name inherits its first character from it.
+      .replace(/^(\d)/, "t$1")
+  );
 }
 
 function buildHashedGeminiToolName(
@@ -152,6 +186,10 @@ export function buildGeminiTools(
   }
 
   const functionDeclarations: GeminiFunctionDeclaration[] = [];
+  // Track sanitized names already added to prevent Gemini rejection from duplicate
+  // function declaration names (two different raw names that collapse to the same
+  // sanitized form, or the same raw name repeated across tool groups).
+  const seenToolNames = new Set<string>();
   let googleSearchTool: GeminiTool | null = null;
 
   for (const rawTool of tools) {
@@ -171,25 +209,28 @@ export function buildGeminiTools(
           continue;
         }
 
+        const sanitizedName = sanitizeGeminiToolName(fn.name, options);
+        if (seenToolNames.has(sanitizedName)) continue;
+        seenToolNames.add(sanitizedName);
         functionDeclarations.push({
-          name: sanitizeGeminiToolName(fn.name, options),
+          name: sanitizedName,
           description: typeof fn.description === "string" ? fn.description : "",
-          parameters: cleanJSONSchemaForAntigravity(
-            fn.parameters || { type: "object", properties: {} }
-          ),
+          parameters: cleanJSONSchemaForAntigravity(toGeminiParametersSchema(fn.parameters)),
         });
       }
       continue;
     }
 
     if (typeof rawTool.name === "string" && rawTool.name.trim()) {
-      functionDeclarations.push({
-        name: sanitizeGeminiToolName(rawTool.name, options),
-        description: typeof rawTool.description === "string" ? rawTool.description : "",
-        parameters: cleanJSONSchemaForAntigravity(
-          rawTool.input_schema || { type: "object", properties: {} }
-        ),
-      });
+      const sanitizedName = sanitizeGeminiToolName(rawTool.name, options);
+      if (!seenToolNames.has(sanitizedName)) {
+        seenToolNames.add(sanitizedName);
+        functionDeclarations.push({
+          name: sanitizedName,
+          description: typeof rawTool.description === "string" ? rawTool.description : "",
+          parameters: cleanJSONSchemaForAntigravity(toGeminiParametersSchema(rawTool.input_schema)),
+        });
+      }
       continue;
     }
 
@@ -199,29 +240,27 @@ export function buildGeminiTools(
         continue;
       }
 
-      functionDeclarations.push({
-        name: sanitizeGeminiToolName(fn.name, options),
-        description: typeof fn.description === "string" ? fn.description : "",
-        parameters: cleanJSONSchemaForAntigravity(
-          fn.parameters || { type: "object", properties: {} }
-        ),
-      });
+      const sanitizedName = sanitizeGeminiToolName(fn.name, options);
+      if (!seenToolNames.has(sanitizedName)) {
+        seenToolNames.add(sanitizedName);
+        functionDeclarations.push({
+          name: sanitizedName,
+          description: typeof fn.description === "string" ? fn.description : "",
+          parameters: cleanJSONSchemaForAntigravity(toGeminiParametersSchema(fn.parameters)),
+        });
+      }
     }
   }
 
-  if (googleSearchTool && functionDeclarations.length > 0) {
-    console.warn(
-      `[GeminiTools] Removing ${functionDeclarations.length} functionDeclarations because googleSearch cannot be mixed with Gemini function tools`
-    );
-  }
+  const result: GeminiTool[] = [];
 
   if (googleSearchTool) {
     return [googleSearchTool];
   }
 
   if (functionDeclarations.length > 0) {
-    return [{ functionDeclarations }];
+    result.push({ functionDeclarations });
   }
 
-  return undefined;
+  return result.length > 0 ? result : undefined;
 }

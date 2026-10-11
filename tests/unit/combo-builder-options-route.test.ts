@@ -16,7 +16,7 @@ const route = await import("../../src/app/api/combos/builder/options/route.ts");
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -51,14 +51,15 @@ test.beforeEach(async () => {
 
 test.after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("combo builder options route aggregates providers, connections, models and combo refs", async () => {
   const nowPlusMinute = Date.now() + 60_000;
+  // gpt-4o was removed from the openai registry; use gpt-4.1 (confirmed at providerRegistry.ts:1156)
   modelsDevSync.saveModelsDevCapabilities({
     openai: {
-      "gpt-4o": {
+      "gpt-4.1": {
         tool_call: true,
         reasoning: false,
         attachment: true,
@@ -67,14 +68,14 @@ test("combo builder options route aggregates providers, connections, models and 
         modalities_input: JSON.stringify(["text", "image"]),
         modalities_output: JSON.stringify(["text"]),
         knowledge_cutoff: "2024-10",
-        release_date: "2024-05-13",
+        release_date: "2024-04-14",
         last_updated: "2024-10-01",
         status: "stable",
         family: "gpt-4",
         open_weights: false,
-        limit_context: 128000,
-        limit_input: 128000,
-        limit_output: 16384,
+        limit_context: 1047576,
+        limit_input: 1047576,
+        limit_output: 32768,
         interleaved_field: null,
       },
     },
@@ -83,7 +84,7 @@ test("combo builder options route aggregates providers, connections, models and 
   await seedConnection("openai", {
     name: "OpenAI Primary",
     priority: 2,
-    defaultModel: "gpt-4o",
+    defaultModel: "gpt-4.1",
   });
   await seedConnection("openai", {
     authType: "oauth",
@@ -102,10 +103,13 @@ test("combo builder options route aggregates providers, connections, models and 
   });
 
   await modelsDb.addCustomModel("openai", "custom-ops", "Custom Ops");
+  await modelsDb.addCustomModel("openai", "gpt-4.1", "Operator GPT");
+  // #6975: embeddings-only models (supportedEndpoints without "chat") are no longer
+  // dropped from the combo builder — they must appear like any other model.
   await modelsDb.addCustomModel(
     "openai",
-    "text-embedding-hidden",
-    "Hidden Embedding",
+    "text-embedding-visible",
+    "Text Embedding",
     "manual",
     "chat-completions",
     ["embeddings"]
@@ -115,12 +119,12 @@ test("combo builder options route aggregates providers, connections, models and 
   const visibleCombo = await combosDb.createCombo({
     name: "team-router",
     strategy: "priority",
-    models: ["openai/gpt-4o"],
+    models: ["openai/gpt-4.1"],
   });
   await combosDb.createCombo({
     name: "hidden-router",
     strategy: "priority",
-    models: ["openai/gpt-4o"],
+    models: ["openai/gpt-4.1"],
     isHidden: true,
   });
 
@@ -139,17 +143,21 @@ test("combo builder options route aggregates providers, connections, models and 
   assert.equal(openai.displayName, "OpenAI");
   assert.equal(openai.connectionCount, 2);
   assert.equal(openai.activeConnectionCount, 1);
-  assert.ok(openai.models.some((model) => model.id === "gpt-4o"));
-  assert.equal(openai.models.find((model) => model.id === "gpt-4o").outputTokenLimit, 16384);
-  assert.equal(openai.models.find((model) => model.id === "gpt-4o").supportsThinking, false);
+  const sharedModel = openai.models.find((model) => model.id === "gpt-4.1");
+  assert.ok(sharedModel);
+  assert.equal(sharedModel.name, "Operator GPT");
+  assert.equal(sharedModel.contextLength, 1047576);
+  assert.equal(sharedModel.outputTokenLimit, 32768);
+  assert.equal(sharedModel.supportsThinking, false);
   assert.equal(
     openai.models.some((model) => model.id === "gpt-4o-mini"),
     false
   );
   assert.ok(openai.models.some((model) => model.id === "custom-ops"));
+  // #6975: embeddings-only models must now appear in the combo builder output.
   assert.equal(
-    openai.models.some((model) => model.id === "text-embedding-hidden"),
-    false
+    openai.models.some((model) => model.id === "text-embedding-visible"),
+    true
   );
   assert.deepEqual(
     openai.connections.map((connection) => ({
@@ -193,6 +201,30 @@ test("combo builder options route aggregates providers, connections, models and 
   );
 });
 
+test("combo builder options route includes no-auth provider (opencode) even without provider_connections rows", async () => {
+  // No connections seeded — opencode has noAuth: true and never gets a provider_connections row.
+  const response = await route.GET();
+  const body = (await response.json()) as any;
+
+  assert.equal(response.status, 200);
+  assert.ok(Array.isArray(body.providers), "providers should be an array");
+
+  const opencode = body.providers.find((p: any) => p.providerId === "opencode");
+  assert.ok(opencode, "opencode should appear in combo builder options even without connections");
+  assert.equal(opencode.connectionCount, 0, "opencode should have 0 connections");
+  assert.equal(opencode.activeConnectionCount, 0, "opencode should have 0 active connections");
+  assert.ok(opencode.models.length > 0, "opencode should expose its built-in models");
+  // Spot-check a known built-in model from providerRegistry.ts
+  assert.ok(
+    opencode.models.some((m: any) => m.id === "big-pickle"),
+    "big-pickle should be among opencode models"
+  );
+  // #2901: no-auth opencode routes under its alias "oc/" (the bare "opencode/"
+  // prefix misroutes to the opencode-zen api-key tier via ALIAS_TO_PROVIDER_ID).
+  assert.equal(opencode.models[0].qualifiedModel.startsWith("oc/"), true);
+  assert.equal(opencode.source, "system", "opencode should have source=system");
+});
+
 test("combo builder options route exposes compatible provider nodes with node metadata", async () => {
   await providersDb.createProviderNode({
     id: "openai-compatible-demo",
@@ -224,5 +256,9 @@ test("combo builder options route exposes compatible provider nodes with node me
   assert.equal(provider.source, "provider-node");
   assert.equal(provider.acceptsArbitraryModel, true);
   assert.ok(provider.models.some((model) => model.id === "gpt-custom"));
-  assert.equal(provider.models[0].qualifiedModel, "openai-compatible-demo/gpt-custom");
+  // #14135/#14143: when a provider node declares a routing prefix, qualifiedModel must
+  // carry that prefix, not the internal node id — `parseModel()` only resolves the alias.
+  // Asserted against the node's own prefix so the pair cannot drift apart again.
+  assert.equal(provider.models[0].qualifiedModel, `${provider.prefix}/gpt-custom`);
+  assert.equal(provider.models[0].qualifiedModel, "gd/gpt-custom");
 });

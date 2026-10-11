@@ -38,13 +38,14 @@ function writeJson(filePath, value) {
 
 function removePath(targetPath) {
   if (!targetPath) return;
-  fs.rmSync(targetPath, { recursive: true, force: true });
+  fs.rmSync(targetPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
 function resetDbTables() {
   const db = getDbInstance();
   db.prepare("DELETE FROM usage_history").run();
   db.prepare("DELETE FROM call_logs").run();
+  db.prepare("DELETE FROM provider_connections").run();
 }
 
 function readJson(filePath) {
@@ -139,7 +140,22 @@ test("migrateLegacyUsageFiles copies legacy JSON files once and does not overwri
   assert.deepEqual(readJson(CALL_LOGS_JSON_FILE), { logs: [{ id: "current-call" }] });
 });
 
-test("migrateUsageJsonToSqlite migrates usage history aliases and TTFT fallbacks", () => {
+test("migrateUsageJsonToSqlite migrates usage history aliases, TTFT, and account snapshots", () => {
+  const db = getDbInstance();
+  db.prepare(
+    `INSERT INTO provider_connections
+      (id, provider, auth_type, email, provider_specific_data, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    "conn-openai",
+    "openai",
+    "oauth",
+    "member@example.com",
+    JSON.stringify({ username: "member" }),
+    "2026-01-01T00:00:00.000Z",
+    "2026-01-01T00:00:00.000Z"
+  );
+
   writeJson(USAGE_JSON_FILE, {
     history: [
       {
@@ -182,24 +198,28 @@ test("migrateUsageJsonToSqlite migrates usage history aliases and TTFT fallbacks
 
   assert.equal(fs.existsSync(`${USAGE_JSON_FILE}.migrated`), true);
 
-  const db = getDbInstance();
   const rows = db
     .prepare(
       `
-        SELECT provider, model, connection_id, api_key_id, api_key_name,
-               tokens_input, tokens_output, tokens_cache_read, tokens_cache_creation,
-               tokens_reasoning, status, success, latency_ms, ttft_ms, error_code
+        SELECT provider, model, connection_id, account_key, account_label,
+               account_label_priority, api_key_id, api_key_name, tokens_input, tokens_output,
+               tokens_cache_read, tokens_cache_creation, tokens_reasoning, status, success,
+               latency_ms, ttft_ms, error_code
         FROM usage_history
         ORDER BY timestamp ASC
       `
     )
-    .all();
+    .all()
+    .map((row) => ({ ...row }));
 
   assert.deepEqual(rows, [
     {
       provider: "openai",
       model: "gpt-4o-mini",
       connection_id: "conn-openai",
+      account_key: '["oauth","openai","email","member@example.com","username","member"]',
+      account_label: "member@example.com",
+      account_label_priority: 3,
       api_key_id: "key-1",
       api_key_name: "Primary Key",
       tokens_input: 11,
@@ -217,6 +237,9 @@ test("migrateUsageJsonToSqlite migrates usage history aliases and TTFT fallbacks
       provider: "gemini",
       model: "gemini-2.5-flash",
       connection_id: null,
+      account_key: '["connection","gemini","unknown"]',
+      account_label: "unknown",
+      account_label_priority: 0,
       api_key_id: null,
       api_key_name: null,
       tokens_input: 9,
@@ -287,20 +310,23 @@ test("migrateUsageJsonToSqlite migrates call logs to summary rows and ignores du
     .all();
 
   assert.equal(rows.length, 2);
-  assert.deepEqual(rows[0], {
-    id: "call-1",
-    method: "GET",
-    path: "/v1/chat/completions",
-    status: 201,
-    provider: "openai",
-    account: "acct-a",
-    connection_id: "conn-a",
-    detail_state: "ready",
-    artifact_relpath: (rows[0] as any).artifact_relpath,
-    has_request_body: 1,
-    has_response_body: 1,
-    error_summary: "bad upstream",
-  });
+  assert.deepEqual(
+    { ...rows[0] },
+    {
+      id: "call-1",
+      method: "GET",
+      path: "/v1/chat/completions",
+      status: 201,
+      provider: "openai",
+      account: "acct-a",
+      connection_id: "conn-a",
+      detail_state: "ready",
+      artifact_relpath: (rows[0] as any).artifact_relpath,
+      has_request_body: 1,
+      has_response_body: 1,
+      error_summary: "bad upstream",
+    }
+  );
   assert.equal(typeof rows[0].artifact_relpath, "string");
   assert.equal((rows[1] as any).id.length > 0, true);
   assert.equal((rows[1] as any).method, "POST");

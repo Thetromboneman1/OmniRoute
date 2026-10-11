@@ -24,8 +24,26 @@ describe("Phase 3 — AggressiveConfig types", () => {
   });
 
   it("CompressionMode includes all expected values", () => {
-    const modes: CompressionMode[] = ["off", "lite", "standard", "aggressive", "ultra"];
-    assert.deepEqual(modes, ["off", "lite", "standard", "aggressive", "ultra"]);
+    const modes: CompressionMode[] = [
+      "off",
+      "lite",
+      "standard",
+      "aggressive",
+      "ultra",
+      "rtk",
+      "codex-responses",
+      "stacked",
+    ];
+    assert.deepEqual(modes, [
+      "off",
+      "lite",
+      "standard",
+      "aggressive",
+      "ultra",
+      "rtk",
+      "codex-responses",
+      "stacked",
+    ]);
   });
 
   it("DEFAULT_AGGRESSIVE_CONFIG has correct threshold defaults", () => {

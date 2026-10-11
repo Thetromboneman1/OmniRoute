@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import {
+  deleteModelAliasesForProvider,
   deleteProviderConnectionsByProvider,
   deleteProviderNode,
   getProviderConnections,
@@ -10,6 +11,7 @@ import {
 import { isClaudeCodeCompatibleProvider } from "@/shared/constants/providers";
 import { updateProviderNodeSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
+import { validateProviderNodeBaseUrl } from "../urlGuard";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -33,7 +35,7 @@ function sanitizeClaudeCodeCompatibleBaseUrl(baseUrl: string) {
 
 // PUT /api/provider-nodes/[id] - Update provider node
 export async function PUT(request: Request, { params }: { params: Promise<{ id: string }> }) {
-  let rawBody;
+  let rawBody: unknown;
   try {
     rawBody = await request.json();
   } catch {
@@ -54,7 +56,8 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
-    const { name, prefix, apiType, baseUrl, chatPath, modelsPath } = validation.data;
+    const { name, prefix, apiType, baseUrl, chatPath, modelsPath, customHeaders, iconUrl, dailyQuotaResetTimezone, dailyQuotaResetHour } =
+      validation.data;
     const node: any = await getProviderNodeById(id);
 
     if (!node) {
@@ -82,6 +85,8 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
         ? sanitizeClaudeCodeCompatibleBaseUrl(sanitizedBaseUrl)
         : sanitizeAnthropicBaseUrl(sanitizedBaseUrl);
     }
+    const baseUrlError = validateProviderNodeBaseUrl(sanitizedBaseUrl);
+    if (baseUrlError) return baseUrlError;
 
     const updates: Record<string, unknown> = {
       name: name.trim(),
@@ -89,6 +94,13 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
       baseUrl: sanitizedBaseUrl,
       chatPath: chatPath || null,
       modelsPath: isClaudeCodeCompatibleProvider(id) ? null : modelsPath || null,
+      // #2166: explicit null (not omission) so an empty submission clears a
+      // previously stored custom icon.
+      iconUrl: iconUrl?.trim() || null,
+      customHeaders: customHeaders || null,
+      dailyQuotaResetTimezone: dailyQuotaResetTimezone?.trim() || null,
+      dailyQuotaResetHour:
+        dailyQuotaResetHour === 0 || dailyQuotaResetHour != null ? dailyQuotaResetHour : null,
     };
 
     if (node.type === "openai-compatible") {
@@ -96,6 +108,21 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
     }
 
     const updated = await updateProviderNode(id, updates);
+
+    try {
+      const { registerMoonshotFetchersForNodes } = await import(
+        "@omniroute/open-sse/services/moonshotQuotaFetcher.ts"
+      );
+      registerMoonshotFetchersForNodes([
+        {
+          id: typeof updated?.id === "string" ? updated.id : id,
+          prefix: prefix.trim(),
+          baseUrl: sanitizedBaseUrl,
+        },
+      ]);
+    } catch (error) {
+      console.warn("Moonshot fetcher re-register after node update skipped:", error);
+    }
 
     const connections = await getProviderConnections({ provider: id });
     await Promise.all(
@@ -110,6 +137,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
           baseUrl: sanitizedBaseUrl,
           nodeName: updated.name,
           chatPath: updated.chatPath || undefined,
+          customHeaders: updated.customHeaders || undefined,
         } as JsonRecord;
         if (updated.modelsPath) {
           providerSpecificData.modelsPath = updated.modelsPath;
@@ -136,7 +164,7 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
 }
 
 // DELETE /api/provider-nodes/[id] - Delete provider node and its connections
-export async function DELETE(request: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function DELETE(_request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params;
     const node = await getProviderNodeById(id);
@@ -147,6 +175,9 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
 
     await deleteProviderConnectionsByProvider(id);
     await deleteProviderNode(id);
+    // #1409: drop orphaned model-alias rows (key=<alias>, value="<providerId>/<model>")
+    // so re-importing the same provider isn't blocked by stale "already exists" aliases.
+    await deleteModelAliasesForProvider(id);
 
     return NextResponse.json({ success: true });
   } catch (error) {

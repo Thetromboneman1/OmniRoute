@@ -1,13 +1,18 @@
 import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
+import { initThinkState, applyThinkTag, flushThinkBuffer } from "../../utils/thinkTagParser.ts";
 
 type OpenAIUsage = {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  reasoning_tokens?: number;
   prompt_tokens_details?: {
     cached_tokens?: number;
     cache_creation_tokens?: number;
+  };
+  completion_tokens_details?: {
+    reasoning_tokens?: number;
   };
 };
 
@@ -40,6 +45,47 @@ export function claudeToOpenAIResponse(chunk, state) {
       state.messageId = chunk.message?.id || `msg_${Date.now()}`;
       state.model = chunk.message?.model;
       state.toolCallIndex = 0;
+      // #13558: MiniMax-M3's Anthropic-compatible endpoint puts its reasoning
+      // inline as <think>...</think> inside ordinary text/text_delta blocks
+      // instead of a structured thinking/thinking_delta block. Reuse the
+      // passthrough-mode think-tag parser here (gated the same way, by
+      // shouldParseTextualReasoningTags) so it strips <think> markup out of
+      // delta.content and re-emits it as delta.reasoning_content.
+      state.thinkState = initThinkState(true, state.provider, state.model);
+      const startUsage = chunk.message?.usage;
+      if (startUsage && typeof startUsage === "object") {
+        const inputTokens =
+          typeof startUsage.input_tokens === "number"
+            ? startUsage.input_tokens
+            : typeof startUsage.prompt_tokens === "number"
+              ? startUsage.prompt_tokens
+              : 0;
+        const outputTokens =
+          typeof startUsage.output_tokens === "number"
+            ? startUsage.output_tokens
+            : typeof startUsage.completion_tokens === "number"
+              ? startUsage.completion_tokens
+              : 0;
+        const cacheRead =
+          typeof startUsage.cache_read_input_tokens === "number"
+            ? startUsage.cache_read_input_tokens
+            : 0;
+        const cacheCreation =
+          typeof startUsage.cache_creation_input_tokens === "number"
+            ? startUsage.cache_creation_input_tokens
+            : 0;
+        if (inputTokens > 0 || outputTokens > 0 || cacheRead > 0 || cacheCreation > 0) {
+          const billableInputTokens = inputTokens + cacheRead;
+          state.usage = {
+            prompt_tokens: billableInputTokens,
+            completion_tokens: outputTokens,
+            input_tokens: billableInputTokens,
+            output_tokens: outputTokens,
+          };
+          if (cacheRead > 0) state.usage.cache_read_input_tokens = cacheRead;
+          if (cacheCreation > 0) state.usage.cache_creation_input_tokens = cacheCreation;
+        }
+      }
       results.push(createChunk(state, { role: "assistant" }));
       break;
     }
@@ -76,7 +122,28 @@ export function claudeToOpenAIResponse(chunk, state) {
     case "content_block_delta": {
       const delta = chunk.delta;
       if (delta?.type === "text_delta" && delta.text) {
-        results.push(createChunk(state, { content: delta.text }));
+        // Flush the deferred </think> close marker before the first text delta so
+        // clients like Claude Code / Cursor (that scan content for </think>) see it
+        // immediately before the assistant reply begins — but NOT in tool-use streams
+        // where no text_delta ever arrives (#5123).
+        if (state.pendingThinkClose) {
+          // Suppressed for clients that render the marker verbatim (#5245);
+          // still clear the flag so it never re-fires later in the stream.
+          if (!state.suppressThinkClose) {
+            results.push(createChunk(state, { content: "</think>" }));
+          }
+          state.pendingThinkClose = false;
+        }
+        const textDelta: { content: unknown; reasoning_content?: string } = {
+          content: delta.text,
+        };
+        if (state.thinkState) applyThinkTag(state.thinkState, textDelta);
+        if (textDelta.reasoning_content) {
+          results.push(createChunk(state, { reasoning_content: textDelta.reasoning_content }));
+        }
+        if (textDelta.content) {
+          results.push(createChunk(state, { content: textDelta.content }));
+        }
       } else if (delta?.type === "thinking_delta" && delta.thinking) {
         // Map Claude thinking_delta → OpenAI reasoning_content
         // Clients (Claude Code, Cursor, etc.) display reasoning_content as the thinking panel
@@ -101,9 +168,29 @@ export function claudeToOpenAIResponse(chunk, state) {
     }
 
     case "content_block_stop": {
+      // #13558: flush any <think>/reasoning text still buffered by the
+      // textual think-tag parser (e.g. a block that ends mid-tag, or a
+      // reasoning tail with no trailing visible content) before the block
+      // closes, so it is never silently dropped.
+      if (state.thinkState?.active) {
+        const flushed = flushThinkBuffer(state.thinkState);
+        if (flushed.reasoningDelta) {
+          results.push(createChunk(state, { reasoning_content: flushed.reasoningDelta }));
+        }
+        if (flushed.contentDelta) {
+          results.push(createChunk(state, { content: flushed.contentDelta }));
+        }
+      }
       if (state.inThinkingBlock && chunk.index === state.currentBlockIndex) {
-        // Thinking block closed — no additional content needed;
-        // reasoning_content chunks have already been streamed
+        // Defer the </think> close marker instead of emitting immediately.
+        // If the next block is tool_use there will be no text_delta, so the
+        // marker would appear as a spurious assistant text chunk before
+        // tool_calls, corrupting OpenAI-compatible clients (#5123).
+        // The marker is flushed in the text_delta branch (for pure-text
+        // thinking responses — preserving the #4633 / decolua/9router#454
+        // behavior) or in the message_delta finish path when no tool_calls
+        // were collected.
+        state.pendingThinkClose = true;
         state.inThinkingBlock = false;
       }
       state.textBlockStarted = false;
@@ -115,10 +202,29 @@ export function claudeToOpenAIResponse(chunk, state) {
       // Extract usage from message_delta event (Claude native format)
       // Normalize to OpenAI format (prompt_tokens/completion_tokens) for consistent logging
       if (chunk.usage && typeof chunk.usage === "object") {
+        const previousUsage = state.usage && typeof state.usage === "object" ? state.usage : {};
+        const previousInputTokens =
+          typeof previousUsage.input_tokens === "number"
+            ? previousUsage.input_tokens
+            : typeof previousUsage.prompt_tokens === "number"
+              ? previousUsage.prompt_tokens
+              : 0;
+        const previousCacheReadTokens =
+          typeof previousUsage.cache_read_input_tokens === "number"
+            ? previousUsage.cache_read_input_tokens
+            : 0;
+        const previousCacheCreationTokens =
+          typeof previousUsage.cache_creation_input_tokens === "number"
+            ? previousUsage.cache_creation_input_tokens
+            : 0;
         const inputTokens =
           typeof chunk.usage.input_tokens === "number" ? chunk.usage.input_tokens : 0;
         const outputTokens =
           typeof chunk.usage.output_tokens === "number" ? chunk.usage.output_tokens : 0;
+        const thinkingTokens =
+          typeof chunk.usage.output_tokens_details?.thinking_tokens === "number"
+            ? chunk.usage.output_tokens_details.thinking_tokens
+            : undefined;
         const cacheReadTokens =
           typeof chunk.usage.cache_read_input_tokens === "number"
             ? chunk.usage.cache_read_input_tokens
@@ -129,25 +235,56 @@ export function claudeToOpenAIResponse(chunk, state) {
             : 0;
 
         // Use OpenAI format keys for consistent logging in stream.js
-        // Issue #1426: Include cached tokens in prompt_tokens and input_tokens
-        const totalInputTokens = inputTokens + cacheReadTokens + cacheCreationTokens;
+        // Issue #1426: Include cache_read tokens in prompt_tokens so cached input
+        // is visible to downstream billing systems.
+        // Issue #2215: Exclude cache_creation_input_tokens from prompt_tokens —
+        // Anthropic's cache-creation pads short prompts up to a 1024-token
+        // minimum, so a 2-token "hi" can be reported as ~2008 prompt_tokens and
+        // inflate downstream billing ~250x. cache_creation is still exposed
+        // separately via prompt_tokens_details.cache_creation_tokens below.
+        const billableInputTokens =
+          inputTokens > 0 || cacheReadTokens > 0 || cacheCreationTokens > 0
+            ? inputTokens + cacheReadTokens
+            : previousInputTokens;
         state.usage = {
-          prompt_tokens: totalInputTokens,
+          prompt_tokens: billableInputTokens,
           completion_tokens: outputTokens,
-          input_tokens: totalInputTokens,
+          input_tokens: billableInputTokens,
           output_tokens: outputTokens,
         };
 
-        // Store cache tokens if present (needed for prompt_tokens_details in final chunk)
-        if (cacheReadTokens > 0) {
-          state.usage.cache_read_input_tokens = cacheReadTokens;
+        // Anthropic includes thinking in output_tokens. Surface the separately
+        // reported portion without adding it to completion_tokens a second time.
+        if (thinkingTokens !== undefined) {
+          state.usage.reasoning_tokens = thinkingTokens;
+          state.usage.completion_tokens_details = { reasoning_tokens: thinkingTokens };
+          state.usage.output_tokens_details = { thinking_tokens: thinkingTokens };
         }
-        if (cacheCreationTokens > 0) {
-          state.usage.cache_creation_input_tokens = cacheCreationTokens;
+
+        // Store cache tokens if present (needed for prompt_tokens_details in final chunk)
+        const effectiveCacheReadTokens = cacheReadTokens || previousCacheReadTokens;
+        const effectiveCacheCreationTokens = cacheCreationTokens || previousCacheCreationTokens;
+        if (effectiveCacheReadTokens > 0) {
+          state.usage.cache_read_input_tokens = effectiveCacheReadTokens;
+        }
+        if (effectiveCacheCreationTokens > 0) {
+          state.usage.cache_creation_input_tokens = effectiveCacheCreationTokens;
         }
       }
 
       if (chunk.delta?.stop_reason) {
+        // Flush any deferred </think> close marker now that we know the stream
+        // is finishing. Only emit when there are no tool_calls — if tool_calls
+        // were collected the marker must stay suppressed (#5123). Text-based
+        // responses that had no text_delta (edge case: thinking-only with
+        // immediate stop) still receive the marker here.
+        if (state.pendingThinkClose && state.toolCalls.size === 0) {
+          // Suppressed for clients that render the marker verbatim (#5245).
+          if (!state.suppressThinkClose) {
+            results.push(createChunk(state, { content: "</think>" }));
+          }
+          state.pendingThinkClose = false;
+        }
         state.finishReason = convertStopReason(chunk.delta.stop_reason);
         const finalChunk: {
           id: string;
@@ -181,7 +318,8 @@ export function claudeToOpenAIResponse(chunk, state) {
           const cachedTokens = state.usage.cache_read_input_tokens || 0;
           const cacheCreationTokens = state.usage.cache_creation_input_tokens || 0;
 
-          // prompt_tokens = input_tokens (which now includes cache_read + cache_creation)
+          // prompt_tokens = input_tokens (input + cache_read, per #2215 —
+          // cache_creation is exposed separately in prompt_tokens_details below).
           // completion_tokens = output_tokens
           // total_tokens = prompt_tokens + completion_tokens
           const promptTokens = inputTokens;
@@ -193,6 +331,14 @@ export function claudeToOpenAIResponse(chunk, state) {
             completion_tokens: completionTokens,
             total_tokens: totalTokens,
           };
+
+          const reasoningTokens = state.usage.reasoning_tokens;
+          if (typeof reasoningTokens === "number") {
+            finalChunk.usage.reasoning_tokens = reasoningTokens;
+            finalChunk.usage.completion_tokens_details = {
+              reasoning_tokens: reasoningTokens,
+            };
+          }
 
           // Add prompt_tokens_details if cached tokens exist
           if (cachedTokens > 0 || cacheCreationTokens > 0) {
@@ -216,6 +362,8 @@ export function claudeToOpenAIResponse(chunk, state) {
       if (!state.finishReasonSent) {
         const finishReason =
           state.finishReason || (state.toolCalls?.size > 0 ? "tool_calls" : "stop");
+        const cachedTokens = state.usage?.cache_read_input_tokens || 0;
+        const cacheCreationTokens = state.usage?.cache_creation_input_tokens || 0;
         const usageObj =
           state.usage && typeof state.usage === "object"
             ? {
@@ -223,6 +371,24 @@ export function claudeToOpenAIResponse(chunk, state) {
                   prompt_tokens: state.usage.input_tokens || 0,
                   completion_tokens: state.usage.output_tokens || 0,
                   total_tokens: (state.usage.input_tokens || 0) + (state.usage.output_tokens || 0),
+                  ...(typeof state.usage.reasoning_tokens === "number"
+                    ? {
+                        reasoning_tokens: state.usage.reasoning_tokens,
+                        completion_tokens_details: {
+                          reasoning_tokens: state.usage.reasoning_tokens,
+                        },
+                      }
+                    : {}),
+                  ...(cachedTokens > 0 || cacheCreationTokens > 0
+                    ? {
+                        prompt_tokens_details: {
+                          ...(cachedTokens > 0 ? { cached_tokens: cachedTokens } : {}),
+                          ...(cacheCreationTokens > 0
+                            ? { cache_creation_tokens: cacheCreationTokens }
+                            : {}),
+                        },
+                      }
+                    : {}),
                 },
               }
             : {};

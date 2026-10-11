@@ -1,31 +1,8 @@
 import type { SupportedBatchEndpoint } from "@/shared/constants/batchEndpoints";
+import { getRuntimePorts } from "@/lib/runtime/ports";
+import { normalizeBasePath } from "@/shared/utils/basePath";
 
-type BatchRouteHandler = (request: Request) => Promise<Response> | Response;
-
-const handlerLoaders: Record<SupportedBatchEndpoint, () => Promise<BatchRouteHandler>> = {
-  "/v1/responses": async () => (await import("@/app/api/v1/responses/route")).POST,
-  "/v1/chat/completions": async () => (await import("@/app/api/v1/chat/completions/route")).POST,
-  "/v1/embeddings": async () => (await import("@/app/api/v1/embeddings/route")).POST,
-  "/v1/completions": async () => (await import("@/app/api/v1/completions/route")).POST,
-  "/v1/moderations": async () => (await import("@/app/api/v1/moderations/route")).POST,
-  "/v1/images/generations": async () =>
-    (await import("@/app/api/v1/images/generations/route")).POST,
-  "/v1/videos/generations": async () =>
-    (await import("@/app/api/v1/videos/generations/route")).POST,
-};
-
-const handlerCache = new Map<SupportedBatchEndpoint, BatchRouteHandler>();
-
-async function getHandler(endpoint: SupportedBatchEndpoint): Promise<BatchRouteHandler> {
-  const cached = handlerCache.get(endpoint);
-  if (cached) return cached;
-
-  const handler = await handlerLoaders[endpoint]();
-  handlerCache.set(endpoint, handler);
-  return handler;
-}
-
-export async function dispatchBatchApiRequest({
+async function dispatchBatchApiRequest({
   endpoint,
   body,
   apiKey,
@@ -39,11 +16,19 @@ export async function dispatchBatchApiRequest({
     headers.set("Authorization", `Bearer ${apiKey}`);
   }
 
-  const handler = await getHandler(endpoint);
-  const request = new Request(`http://localhost${endpoint}`, {
+  const { dashboardPort } = getRuntimePorts();
+  const basePath = normalizeBasePath(process.env.OMNIROUTE_BASE_PATH);
+  const url = `http://127.0.0.1:${dashboardPort}${basePath}${endpoint}`;
+
+  return await globalThis.fetch(url, {
     method: "POST",
     headers,
     body: JSON.stringify(body),
+    // Never follow a redirect while carrying the stored batch API key.
+    redirect: "error",
   });
-  return await handler(request);
 }
+
+export const dispatch = {
+  dispatchBatchApiRequest,
+};

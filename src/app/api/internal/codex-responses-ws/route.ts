@@ -1,17 +1,105 @@
 import { NextResponse } from "next/server";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import { CodexExecutor } from "@omniroute/open-sse/executors/codex.ts";
 import { getApiKeyMetadata } from "@/lib/db/apiKeys";
 import { authorizeWebSocketHandshake, extractWsTokenFromRequest } from "@/lib/ws/handshake";
 import { getModelInfo } from "@/sse/services/model";
+import { resolveCcDiscoveryAliasStrip } from "@/lib/ccDiscoveryAliasResolve";
 import { getProviderCredentialsWithQuotaPreflight } from "@/sse/services/auth";
+import { acquireCodexWsLease, releaseCodexWsLease } from "@/sse/services/codexWsLease";
+import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { checkAndRefreshToken } from "@/sse/services/tokenRefresh";
+import { resolveCodexWsModelInfo } from "./modelResolution";
+import { isFeatureFlagEnabled } from "@/shared/utils/featureFlags";
+import { formatMemoryContext } from "@/lib/memory/injection";
+import { retrieveMemories } from "@/lib/memory/retrieval";
+import {
+  DEFAULT_MEMORY_SETTINGS,
+  getMemorySettings,
+  toMemoryRetrievalConfig,
+} from "@/lib/memory/settings";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
+import { logger } from "@omniroute/open-sse/utils/logger.ts";
+import { resolveProxyForConnection } from "@/lib/db/settings";
+import { withCodexFingerprintCredentials } from "@omniroute/open-sse/config/codexIdentity.ts";
+import { withReasoningRuleContext } from "@omniroute/open-sse/utils/reasoningRuleContext.ts";
+import { proxyConfigToUrl } from "@omniroute/open-sse/utils/proxyDispatcher.ts";
+import {
+  attachReasoningRuleDirective,
+  applyReasoningRuleDirective,
+  extractReasoningIntent,
+  resolveReasoningSourceModels,
+  resolveReasoningRoutingRule,
+  validateCodexWsDecision,
+} from "@/lib/reasoningRouting/policy";
+import { resolveRequestRoutingTags } from "@/domain/tagRouter";
+import {
+  validateApiKeyRoutingTarget,
+  type ApiKeyMetadata as PolicyApiKeyMetadata,
+} from "@/shared/utils/apiKeyPolicy";
+import { persistResponsesWsCallHistory } from "./history";
+import { applyResponsesWsCompression } from "./compression";
+import { getComboByName } from "@/lib/db/combos";
+import { getComboModelString } from "@/lib/combos/steps";
+import { isQuotaModelName } from "@/lib/quota/quotaModelNaming";
+import {
+  buildManagedLeaseErrorResponse,
+  isExclusiveLeaseManagedKey,
+  LeaseContextError,
+} from "@/sse/services/leaseContext";
 
 const CODEX_RESPONSES_WS_URL = "wss://chatgpt.com/backend-api/codex/responses";
 const executor = new CodexExecutor();
+const log = logger("RESPONSES_WS");
 
 type JsonRecord = Record<string, unknown>;
+// Key metadata reaches this bridge from two sources that each declare their own
+// shape: `getApiKeyMetadata()` (every field required) and `enforceApiKeyPolicy()`
+// (every field optional). The policy shape is the wider of the two and the db
+// shape is assignable to it, so it is the only one that can hold both — pinning
+// the alias to the db shape is what produced the "Type 'ApiKeyMetadata' is
+// missing … from type 'ApiKeyMetadata'" mismatch at the policy boundary.
+type ApiKeyMetadata = PolicyApiKeyMetadata | null;
+
+/**
+ * Bridge helpers below either fail with a ready-made HTTP response or return
+ * their success payload. `error` must exist on exactly ONE member of each union:
+ * for an unannotated object-literal union TypeScript synthesises `error?:
+ * undefined` on the success member, and `"error" in x` then keeps that member
+ * too — which is how every `if ("error" in context)` guard in this file silently
+ * stopped narrowing. Annotating the returns keeps the discriminant real.
+ */
+type CodexWsFailure = { error: Response };
+
+type CodexWsReasoningRoute = {
+  decision: Awaited<ReturnType<typeof resolveReasoningRoutingRule>>;
+  intent: ReturnType<typeof extractReasoningIntent>;
+  sourceModels: Awaited<ReturnType<typeof resolveReasoningSourceModels>>;
+  routingTags: ReturnType<typeof resolveRequestRoutingTags>;
+};
+
+type CodexWsCredentials = {
+  credentials: NonNullable<Awaited<ReturnType<typeof checkAndRefreshToken>>>;
+  leaseId: string;
+};
+
+type CodexWsRequestContext = CodexWsReasoningRoute & {
+  authRequest: Request;
+  apiKey: string | null;
+  responseBody: JsonRecord;
+  requestedModel: string;
+  clientHeaders: Record<string, string>;
+  metadata: ApiKeyMetadata;
+  allowedConnections: string[] | null;
+};
+
+type CodexWsUpstreamContext = CodexWsRequestContext &
+  CodexWsCredentials & {
+    provider: string;
+    model: string;
+    reasoningDecision: Awaited<ReturnType<typeof resolveReasoningRoutingRule>>;
+  };
 
 const bridgePayloadSchema = z
   .object({
@@ -24,6 +112,160 @@ const bridgePayloadSchema = z
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function toStringOrNull(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+const RESPONSES_WS_MEMORY_CONTEXT_PREFIX = "Memory context:";
+const RESPONSES_WS_MEMORY_TEXT_PART_TYPES = new Set(["text", "input_text", "output_text"]);
+const RESPONSES_WS_MEMORY_SKIP_ITEM_TYPES = new Set([
+  "function_call",
+  "function_call_output",
+  "tool_call",
+  "tool_call_output",
+  "reasoning",
+  "computer_call",
+  "computer_call_output",
+  "web_search_call",
+  "file_search_call",
+]);
+
+function compactText(parts: Array<string | null>): string | null {
+  const text = parts
+    .map((part) => (typeof part === "string" ? part.trim() : ""))
+    .filter(Boolean)
+    .join("\n");
+  return text.length > 0 ? text : null;
+}
+
+function extractResponsesWsContentText(value: unknown): string | null {
+  if (typeof value === "string") return toStringOrNull(value);
+
+  if (Array.isArray(value)) {
+    return compactText(
+      value.map((part) => {
+        if (typeof part === "string") return toStringOrNull(part);
+        if (!isRecord(part)) return null;
+
+        const type = typeof part.type === "string" ? part.type : "";
+        if (type && !RESPONSES_WS_MEMORY_TEXT_PART_TYPES.has(type)) return null;
+
+        return toStringOrNull(part.text) || toStringOrNull(part.input_text);
+      })
+    );
+  }
+
+  if (isRecord(value)) {
+    const type = typeof value.type === "string" ? value.type : "";
+    if (type && !RESPONSES_WS_MEMORY_TEXT_PART_TYPES.has(type)) return null;
+    return toStringOrNull(value.text) || toStringOrNull(value.input_text);
+  }
+
+  return null;
+}
+
+function extractResponsesWsItemText(value: unknown): string | null {
+  if (typeof value === "string") return toStringOrNull(value);
+  if (!isRecord(value)) return null;
+
+  return (
+    extractResponsesWsContentText(value.content) ||
+    extractResponsesWsContentText(value.text) ||
+    extractResponsesWsContentText(value.input_text) ||
+    extractResponsesWsContentText(value.output_text) ||
+    extractResponsesWsContentText(value.output)
+  );
+}
+
+function isResponsesWsMemoryCandidate(value: unknown): boolean {
+  if (!isRecord(value)) return typeof value === "string";
+  const type = typeof value.type === "string" ? value.type : "";
+  return !RESPONSES_WS_MEMORY_SKIP_ITEM_TYPES.has(type);
+}
+
+function extractLatestResponsesWsInputText(input: unknown): string | null {
+  if (typeof input === "string") return toStringOrNull(input);
+  if (!Array.isArray(input)) return null;
+
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = input[index];
+    if (!isResponsesWsMemoryCandidate(item) || !isRecord(item) || item.role !== "user") continue;
+    const text = extractResponsesWsItemText(item);
+    if (text) return text;
+  }
+
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    const item = input[index];
+    if (!isResponsesWsMemoryCandidate(item)) continue;
+    const text = extractResponsesWsItemText(item);
+    if (text) return text;
+  }
+
+  return null;
+}
+
+export function extractResponsesWsMemoryQuery(body: JsonRecord): string {
+  return (
+    extractLatestResponsesWsInputText(body.input) ||
+    extractLatestResponsesWsInputText(body.messages) ||
+    toStringOrNull(body.prompt) ||
+    toStringOrNull(body.instructions) ||
+    ""
+  );
+}
+
+export function injectResponsesWsMemoryInstructions(
+  body: JsonRecord,
+  memoryText: string
+): JsonRecord {
+  const memoryContext = toStringOrNull(memoryText);
+  if (!memoryContext) return body;
+
+  const existingInstructions = toStringOrNull(body.instructions);
+  if (existingInstructions?.includes(RESPONSES_WS_MEMORY_CONTEXT_PREFIX)) return body;
+
+  return {
+    ...body,
+    instructions: [memoryContext, existingInstructions].filter(Boolean).join("\n\n"),
+  };
+}
+
+async function getMemorySettingsForResponsesWs() {
+  try {
+    return await getMemorySettings();
+  } catch (error) {
+    log.warn("memory.settings.defaulted", {
+      error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
+    });
+    return DEFAULT_MEMORY_SETTINGS;
+  }
+}
+
+async function maybeInjectResponsesWsMemory(
+  responseBody: JsonRecord,
+  metadata: ApiKeyMetadata | null
+): Promise<JsonRecord> {
+  if (!metadata?.id) return responseBody;
+
+  const query = extractResponsesWsMemoryQuery(responseBody);
+  if (!query) return responseBody;
+
+  try {
+    const memorySettings = await getMemorySettingsForResponsesWs();
+    const memories = await retrieveMemories(
+      metadata.id,
+      toMemoryRetrievalConfig(memorySettings, { query })
+    );
+    const memoryText = formatMemoryContext(memories);
+    return injectResponsesWsMemoryInstructions(responseBody, memoryText);
+  } catch (error) {
+    log.warn("memory.injection.skipped", {
+      error: sanitizeErrorMessage(error instanceof Error ? error.message : String(error)),
+    });
+    return responseBody;
+  }
 }
 
 function getBridgeSecret(): string {
@@ -107,75 +349,423 @@ async function authenticate(body: JsonRecord) {
   });
 }
 
-async function prepare(body: JsonRecord) {
+/**
+ * #6564: the WS bridge authenticates the API key (see `authenticate()`) but
+ * historically never enforced the API-key model/combo policy the HTTP
+ * `/v1/responses` path enforces via `enforceApiKeyPolicy()` — a key
+ * restricted to `allowedModels`/`allowedCombos` could still reach a direct
+ * Codex model through this transport. The bridge's token arrives via query
+ * params, not a normal Authorization header, so this builds an equivalent
+ * Request carrying the extracted bearer token and evaluates policy against
+ * the CLIENT-requested model, before any Codex-specific remapping.
+ */
+async function enforceCodexWsApiKeyPolicy(
+  authRequest: Request,
+  apiKey: string | null,
+  requestedModel: string
+): Promise<{ rejection: Response | null; apiKeyInfo: ApiKeyMetadata | null }> {
+  const policyHeaders = new Headers(authRequest.headers);
+  if (apiKey) policyHeaders.set("Authorization", `Bearer ${apiKey}`);
+  const policyRequest = new Request(authRequest.url, { headers: policyHeaders });
+  const policy = await enforceApiKeyPolicy(policyRequest, requestedModel);
+  return { rejection: policy.rejection, apiKeyInfo: policy.apiKeyInfo };
+}
+
+async function prepareReasoningRoute(
+  authRequest: Request,
+  apiKey: string | null,
+  metadata: ApiKeyMetadata,
+  requestedModel: string,
+  responseBody: JsonRecord
+): Promise<CodexWsFailure | CodexWsReasoningRoute> {
+  const reasoningIntent = extractReasoningIntent(requestedModel, responseBody);
+  const sourceModels = await resolveReasoningSourceModels(reasoningIntent.model, (model) =>
+    resolveCodexWsModelInfo(model, getModelInfo)
+  );
+  reasoningIntent.model = sourceModels.normalized;
+  const routingTags = resolveRequestRoutingTags(responseBody);
+  const routeInput = {
+    sourceModel: reasoningIntent.model,
+    sourceModelAliases: sourceModels.aliases,
+    sourceEffort: reasoningIntent.sourceEffort,
+    hasReasoningSignal: reasoningIntent.hasReasoningSignal,
+    hasThinkingBudget: reasoningIntent.hasThinkingBudget,
+    apiKeyId: metadata?.id ?? null,
+    requestTags: routingTags.tags,
+  };
+  let decision = await resolveReasoningRoutingRule(routeInput);
+  if (decision) {
+    const transportError = validateCodexWsDecision(decision);
+    if (transportError)
+      return { error: jsonError(400, "reasoning_route_transport", transportError) };
+    if (decision.capability === "unsupported") {
+      return {
+        error: jsonError(
+          400,
+          "reasoning_effort_unsupported",
+          "The configured reasoning effort is not supported by the target model"
+        ),
+      };
+    }
+    const rejection = await validateApiKeyRoutingTarget(
+      authRequest,
+      apiKey,
+      metadata,
+      decision.targetModel
+    );
+    if (rejection) return { error: rejection };
+  }
+  return { decision, intent: reasoningIntent, sourceModels, routingTags };
+}
+
+async function resolveCodexCredentials(
+  provider: string,
+  model: string,
+  allowedConnections: string[] | null
+): Promise<CodexWsFailure | CodexWsCredentials> {
+  const excludedConnectionIds: string[] = [];
+  let credentials: Awaited<ReturnType<typeof getProviderCredentialsWithQuotaPreflight>> = null;
+
+  // A saturated account is excluded and another eligible account is selected;
+  // never queue a Responses WS session behind an existing tool turn — a queued
+  // session times out client-side as 499/502.
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    credentials = await getProviderCredentialsWithQuotaPreflight(
+      provider,
+      null,
+      allowedConnections,
+      model,
+      { excludeConnectionIds: excludedConnectionIds }
+    );
+    if (!credentials || "allRateLimited" in credentials || !credentials.connectionId) break;
+
+    const leaseId = await acquireCodexWsLease(credentials.connectionId, credentials.maxConcurrent);
+    if (!leaseId) {
+      excludedConnectionIds.push(credentials.connectionId);
+      continue;
+    }
+
+    let refreshed: Awaited<ReturnType<typeof checkAndRefreshToken>>;
+    try {
+      refreshed = await checkAndRefreshToken(provider, credentials);
+    } catch (error) {
+      releaseCodexWsLease(leaseId);
+      return {
+        error: jsonError(
+          502,
+          "codex_ws_prepare_failed",
+          sanitizeErrorMessage(error instanceof Error ? error.message : String(error))
+        ),
+      };
+    }
+
+    if (!refreshed?.accessToken) {
+      releaseCodexWsLease(leaseId);
+      return {
+        error: jsonError(401, "codex_oauth_token_missing", "Codex OAuth access token is missing"),
+      };
+    }
+    return { credentials: refreshed, leaseId };
+  }
+
+  return {
+    error: jsonError(
+      503,
+      "codex_credentials_unavailable",
+      "No available Codex OAuth connection for Responses WebSocket"
+    ),
+  };
+}
+
+async function resolveCodexRequestContext(
+  body: JsonRecord
+): Promise<CodexWsFailure | CodexWsRequestContext> {
+  if (!isFeatureFlagEnabled("OMNIROUTE_CODEX_WS_ENABLED")) {
+    return {
+      error: jsonError(503, "codex_ws_disabled", "Codex Responses WebSocket transport is disabled"),
+    };
+  }
   const authResponse = await authenticate(body);
-  if (!authResponse.ok) return authResponse;
+  if (!authResponse.ok) return { error: authResponse };
 
   const authRequest = getAuthRequest(body);
   const apiKey = extractWsTokenFromRequest(authRequest);
-  const metadata = apiKey ? await getApiKeyMetadata(apiKey).catch(() => null) : null;
+  const responseBody = isRecord(body.response) ? body.response : {};
+  const rawRequestedModel =
+    typeof responseBody.model === "string" && responseBody.model.trim()
+      ? responseBody.model.trim()
+      : "gpt-5.5";
+  // cc discovery alias (`claude/<provider>/<model>`, `claude/combo/<name>`):
+  // resolve back to the real id before provider/policy resolution — the shared
+  // resolver used by src/sse/handlers/chat.ts. This WS bridge never goes through
+  // handleChat, so without this a Claude Code client selecting a mirrored model
+  // over the Codex Responses WS transport would fail as an unknown model.
+  const ccAliasStrip = await resolveCcDiscoveryAliasStrip(rawRequestedModel);
+  const requestedModel = ccAliasStrip.stripped ? ccAliasStrip.model : rawRequestedModel;
+  const policyResult = await enforceCodexWsApiKeyPolicy(authRequest, apiKey, requestedModel);
+  if (policyResult.rejection) return { error: policyResult.rejection };
+  const metadata =
+    policyResult.apiKeyInfo ?? (apiKey ? await getApiKeyMetadata(apiKey).catch(() => null) : null);
+  if (isExclusiveLeaseManagedKey(metadata)) {
+    return {
+      error: buildManagedLeaseErrorResponse(
+        new LeaseContextError(
+          409,
+          "LEASE_UNSUPPORTED_TRANSPORT",
+          "Managed leases require the fenced HTTP Responses transport"
+        )
+      ),
+    };
+  }
   const allowedConnections =
     metadata && Array.isArray(metadata.allowedConnections) && metadata.allowedConnections.length > 0
       ? metadata.allowedConnections
       : null;
-
-  const responseBody = isRecord(body.response) ? body.response : {};
-  const requestedModel =
-    typeof responseBody.model === "string" && responseBody.model.trim()
-      ? responseBody.model.trim()
-      : "gpt-5.5";
-  const modelInfo = await getModelInfo(requestedModel);
-  const provider = modelInfo.provider;
-  const model = modelInfo.model || requestedModel;
-
-  if (provider !== "codex") {
-    return jsonError(
-      400,
-      "codex_ws_provider_required",
-      `Responses WebSocket bridge only supports Codex models, got ${provider || "unknown"}`
-    );
-  }
-
-  const credentials = await getProviderCredentialsWithQuotaPreflight(
-    provider,
-    null,
-    allowedConnections,
-    model
+  const reasoningRoute = await prepareReasoningRoute(
+    authRequest,
+    apiKey,
+    metadata,
+    requestedModel,
+    responseBody
   );
+  if ("error" in reasoningRoute) return reasoningRoute;
+  return {
+    authRequest,
+    apiKey,
+    responseBody,
+    requestedModel,
+    clientHeaders: Object.fromEntries(authRequest.headers.entries()),
+    metadata,
+    allowedConnections,
+    ...reasoningRoute,
+  };
+}
 
-  if (!credentials || "allRateLimited" in credentials) {
+async function resolveCodexUpstreamContext(
+  context: CodexWsFailure | CodexWsRequestContext
+): Promise<CodexWsFailure | CodexWsUpstreamContext> {
+  if ("error" in context) return context;
+  const routedModel = context.decision?.targetModel ?? context.requestedModel;
+  const modelInfo = await resolveCodexWsModelInfo(routedModel, getModelInfo);
+  const provider = modelInfo.provider;
+  const model = modelInfo.model || context.requestedModel;
+  if (provider !== "codex") {
+    return {
+      error: jsonError(
+        400,
+        "codex_ws_provider_required",
+        `Responses WebSocket bridge only supports Codex models, got ${provider || "unknown"}`
+      ),
+    };
+  }
+  const credentialResult = await resolveCodexCredentials(
+    provider,
+    model,
+    context.allowedConnections
+  );
+  if ("error" in credentialResult) return credentialResult;
+  let reasoningDecision = context.decision;
+  if (!reasoningDecision) {
+    try {
+      reasoningDecision = await resolveReasoningRoutingRule({
+        sourceModel: context.intent.model,
+        sourceModelAliases: context.sourceModels.aliases,
+        sourceEffort: context.intent.sourceEffort,
+        hasReasoningSignal: context.intent.hasReasoningSignal,
+        hasThinkingBudget: context.intent.hasThinkingBudget,
+        apiKeyId: context.metadata?.id ?? null,
+        connectionId: credentialResult.credentials.connectionId,
+        requestTags: context.routingTags.tags,
+        connectionOnly: true,
+        capabilityModel: `codex/${model}`,
+      });
+    } catch (error) {
+      releaseCodexWsLease(credentialResult.leaseId);
+      return {
+        error: jsonError(
+          502,
+          "codex_ws_prepare_failed",
+          sanitizeErrorMessage(error instanceof Error ? error.message : String(error))
+        ),
+      };
+    }
+    if (reasoningDecision?.capability === "unsupported") {
+      releaseCodexWsLease(credentialResult.leaseId);
+      return {
+        error: jsonError(
+          400,
+          "reasoning_effort_unsupported",
+          "The configured reasoning effort is not supported by the selected Codex connection model"
+        ),
+      };
+    }
+  }
+  return {
+    ...context,
+    provider,
+    model,
+    credentials: credentialResult.credentials,
+    leaseId: credentialResult.leaseId,
+    reasoningDecision,
+  };
+}
+
+async function resolveCodexProxy(
+  connectionId: string,
+  apiKeyId?: string | null,
+  provider?: string
+): Promise<string | undefined> {
+  try {
+    // #14531: resolve through the same full cascade the HTTP path uses
+    // (per-key → account → provider → combo → global, Proxy Registry first,
+    // legacy key_value store after). The previous networkProxy.resolveProxy()
+    // read only the legacy store, so a proxy assigned in the Proxy Registry —
+    // what the dashboard's provider/account/global "Set Proxy" modals write —
+    // never reached the upstream WS connect and the bridge went out direct.
+    const resolved = await resolveProxyForConnection(
+      connectionId,
+      apiKeyId ?? undefined,
+      provider ?? undefined
+    );
+    return proxyConfigToUrl(resolved?.proxy ?? null) || undefined;
+  } catch (err) {
+    log.warn(`[codex-responses-ws] proxy resolution failed: ${sanitizeErrorMessage(err)}`);
+    return undefined;
+  }
+}
+
+async function prepare(body: JsonRecord) {
+  const context = await resolveCodexRequestContext(body);
+  if ("error" in context) return context.error;
+  const combo = await getComboByName(context.requestedModel).catch(() => null);
+  if (combo) {
+    if (combo.strategy === "quota-share") {
+      return jsonError(
+        426,
+        "responses_websocket_http_fallback",
+        "Quota sharing requires the HTTP/SSE Responses transport for lease and quota coordination"
+      );
+    }
+    const models = Array.isArray(combo.models) ? combo.models : [];
+    if (models.some((model) => getComboModelString(model)?.startsWith("chatgpt-web-codex/"))) {
+      return jsonError(
+        426,
+        "responses_websocket_http_fallback",
+        "This Combo contains ChatGPT Web (Codex) and must use the HTTP/SSE Responses transport"
+      );
+    }
+  }
+  if (isQuotaModelName(context.requestedModel)) {
     return jsonError(
-      503,
-      "codex_credentials_unavailable",
-      "No available Codex OAuth connection for Responses WebSocket"
+      426,
+      "responses_websocket_http_fallback",
+      "Quota sharing requires the HTTP/SSE Responses transport for lease and quota coordination"
+    );
+  }
+  const upstream = await resolveCodexUpstreamContext(context);
+  if ("error" in upstream) return upstream.error;
+  const {
+    responseBody,
+    metadata,
+    provider,
+    model,
+    credentials: refreshedCredentials,
+    leaseId,
+  } = upstream;
+  const reasoningDecision = upstream.reasoningDecision;
+
+  let responseBodyWithMemory: JsonRecord;
+  let reasoningRouting: JsonRecord | null = null;
+  let transformed: JsonRecord;
+  let credentialsWithFingerprint: typeof refreshedCredentials;
+  let reasoningRuleDirective: unknown;
+  try {
+    responseBodyWithMemory = await maybeInjectResponsesWsMemory(responseBody, metadata);
+    if (reasoningDecision) {
+      const withDirective = attachReasoningRuleDirective(responseBodyWithMemory, reasoningDecision);
+      reasoningRuleDirective = withDirective._omnirouteReasoningRule;
+      reasoningRouting = isRecord(withDirective._omnirouteReasoningRouteTrace)
+        ? withDirective._omnirouteReasoningRouteTrace
+        : null;
+      responseBodyWithMemory = applyReasoningRuleDirective(
+        withDirective,
+        "openai-responses"
+      ) as JsonRecord;
+      delete responseBodyWithMemory._omnirouteReasoningRouteTrace;
+    }
+    // #8052: the WS bridge previously skipped the whole prompt-compression pipeline that the
+    // HTTP/SSE path (chatCore.ts) runs on every request — wire the same core pipeline in here,
+    // per logical turn, before handing off to the executor.
+    responseBodyWithMemory = await applyResponsesWsCompression(responseBodyWithMemory, {
+      provider,
+      model,
+      requestId: randomUUID(),
+    });
+    credentialsWithFingerprint = withCodexFingerprintCredentials(
+      withReasoningRuleContext(refreshedCredentials, reasoningRuleDirective),
+      context.clientHeaders,
+      responseBodyWithMemory
+    );
+    transformed = (await executor.transformRequest(
+      model,
+      // This route already accepts native Responses input. Match HTTP passthrough
+      // so the executor preserves custom tools and native tool-result history.
+      { ...responseBodyWithMemory, _nativeCodexPassthrough: true },
+      true,
+      credentialsWithFingerprint
+    )) as JsonRecord;
+    transformed.model = model;
+    delete transformed.stream;
+    delete transformed.stream_options;
+  } catch (error) {
+    releaseCodexWsLease(leaseId);
+    return jsonError(
+      502,
+      "codex_ws_prepare_failed",
+      sanitizeErrorMessage(error instanceof Error ? error.message : String(error))
     );
   }
 
-  const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
-  if (!refreshedCredentials?.accessToken) {
-    return jsonError(401, "codex_oauth_token_missing", "Codex OAuth access token is missing");
+  let headers: Record<string, string>;
+  let proxy: string | undefined;
+  try {
+    headers = normalizeUpstreamHeaders(executor.buildHeaders(credentialsWithFingerprint, true));
+
+    // #5611: apply the configured proxy to the upstream Codex Responses
+    // WebSocket too. #14531: resolve it through the full per-connection
+    // cascade (Proxy Registry + legacy store, per-key → account → provider →
+    // combo → global) the HTTP path uses, not just the legacy key_value map.
+    proxy = await resolveCodexProxy(
+      refreshedCredentials.connectionId,
+      metadata?.id ?? null,
+      provider
+    );
+  } catch (error) {
+    releaseCodexWsLease(leaseId);
+    return jsonError(
+      502,
+      "codex_ws_prepare_failed",
+      sanitizeErrorMessage(error instanceof Error ? error.message : String(error))
+    );
   }
-
-  const transformed = (await executor.transformRequest(
-    model,
-    responseBody,
-    true,
-    refreshedCredentials
-  )) as JsonRecord;
-  transformed.model = model;
-  delete transformed.stream;
-  delete transformed.stream_options;
-
-  const headers = normalizeUpstreamHeaders(executor.buildHeaders(refreshedCredentials, true));
 
   return NextResponse.json({
     ok: true,
     upstreamUrl: CODEX_RESPONSES_WS_URL,
+    // #5591: chrome_149 does not exist in wreq-js 2.3.1 (max chrome_147) → the
+    // native layer yields a degenerate TLS fingerprint and ChatGPT rejects the
+    // upgrade ("Invalid JSON body"). chrome_142 is the profile that shipped in
+    // v3.8.39 and is confirmed working against this upstream.
     browser: "chrome_142",
     os: "windows",
     connectionId: refreshedCredentials.connectionId,
+    leaseId,
+    provider,
+    account: refreshedCredentials.email || null,
     model,
     headers,
+    proxy,
+    reasoningRouting,
     response: transformed,
   });
 }
@@ -204,6 +794,23 @@ export async function POST(request: Request) {
   }
   if (action === "prepare") {
     return prepare(body);
+  }
+  if (action === "release") {
+    return NextResponse.json({
+      ok: true,
+      released: releaseCodexWsLease(toStringOrNull(body.leaseId)),
+    });
+  }
+  if (action === "log") {
+    try {
+      return await persistResponsesWsCallHistory(body);
+    } catch (error) {
+      return jsonError(
+        500,
+        "responses_ws_history_log_failed",
+        sanitizeErrorMessage(error instanceof Error ? error.message : String(error))
+      );
+    }
   }
 
   return jsonError(400, "invalid_action", "Unsupported bridge action");

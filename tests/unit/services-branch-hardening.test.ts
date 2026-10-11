@@ -1,5 +1,29 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omniroute-services-hardening-"));
+const ORIGINAL_DATA_DIR = process.env.DATA_DIR;
+process.env.DATA_DIR = TEST_DATA_DIR;
+
+if (!process.env.API_KEY_SECRET) {
+  process.env.API_KEY_SECRET = "test-services-hardening-secret-" + Date.now();
+}
+
+test.after(() => {
+  if (ORIGINAL_DATA_DIR === undefined) {
+    delete process.env.DATA_DIR;
+  } else {
+    process.env.DATA_DIR = ORIGINAL_DATA_DIR;
+  }
+  try {
+    fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  } catch {
+    // Best effort cleanup
+  }
+});
 
 const signatureStore = await import("../../open-sse/services/geminiThoughtSignatureStore.ts");
 const modelCapabilities = await import("../../open-sse/services/modelCapabilities.ts");
@@ -36,7 +60,7 @@ test.afterEach(() => {
   comboMetrics.resetAllComboMetrics();
 });
 
-test("gemini thought signature store handles invalid input, TTL expiry and max-size pruning", () => {
+test("gemini thought signature store handles invalid input, memory TTL and max-size pruning", () => {
   signatureStore.storeGeminiThoughtSignature("", "sig");
   signatureStore.storeGeminiThoughtSignature("call-empty", "");
   assert.equal(signatureStore.getGeminiThoughtSignature(""), null);
@@ -49,7 +73,8 @@ test("gemini thought signature store handles invalid input, TTL expiry and max-s
   assert.equal(signatureStore.getGeminiThoughtSignature("call-live"), "sig-live");
 
   now += 60 * 60 * 1000 + 1;
-  assert.equal(signatureStore.getGeminiThoughtSignature("call-live"), null);
+  assert.equal(signatureStore.getGeminiThoughtSignatureMemorySizeForTests(), 0);
+  assert.equal(signatureStore.getGeminiThoughtSignature("call-live"), "sig-live");
 
   now = 10_000;
   for (let index = 0; index < 1002; index++) {
@@ -57,7 +82,8 @@ test("gemini thought signature store handles invalid input, TTL expiry and max-s
     now += 1;
   }
 
-  assert.equal(signatureStore.getGeminiThoughtSignature("call-0"), null);
+  assert.equal(signatureStore.getGeminiThoughtSignatureMemorySizeForTests(), 1000);
+  assert.equal(signatureStore.getGeminiThoughtSignature("call-0"), "sig-0");
   assert.equal(signatureStore.getGeminiThoughtSignature("call-1001"), "sig-1001");
 });
 
@@ -87,8 +113,8 @@ test("model capability helpers cover denylist, empty input and default-safe path
   );
 
   assert.equal(modelCapabilities.supportsReasoning(""), true);
-  assert.equal(modelCapabilities.supportsReasoning("antigravity/claude-sonnet-4-6"), false);
-  assert.equal(modelCapabilities.supportsReasoning("antigravity/claude-sonnet-4"), false);
+  assert.equal(modelCapabilities.supportsReasoning("antigravity/claude-sonnet-4-6"), true);
+  assert.equal(modelCapabilities.supportsReasoning("antigravity/claude-sonnet-4"), true);
   assert.equal(modelCapabilities.supportsReasoning("openai/nonexistent-default-safe-model"), true);
 });
 
@@ -142,8 +168,10 @@ test("combo agent middleware covers system override, tool filtering, tag strippi
     "openai/gpt-4o"
   );
 
-  assert.equal(result.pinnedModel, "anthropic/claude-sonnet-4-6");
-  assert.equal(result.body.model, "anthropic/claude-sonnet-4-6");
+  // PR #3399: server-side session pinning replaced <omniModel> tag extraction;
+  // pinnedModel is now always null from applyComboAgentMiddleware.
+  assert.equal(result.pinnedModel, null);
+  assert.equal(result.body.model, "combo/default");
   assert.deepEqual(result.body.messages, [
     { role: "system", content: "combo system" },
     { role: "user", content: "hello" },
@@ -154,6 +182,32 @@ test("combo agent middleware covers system override, tool filtering, tag strippi
   const passthrough = comboAgentMiddleware.applyComboAgentMiddleware(body, null, "openai/gpt-4o");
   assert.equal(passthrough.pinnedModel, null);
   assert.equal(passthrough.body, body);
+});
+
+test("combo agent middleware preserves Responses API input and instructions", () => {
+  const body = {
+    model: "combo/default",
+    input: "Reply with exactly: pong",
+  };
+
+  const unchanged = comboAgentMiddleware.applyComboAgentMiddleware(
+    body,
+    { context_cache_protection: true },
+    "openai/gpt-4o"
+  );
+  assert.deepEqual(unchanged.body, body);
+  assert.equal(Object.hasOwn(unchanged.body, "messages"), false);
+
+  const overridden = comboAgentMiddleware.applyComboAgentMiddleware(
+    { ...body, instructions: "client instruction" },
+    { system_message: "combo instruction" },
+    "openai/gpt-4o"
+  );
+  assert.deepEqual(overridden.body, {
+    ...body,
+    instructions: "combo instruction",
+  });
+  assert.equal(Object.hasOwn(overridden.body, "messages"), false);
 });
 
 test("rate limit semaphore covers immediate acquire, timeout, cooldown drain and reset", async () => {
@@ -167,7 +221,9 @@ test("rate limit semaphore covers immediate acquire, timeout, cooldown drain and
 
   release();
   release();
-  assert.equal(rateLimitSemaphore.getStats()["model-a"].running, 0);
+  // #2903 (perf-ram) prunes idle gates when they reach zero running/queued, so the
+  // entry may be absent here — assert "no running slots" without assuming it persists.
+  assert.equal(rateLimitSemaphore.getStats()["model-a"]?.running ?? 0, 0);
 
   const heldRelease = await rateLimitSemaphore.acquire("model-b", { maxConcurrency: 1 });
   const timeoutPromise = rateLimitSemaphore.acquire("model-b", {
@@ -188,7 +244,7 @@ test("rate limit semaphore covers immediate acquire, timeout, cooldown drain and
   assert.equal(rateLimitSemaphore.getStats()["model-c"].queued, 1);
   const secondRelease = await secondPromise;
   secondRelease();
-  assert.equal(rateLimitSemaphore.getStats()["model-c"].queued, 0);
+  assert.equal(rateLimitSemaphore.getStats()["model-c"]?.queued ?? 0, 0);
 
   const blockingRelease = await rateLimitSemaphore.acquire("model-d", { maxConcurrency: 1 });
   const queuedPromise = rateLimitSemaphore.acquire("model-d", {
@@ -203,8 +259,19 @@ test("rate limit semaphore covers immediate acquire, timeout, cooldown drain and
 test("combo metrics cover empty reads, intent tracking, per-model stats and resets", () => {
   assert.equal(comboMetrics.getComboMetrics("missing"), null);
 
+  comboMetrics.recordComboShadowRequest("shadow-only", "openai/shadow", {
+    success: true,
+    latencyMs: 40,
+  });
+  const shadowOnlyMetrics = comboMetrics.getComboMetrics("shadow-only");
+  assert.equal(shadowOnlyMetrics.productionTraffic, false);
+  assert.equal(shadowOnlyMetrics.totalRequests, 0);
+  assert.equal(shadowOnlyMetrics.shadow.totalRequests, 1);
+  comboMetrics.resetComboMetrics("shadow-only");
+
   comboMetrics.recordComboIntent("idle", "chat");
   const idleMetrics = comboMetrics.getComboMetrics("idle");
+  assert.equal(idleMetrics.productionTraffic, false);
   assert.equal(idleMetrics.avgLatencyMs, 0);
   assert.equal(idleMetrics.successRate, 0);
   assert.equal(idleMetrics.fallbackRate, 0);
@@ -246,6 +313,7 @@ test("combo metrics cover empty reads, intent tracking, per-model stats and rese
   });
 
   const writer = comboMetrics.getComboMetrics("writer");
+  assert.equal(writer.productionTraffic, true);
   assert.equal(writer.strategy, "least-used");
   assert.equal(writer.totalRequests, 3);
   assert.equal(writer.totalSuccesses, 2);
@@ -335,28 +403,28 @@ test("model helpers cover malformed input, alias maps, wildcard aliases, ambigui
   assert.equal(wildcardAlias.model, "claude-sonnet-4-5-20250929");
   assert.equal(wildcardAlias.wildcardPattern, "claude-sonnet-*");
 
-  const ambiguous = await modelService.getModelInfoCore("gpt-5.2-codex", {});
+  const ambiguous = await modelService.getModelInfoCore("claude-haiku-4.5", {});
   assert.equal(ambiguous.provider, null);
   assert.equal(ambiguous.errorType, "ambiguous_model");
   assert.ok(ambiguous.errorMessage.includes("provider/model"));
   assert.ok(Array.isArray(ambiguous.candidateProviders));
   assert.ok(ambiguous.candidateProviders.length >= 2);
 
-  assert.deepEqual(await modelService.getModelInfoCore("claude-unknown", {}), {
-    provider: "anthropic",
-    model: "claude-unknown",
-    extendedContext: false,
-  });
-  assert.deepEqual(await modelService.getModelInfoCore("gemini-custom", {}), {
-    provider: "gemini",
-    model: "gemini-custom",
-    extendedContext: false,
-  });
-  assert.deepEqual(await modelService.getModelInfoCore("made-up-model", {}), {
-    provider: "openai",
-    model: "made-up-model",
-    extendedContext: false,
-  });
+  const unknownClaude = await modelService.getModelInfoCore("claude-unknown", {});
+  assert.equal(unknownClaude.provider, null);
+  assert.equal(unknownClaude.errorType, "model_not_found");
+  assert.ok(unknownClaude.errorMessage.includes("claude-unknown"));
+  assert.ok(unknownClaude.errorMessage.includes("provider/model prefix"));
+  const unknownGemini = await modelService.getModelInfoCore("gemini-custom", {});
+  assert.equal(unknownGemini.provider, null);
+  assert.equal(unknownGemini.errorType, "model_not_found");
+  assert.ok(unknownGemini.errorMessage.includes("gemini-custom"));
+  assert.ok(unknownGemini.errorMessage.includes("provider/model prefix"));
+  const unknownModel = await modelService.getModelInfoCore("made-up-model", {});
+  assert.equal(unknownModel.provider, null);
+  assert.equal(unknownModel.errorType, "model_not_found");
+  assert.ok(unknownModel.errorMessage.includes("made-up-model"));
+  assert.ok(unknownModel.errorMessage.includes("provider/model prefix"));
 });
 
 test("error classifier covers empty-content helpers, context overflow and remaining error classes", () => {

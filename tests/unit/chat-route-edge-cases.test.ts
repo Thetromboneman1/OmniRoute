@@ -15,11 +15,13 @@ const {
   settingsDb,
   idempotencyLayerModule,
   semanticCacheModule,
+  combosDb,
 } = harness;
 
 const { getBackgroundDegradationConfig } =
   await import("../../open-sse/services/backgroundTaskDetector.ts");
 const { setCustomAliases } = await import("../../open-sse/services/modelDeprecation.ts");
+const { setModelAlias } = await import("../../src/lib/db/models.ts");
 
 test.beforeEach(async () => {
   BaseExecutor.RETRY_CONFIG.delayMs = 0;
@@ -36,10 +38,11 @@ test.after(async () => {
 
 test("handleChat resolves model alias before routing", async () => {
   await seedConnection("openai", { apiKey: "sk-openai" });
-  await settingsDb.updateSettings({
-    modelAliases: JSON.stringify({ "alias-model": "gpt-4o" }),
-  });
-  setCustomAliases({ "alias-model": "gpt-4o" });
+  // setModelAlias writes to key_value namespace='modelAliases', which is the
+  // namespace that getModelAliases() (used by getModelInfo in chatCore) reads from.
+  // settingsDb.updateSettings({ modelAliases }) writes to namespace='settings' and
+  // triggers setCustomAliases (in-memory only) — a separate store not consulted here.
+  await setModelAlias("alias-model", "openai/gpt-4.1");
 
   const seenModels = [];
   globalThis.fetch = async (_url, init = {}) => {
@@ -61,7 +64,62 @@ test("handleChat resolves model alias before routing", async () => {
   );
 
   assert.equal(response.status, 200, "Should succeed with 200 OK");
-  assert.equal(seenModels[0], "gpt-4o", "Model alias should be resolved to gpt-4o");
+  assert.equal(seenModels[0], "gpt-4.1", "Model alias should be resolved to gpt-4.1");
+});
+
+test("handleChat strips client context-window tags before combo routing and dispatch", async () => {
+  await seedConnection("openai", { apiKey: "sk-openai-context-tag" });
+  await combosDb.createCombo({
+    name: "context-tag-combo",
+    models: ["openai/gpt-4.1"],
+  });
+
+  const seenModels = [];
+  globalThis.fetch = async (_url, init = {}) => {
+    const body = JSON.parse(String(init.body));
+    seenModels.push(body.model);
+    return buildOpenAIResponse("Context tag response");
+  };
+
+  const response = await handleChat(
+    buildRequest({
+      body: {
+        model: "context-tag-combo[500k]",
+        stream: false,
+        messages: [{ role: "user", content: "Use the context-tagged combo" }],
+      },
+    })
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(seenModels, ["gpt-4.1"]);
+});
+
+test("handleChat preserves a literal context-tagged combo name", async () => {
+  await seedConnection("openai", { apiKey: "sk-openai-literal-context-tag" });
+  await combosDb.createCombo({
+    name: "literal [1m]",
+    models: ["openai/gpt-4.1"],
+  });
+
+  const seenModels = [];
+  globalThis.fetch = async (_url, init = {}) => {
+    seenModels.push(JSON.parse(String(init.body)).model);
+    return buildOpenAIResponse("Literal combo response");
+  };
+
+  const response = await handleChat(
+    buildRequest({
+      body: {
+        model: "literal [1m]",
+        stream: false,
+        messages: [{ role: "user", content: "Use the literal combo" }],
+      },
+    })
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(seenModels, ["gpt-4.1"]);
 });
 
 test("Test 3: handleChat returns cached response directly for Semantic Cache hits", async () => {

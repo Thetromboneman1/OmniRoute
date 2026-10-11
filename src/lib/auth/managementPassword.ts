@@ -4,13 +4,17 @@ import { getSettings, updateSettings } from "@/lib/db/settings";
 const BCRYPT_HASH_PATTERN = /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/;
 const MANAGEMENT_PASSWORD_SALT_ROUNDS = 12;
 
+// Well-known placeholder shipped in `.env.example` (INITIAL_PASSWORD=CHANGEME). Bootstrapping
+// with it leaves the dashboard open to anyone, so we warn loudly on boot (Seg2 hardening).
+const INSECURE_DEFAULT_PASSWORDS = new Set(["CHANGEME"]);
+
 type JsonRecord = Record<string, unknown>;
 
 type MigrationSource = "stored_hash" | "stored_plaintext" | "env" | "missing";
 
 interface EnsureManagementPasswordOptions {
   initialPassword?: string | null;
-  logger?: Pick<Console, "log">;
+  logger?: Pick<Console, "log"> & Partial<Pick<Console, "warn">>;
   settings?: JsonRecord;
   source?: string;
 }
@@ -41,6 +45,14 @@ export function isBcryptHash(value: unknown): value is string {
   return typeof value === "string" && BCRYPT_HASH_PATTERN.test(value);
 }
 
+// #13679 (PR D, item #5): the well-known INITIAL_PASSWORD placeholder shipped in
+// .env.example / contrib/podman/omniroute.container / docker deploy manifests is a
+// public, guessable credential. Callers on the authentication path use this to refuse
+// a successful match from non-loopback requests instead of only warning on boot.
+export function isKnownInsecureManagementPassword(password: string): boolean {
+  return INSECURE_DEFAULT_PASSWORDS.has(password);
+}
+
 export async function hashManagementPassword(password: string) {
   return bcrypt.hash(password, MANAGEMENT_PASSWORD_SALT_ROUNDS);
 }
@@ -68,6 +80,15 @@ export async function ensurePersistentManagementPasswordHash(
   const bootstrapPassword =
     storedPassword ||
     getInitialPasswordValue(options.initialPassword ?? process.env.INITIAL_PASSWORD);
+
+  if (bootstrapPassword && INSECURE_DEFAULT_PASSWORDS.has(bootstrapPassword)) {
+    const warn = options.logger?.warn?.bind(options.logger) ?? console.warn;
+    warn(
+      '[AUTH][SECURITY] Management password is set to the well-known default "CHANGEME" ' +
+        "(INITIAL_PASSWORD in .env.example). Anyone can sign in to the dashboard with it — " +
+        "change it immediately via the dashboard or a strong INITIAL_PASSWORD."
+    );
+  }
 
   if (!bootstrapPassword) {
     return {

@@ -19,7 +19,7 @@ const originalGetCookieStore = loginRoute.authRouteInternals.getCookieStore;
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
   delete process.env.INITIAL_PASSWORD;
 }
@@ -37,12 +37,30 @@ test.afterEach(() => {
 
 test.after(() => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   if (ORIGINAL_INITIAL_PASSWORD === undefined) {
     delete process.env.INITIAL_PASSWORD;
   } else {
     process.env.INITIAL_PASSWORD = ORIGINAL_INITIAL_PASSWORD;
   }
+});
+
+test("auth login route returns 400 for malformed JSON bodies", async () => {
+  const response = await loginRoute.POST(
+    new Request("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "a��",
+    })
+  );
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), {
+    error: {
+      message: "Invalid request",
+      details: [{ field: "body", message: "Invalid JSON body" }],
+    },
+  });
 });
 
 test("auth login route returns needsSetup when no management password is configured", async () => {
@@ -84,8 +102,55 @@ test("auth login route lazily migrates INITIAL_PASSWORD to a persisted hash befo
   assert.equal(
     await managementPassword.verifyManagementPassword(
       "bootstrap-secret",
-      (settings as any).password
+      (settings as Record<string, unknown>).password as string
     ),
     true
   );
+});
+
+test("auth login route sets a bounded maxAge on the auth_token cookie (Seg3)", async () => {
+  process.env.INITIAL_PASSWORD = "bootstrap-secret";
+  const setCalls: unknown[][] = [];
+  loginRoute.authRouteInternals.getCookieStore = async () => ({
+    set: (...args: unknown[]) => setCalls.push(args),
+  });
+
+  const response = await loginRoute.POST(
+    new Request("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: "bootstrap-secret" }),
+    })
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(setCalls.length, 1);
+  const [cookieName, , options] = setCalls[0] as [string, string, Record<string, unknown>];
+  assert.equal(cookieName, "auth_token");
+  // 30 days in seconds — must match the JWT 30d expiry so the cookie is not an open-ended
+  // session cookie outliving its token.
+  assert.equal(options.maxAge, 60 * 60 * 24 * 30);
+  assert.equal(options.httpOnly, true);
+  assert.equal(options.path, "/");
+});
+
+test("auth login route returns 403 when OIDC password login is disabled", async () => {
+  process.env.INITIAL_PASSWORD = "bootstrap-secret";
+  await settingsDb.updateSettings({
+    requireLogin: true,
+    oidcEnabled: true,
+    oidcDisablePasswordLogin: true,
+  });
+
+  const response = await loginRoute.POST(
+    new Request("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: "bootstrap-secret" }),
+    })
+  );
+
+  assert.equal(response.status, 403);
+  const body = (await response.json()) as { error?: string };
+  assert.match(body.error || "", /Password login is disabled when OIDC is active/);
 });

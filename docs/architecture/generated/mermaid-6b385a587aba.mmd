@@ -1,0 +1,6 @@
+flowchart TD
+  A["feat/fix branch"] --> B["PR → release/vX.Y.Z"]
+  B --> C["release/vX.Y.Z tip"]
+  C --> D["Release PR squash-merges → main"]
+  D --> E["Tag vX.Y.Z"]
+  C --> F["Next cycle: release/vX+1 cut from frozen tip"]

@@ -15,7 +15,7 @@ const { migrateCodexConnectionDefaultsFromLegacySettings } =
 
 async function resetStorage() {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
 }
 
@@ -25,7 +25,7 @@ test.beforeEach(async () => {
 
 test.after(async () => {
   core.resetDbInstance();
-  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 test("migration backfills Codex request defaults, preserves existing providerSpecificData, and is idempotent", async () => {
@@ -132,4 +132,26 @@ test("provider connection persistence normalizes request defaults without droppi
   assert.equal((updated.providerSpecificData as any).openaiStoreEnabled, true);
   assert.equal((updated.providerSpecificData as any).workspaceId, "ws-normalize");
   assert.equal((updated.providerSpecificData as any).tag, "team-z");
+});
+
+test("migration does not treat explicit default global tier as legacy fast", async () => {
+  const created = await providersDb.createProviderConnection({
+    provider: "codex",
+    authType: "oauth",
+    email: "default-tier@example.com",
+    providerSpecificData: { workspaceId: "ws-default" },
+  });
+
+  await settingsDb.updateSettings({ codexServiceTier: { enabled: true, tier: "default" } });
+
+  const firstRun = await migrateCodexConnectionDefaultsFromLegacySettings();
+  const rows = await providersDb.getProviderConnections({ provider: "codex" });
+  const byId = new Map(rows.map((row) => [row.id, row]));
+
+  assert.equal(firstRun.legacyFastEnabled, false);
+  const providerSpecificData = byId.get(created.id)?.providerSpecificData as
+    { requestDefaults?: unknown } | undefined;
+  assert.deepEqual(providerSpecificData?.requestDefaults, {
+    reasoningEffort: "medium",
+  });
 });

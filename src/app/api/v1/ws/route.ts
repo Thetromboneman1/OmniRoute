@@ -1,4 +1,5 @@
 import { CORS_HEADERS } from "@/shared/utils/cors";
+import { getLiveWsPath, resolveLiveWsPublicUrl } from "@/shared/utils/wsPath";
 import { authorizeWebSocketHandshake } from "@/lib/ws/handshake";
 
 const WS_HANDSHAKE_HEADERS = {
@@ -6,14 +7,36 @@ const WS_HANDSHAKE_HEADERS = {
   "Cache-Control": "no-store",
 };
 
-const WS_PROTOCOL = {
-  request: {
-    type: "request",
-    id: "req-1",
-    payload: { model: "openai/gpt-4.1-mini", messages: [] },
-  },
-  cancel: { type: "cancel", id: "req-1" },
-};
+/**
+ * Public URL for the live dashboard WebSocket (reverse proxy / Cloudflare
+ * Tunnel setups). Read lazily at request time (not module load) so runtime
+ * env changes are honored, and only echoed when it is a ws:// or wss:// URL.
+ */
+function getLivePublicUrl(): string | null {
+  // Runtime-resolved: a prebuilt image never carries a build-time NEXT_PUBLIC_*
+  // value, and this handshake is what the browser reads instead (#11331).
+  return resolveLiveWsPublicUrl();
+}
+
+function getWsProtocol() {
+  return {
+    request: {
+      type: "request",
+      id: "req-1",
+      payload: { model: "openai/gpt-4.1-mini", messages: [] },
+    },
+    cancel: { type: "cancel", id: "req-1" },
+    live: {
+      port: parseInt(process.env.LIVE_WS_PORT || "20132", 10),
+      publicUrl: getLivePublicUrl(),
+      path: getLiveWsPath(),
+      protocol: "json",
+      channels: ["requests", "combo", "credentials"],
+      auth: "api-key",
+      heartbeatMs: 15000,
+    },
+  };
+}
 
 export async function OPTIONS() {
   return new Response(null, {
@@ -58,7 +81,16 @@ export async function GET(request: Request) {
         wsAuth: auth.wsAuth,
         authenticated: auth.authenticated,
         authType: auth.authType,
-        protocol: WS_PROTOCOL,
+        protocol: getWsProtocol(),
+        live: {
+          port: parseInt(process.env.LIVE_WS_PORT || "20132", 10),
+          publicUrl: getLivePublicUrl(),
+          path: getLiveWsPath(),
+          protocol: "json",
+          channels: ["requests", "combo", "credentials"],
+          auth: "api-key",
+          description: "Real-time dashboard events via WebSocket",
+        },
       },
       {
         headers: WS_HANDSHAKE_HEADERS,
@@ -75,7 +107,7 @@ export async function GET(request: Request) {
       },
       path: auth.wsPath,
       wsAuth: auth.wsAuth,
-      protocol: WS_PROTOCOL,
+      protocol: getWsProtocol(),
     },
     {
       status: 426,

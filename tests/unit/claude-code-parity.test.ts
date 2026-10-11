@@ -23,7 +23,10 @@ import {
 } from "../../open-sse/services/claudeCodeFingerprint.ts";
 
 // ── Tool remapper ─────────────────────────────────────────────────────────────
-import { remapToolNamesInRequest } from "../../open-sse/services/claudeCodeToolRemapper.ts";
+import {
+  remapToolNamesInRequest,
+  remapToolNamesInResponse,
+} from "../../open-sse/services/claudeCodeToolRemapper.ts";
 
 // ── Constraints ───────────────────────────────────────────────────────────────
 import {
@@ -31,6 +34,7 @@ import {
   disableThinkingIfToolChoiceForced,
   enforceCacheControlLimit,
   ensureCacheControlOnLastUserMessage,
+  normalizeCacheControlTtl,
 } from "../../open-sse/services/claudeCodeConstraints.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -165,11 +169,77 @@ describe("remapToolNamesInRequest", () => {
     assert.ok(Array.isArray(body.tools), "tools array must still be present after remap");
   });
 
+  it("tracks remapped tool names without leaking helper fields into the wire payload", () => {
+    const body = {
+      tools: [
+        { name: "bash", description: "Run bash commands" },
+        { name: "glob", description: "Search files" },
+      ],
+      tool_choice: { type: "tool", name: "glob" },
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", name: "read", input: { file_path: "README.md" } }],
+        },
+      ],
+    };
+
+    remapToolNamesInRequest(body);
+
+    const mappedBody = body as Record<string, unknown> & {
+      _toolNameMap?: Map<string, string>;
+      _claudeCodeRequiresLowercaseToolNames?: boolean;
+    };
+
+    // remapToolNamesInRequest remaps in-place and stores _toolNameMap as non-enumerable.
+    assert.equal(body.tools[0].name, "Bash");
+    assert.equal(body.tools[1].name, "Glob");
+    assert.equal(body.tool_choice.name, "Glob");
+    assert.equal(body.messages[0].content[0].name, "Read");
+    assert.equal(mappedBody._claudeCodeRequiresLowercaseToolNames, undefined);
+
+    const wirePayload = JSON.stringify(body);
+    assert.equal(wirePayload.includes("_toolNameMap"), false);
+    assert.equal(wirePayload.includes("_claudeCodeRequiresLowercaseToolNames"), false);
+    assert.match(wirePayload, /"name":"Bash"/);
+    assert.match(wirePayload, /"name":"Glob"/);
+  });
+
+  it("remaps known tools and does not throw with extra unknown fields on body", () => {
+    // Verify unrelated extra properties do not interfere with remapping and no error is thrown.
+    const body: Record<string, unknown> = {
+      tools: [{ name: "bash", description: "Run bash commands" }],
+      messages: [],
+      _someExtraField: "irrelevant",
+    };
+
+    assert.doesNotThrow(() => remapToolNamesInRequest(body));
+
+    // Known tool names are still remapped in-place
+    assert.equal((body.tools as Array<Record<string, unknown>>)[0].name, "Bash");
+    // Extra fields are left intact (not stripped, not used for map lookup)
+    assert.equal(body._someExtraField, "irrelevant");
+    // _toolNameMap is non-enumerable and will not leak through Object.keys/JSON.stringify.
+    assert.equal(Object.keys(body).includes("_toolNameMap"), false);
+  });
+
   it("handles body without tools without throwing", () => {
     const body = { messages: [{ role: "user", content: "hello" }] };
     assert.doesNotThrow(() => remapToolNamesInRequest(body));
   });
   // Note: remapToolNamesInRequest requires a non-null body (callers always provide one)
+});
+
+describe("remapToolNamesInResponse", () => {
+  it("restores TitleCase tool names to lowercase via REVERSE_MAP when forceLowercase=true", () => {
+    // remapToolNamesInResponse(text, forceLowercase) — 2 args only; uses hardcoded REVERSE_MAP
+    const text = 'data: {"name":"Bash","other":{"name": "Glob"}}\n\n';
+    const restored = remapToolNamesInResponse(text, true);
+
+    assert.match(restored, /"name":"bash"/);
+    assert.match(restored, /"name": "glob"/);
+    assert.equal(remapToolNamesInResponse(text, false), text);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -191,12 +261,40 @@ describe("enforceThinkingTemperature", () => {
     enforceThinkingTemperature(body);
     assert.equal(body.temperature, 0.7, "temperature should be unchanged when no thinking");
   });
+
+  it("drops top_p and pins temperature when thinking is enabled (both sent)", () => {
+    const body: Record<string, unknown> = {
+      thinking: { type: "enabled", budget_tokens: 1000 },
+      temperature: 0.7,
+      top_p: 0.9,
+    };
+    enforceThinkingTemperature(body);
+    assert.equal(body.temperature, 1, "temperature must be pinned to 1 when thinking is active");
+    assert.ok(!("top_p" in body), "top_p must be dropped when thinking is active");
+  });
+
+  it("drops a lone top_p (< 0.95) under adaptive thinking", () => {
+    const body: Record<string, unknown> = {
+      thinking: { type: "adaptive" },
+      top_p: 0.9,
+    };
+    enforceThinkingTemperature(body);
+    assert.ok(!("top_p" in body), "top_p must be dropped under adaptive thinking");
+    assert.equal(body.temperature, 1, "temperature must be set to 1 under adaptive thinking");
+  });
+
+  it("leaves top_p untouched when thinking is not present", () => {
+    const body: Record<string, unknown> = { top_p: 0.9, messages: [] };
+    enforceThinkingTemperature(body);
+    assert.equal(body.top_p, 0.9, "top_p should be unchanged when no thinking");
+  });
 });
 
 describe("disableThinkingIfToolChoiceForced", () => {
   it("removes thinking when tool_choice forces a specific tool", () => {
     const body = {
       thinking: { type: "enabled", budget_tokens: 1000 },
+      context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] },
       tool_choice: { type: "tool", name: "Bash" },
       tools: [{ name: "Bash" }],
     };
@@ -207,6 +305,7 @@ describe("disableThinkingIfToolChoiceForced", () => {
       !thinkingType || thinkingType === "disabled" || thinkingType === "none",
       "thinking must be disabled when tool_choice forces a specific tool"
     );
+    assert.equal(body.context_management, undefined);
   });
 
   it("does not modify thinking when tool_choice is auto", () => {
@@ -243,19 +342,169 @@ describe("enforceCacheControlLimit", () => {
 });
 
 describe("ensureCacheControlOnLastUserMessage", () => {
-  it("does not throw on a valid messages array", () => {
+  it("adds a breakpoint to the last user message when messages have none", () => {
     const body = {
+      system: [
+        { type: "text", text: "s1", cache_control: { type: "ephemeral" } },
+        { type: "text", text: "s2", cache_control: { type: "ephemeral" } },
+      ],
       messages: [
         { role: "user", content: [{ type: "text", text: "Hello" }] },
         { role: "assistant", content: [{ type: "text", text: "Hi!" }] },
         { role: "user", content: [{ type: "text", text: "Follow up" }] },
       ],
     };
-    assert.doesNotThrow(() => ensureCacheControlOnLastUserMessage(body));
+
+    ensureCacheControlOnLastUserMessage(body);
+
+    assert.deepEqual(body.messages[2].content[0].cache_control, { type: "ephemeral" });
+  });
+
+  it("keeps an existing message breakpoint and advances one to the last user message", () => {
+    const body = {
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "Hello",
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+        },
+        { role: "user", content: [{ type: "text", text: "Follow up" }] },
+      ],
+    };
+
+    ensureCacheControlOnLastUserMessage(body);
+    ensureCacheControlOnLastUserMessage(body);
+
+    assert.deepEqual(body.messages[0].content[0].cache_control, { type: "ephemeral" });
+    assert.deepEqual(body.messages[1].content[0].cache_control, { type: "ephemeral" });
+    assert.equal(
+      body.messages.flatMap((message) => message.content).filter((block) => block.cache_control)
+        .length,
+      2
+    );
+  });
+
+  it("keeps a new tail breakpoint at 5m after an existing 5m breakpoint", () => {
+    const body = {
+      system: [
+        { type: "text", text: "long", cache_control: { type: "ephemeral", ttl: "1h" } },
+        { type: "text", text: "short", cache_control: { type: "ephemeral", ttl: "5m" } },
+      ],
+      messages: [{ role: "user", content: [{ type: "text", text: "Follow up" }] }],
+    };
+
+    ensureCacheControlOnLastUserMessage(body);
+
+    assert.deepEqual(body.messages[0].content[0].cache_control, {
+      type: "ephemeral",
+      ttl: "5m",
+    });
+  });
+
+  it("does not exceed four surviving system and message breakpoints", () => {
+    const body = {
+      system: Array.from({ length: 4 }, (_, index) => ({
+        type: "text",
+        text: `s${index}`,
+        cache_control: { type: "ephemeral" },
+      })),
+      messages: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+    };
+
+    ensureCacheControlOnLastUserMessage(body);
+
+    assert.equal(body.messages[0].content[0].cache_control, undefined);
   });
 
   it("handles body without messages without throwing", () => {
     // chatCore always provides a valid body object — test empty but non-null object
     assert.doesNotThrow(() => ensureCacheControlOnLastUserMessage({}));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// normalizeCacheControlTtl tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("normalizeCacheControlTtl", () => {
+  it("defaults a missing ttl to 1h on the last system block", () => {
+    const body = {
+      system: [
+        { type: "text", text: "billing" },
+        { type: "text", text: "sentinel" },
+        { type: "text", text: "prompt", cache_control: { type: "ephemeral" } },
+      ],
+    };
+
+    normalizeCacheControlTtl(body);
+
+    assert.deepEqual(body.system[2].cache_control, { type: "ephemeral", ttl: "1h" });
+  });
+
+  it("does not touch a cache_control that already specifies a ttl", () => {
+    const body = {
+      system: [{ type: "text", text: "prompt", cache_control: { type: "ephemeral", ttl: "5m" } }],
+    };
+
+    normalizeCacheControlTtl(body);
+
+    assert.deepEqual(body.system[0].cache_control, { type: "ephemeral", ttl: "5m" });
+  });
+
+  it("defaults missing ttl in tools and message content blocks", () => {
+    const body = {
+      tools: [{ name: "bash", description: "run", cache_control: { type: "ephemeral" } }],
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }],
+        },
+      ],
+    };
+
+    normalizeCacheControlTtl(body);
+
+    assert.deepEqual(body.tools[0].cache_control, { type: "ephemeral", ttl: "1h" });
+    assert.deepEqual(body.messages[0].content[0].cache_control, {
+      type: "ephemeral",
+      ttl: "1h",
+    });
+  });
+
+  it("defaults missing ttl to 5m after a 5m breakpoint", () => {
+    const body = {
+      system: [{ type: "text", text: "stable", cache_control: { type: "ephemeral", ttl: "5m" } }],
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "follow up", cache_control: { type: "ephemeral" } }],
+        },
+      ],
+    };
+
+    normalizeCacheControlTtl(body);
+
+    assert.deepEqual(body.messages[0].content[0].cache_control, {
+      type: "ephemeral",
+      ttl: "5m",
+    });
+  });
+
+  it("leaves blocks without cache_control untouched", () => {
+    const body = {
+      system: [{ type: "text", text: "no cache_control here" }],
+    };
+
+    assert.doesNotThrow(() => normalizeCacheControlTtl(body));
+    assert.equal(body.system[0].cache_control, undefined);
+  });
+
+  it("handles a body with no system/tools/messages without throwing", () => {
+    assert.doesNotThrow(() => normalizeCacheControlTtl({}));
   });
 });
