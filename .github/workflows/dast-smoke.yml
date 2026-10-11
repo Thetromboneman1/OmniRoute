@@ -54,6 +54,11 @@ jobs:
       - name: Build CLI bundle
         env:
           OMNIROUTE_BUILD_BACKEND_ONLY: "1"
+          # Turbopack's native memory is not bounded by NODE_OPTIONS and repeatedly
+          # causes hosted runners to be reclaimed during static generation. DAST
+          # validates the API artifact, not bundler parity, so use the repository's
+          # documented lower-peak-memory production fallback (#6409/#8090).
+          OMNIROUTE_USE_TURBOPACK: "0"
         run: npm run build:cli
       - name: Start OmniRoute
         env:

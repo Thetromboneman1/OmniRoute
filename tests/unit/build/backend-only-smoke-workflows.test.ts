@@ -82,6 +82,22 @@ for (const { file, jobName, stepName } of TARGETS) {
   });
 }
 
+test("dast-smoke uses the lower-peak-memory webpack fallback on hosted runners", () => {
+  const doc = loadWorkflow("dast-smoke.yml");
+  const step = doc.jobs["dast-smoke"].steps.find((candidate) =>
+    candidate.name === "Build CLI bundle"
+  );
+
+  assert.ok(step, "dast-smoke must retain its Build CLI bundle step");
+  assert.equal(
+    step.env?.OMNIROUTE_USE_TURBOPACK,
+    "0",
+    "DAST must use the documented lower-peak-memory webpack production fallback; " +
+      "Turbopack's native memory is unbounded by NODE_OPTIONS and repeatedly causes the " +
+      "hosted runner to be reclaimed before either DAST stage starts"
+  );
+});
+
 test("npm-publish.yml 'Build CLI bundle (standalone app)' step must NOT be backend-only (it legitimately ships the full dashboard UI)", () => {
   const doc = loadWorkflow("npm-publish.yml");
   const publishJob = Object.values(doc.jobs).find((job) =>
