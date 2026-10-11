@@ -1,3 +1,8 @@
+---
+title: "Architecture Assets"
+description: "Rendering and source conventions for OmniRoute architecture diagrams."
+---
+
 # Architecture Assets
 
 <!-- fleet-documentation-contract:start -->

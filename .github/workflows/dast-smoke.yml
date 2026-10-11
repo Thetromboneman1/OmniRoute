@@ -26,7 +26,12 @@ concurrency:
   cancel-in-progress: true
 jobs:
   dast-smoke:
-    runs-on: ubuntu-latest
+    # The backend-only Next build no longer fits reliably on the hosted 7 GB VM
+    # (the runner is terminated during static generation). Use the repository's
+    # light build pool for trusted same-repository refs, matching the nightly DAST
+    # rail. Fork pull requests stay on GitHub-hosted runners so untrusted candidate
+    # code can never execute on a persistent self-hosted runner.
+    runs-on: ${{ (vars.USE_VPS_RUNNER == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","omni-light"]')) || 'ubuntu-latest' }}
     # ADVISORY while this new gate matures (repo convention: advisory -> blocking).
     # Flip to blocking (remove continue-on-error) once it's proven stable across a few PRs.
     continue-on-error: true
@@ -49,6 +54,11 @@ jobs:
       - name: Build CLI bundle
         env:
           OMNIROUTE_BUILD_BACKEND_ONLY: "1"
+          # Turbopack's native memory is not bounded by NODE_OPTIONS and repeatedly
+          # causes hosted runners to be reclaimed during static generation. DAST
+          # validates the API artifact, not bundler parity, so use the repository's
+          # documented lower-peak-memory production fallback (#6409/#8090).
+          OMNIROUTE_USE_TURBOPACK: "0"
         run: npm run build:cli
       - name: Start OmniRoute
         env:

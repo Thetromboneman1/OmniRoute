@@ -2,12 +2,26 @@ name: Deploy to VPS
 
 on:
   workflow_run:
-    workflows: ["Publish Container Images"]
+    workflows: ["Publish to npm"]
     types: [completed]
   workflow_dispatch:
+    inputs:
+      version:
+        description: Exact published npm version to deploy.
+        required: true
+        type: string
+      head-sha:
+        description: Exact trusted repository commit that produced the version.
+        required: true
+        type: string
 
 permissions:
+  actions: read
   contents: read
+
+concurrency:
+  group: deploy-vps-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -17,6 +31,92 @@ jobs:
     name: Deploy OmniRoute to VPS
     runs-on: ubuntu-latest
     steps:
+      - name: Bind deployment to a trusted immutable version
+        id: provenance
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_PATH: ${{ github.event.workflow_run.path }}
+          SOURCE_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_SHA: ${{ inputs.head-sha }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            if [[ "$SOURCE_CONCLUSION" != "success" || "$SOURCE_REPOSITORY" != "$GITHUB_REPOSITORY" || "$SOURCE_PATH" != ".github/workflows/npm-publish.yml" ]]; then
+              echo "::error::Refusing an unsuccessful or foreign publish run"
+              exit 1
+            fi
+            case "$SOURCE_EVENT:$SOURCE_BRANCH" in
+              release:v[0-9]*|release:main|workflow_dispatch:main|workflow_dispatch:v[0-9]*|workflow_dispatch:release/v*|workflow_call:main|workflow_call:v[0-9]*|workflow_call:release/v*) ;;
+              *)
+                echo "::error::Publish run did not originate from an approved event and branch"
+                exit 1
+                ;;
+            esac
+            deploy_sha="$SOURCE_SHA"
+          else
+            deploy_sha="$INPUT_SHA"
+          fi
+          if [[ ! "$deploy_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid deployment commit identity"
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            trusted_run=false
+            while IFS=$'\t' read -r conclusion event branch path repository; do
+              [[ "$conclusion" == "success" && "$path" == ".github/workflows/npm-publish.yml" && "$repository" == "$GITHUB_REPOSITORY" ]] || continue
+              case "$event:$branch" in
+                release:v[0-9]*|release:main|workflow_dispatch:main|workflow_dispatch:v[0-9]*|workflow_dispatch:release/v*|workflow_call:main|workflow_call:v[0-9]*|workflow_call:release/v*) trusted_run=true ;;
+              esac
+            done < <(gh api -X GET "repos/${GITHUB_REPOSITORY}/actions/workflows/npm-publish.yml/runs" \
+              -f head_sha="$deploy_sha" -f status=success -f per_page=100 \
+              --jq '.workflow_runs[] | [.conclusion, .event, .head_branch, .path, .head_repository.full_name] | @tsv')
+            if [[ "$trusted_run" != "true" ]]; then
+              echo "::error::No successful trusted npm publish run exists for the requested commit"
+              exit 1
+            fi
+          fi
+          git init provenance
+          git -C provenance remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -C provenance fetch --filter=blob:none --no-tags origin "$deploy_sha"
+          git -C provenance fetch --filter=blob:none --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git -C provenance merge-base --is-ancestor "$deploy_sha" refs/remotes/origin/main
+          package_version=$(git -C provenance show "$deploy_sha:package.json" | jq -er .version)
+          if [[ ! "$package_version" =~ ^[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Exact commit does not declare a valid package version"
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$INPUT_VERSION" != "$package_version" ]]; then
+            echo "::error::Requested version does not match the exact commit"
+            exit 1
+          fi
+          registry_version=$(npm view "omniroute@${package_version}" version)
+          if [[ "$registry_version" != "$package_version" ]]; then
+            echo "::error::Exact package version is not available from npm"
+            exit 1
+          fi
+          registry_git_head=$(npm view "omniroute@${package_version}" gitHead)
+          if [[ "$registry_git_head" != "$deploy_sha" ]]; then
+            echo "::error::Published npm artifact was not built from the trusted commit"
+            exit 1
+          fi
+          registry_integrity=$(npm view "omniroute@${package_version}" dist.integrity)
+          if [[ ! "$registry_integrity" =~ ^sha(256|384|512)-[A-Za-z0-9+/=]+$ ]]; then
+            echo "::error::Published npm artifact has no valid immutable integrity identity"
+            exit 1
+          fi
+          {
+            echo "version=$package_version"
+            echo "sha=$deploy_sha"
+            echo "integrity=$registry_integrity"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Check VPS SSH reachability from runner
         id: reach
         env:
@@ -25,15 +125,9 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
         run: |
           set -uo pipefail
-          # A GitHub-hosted runner can only deploy when it can actually open a TCP
-          # connection to the VPS SSH port. The Local VPS lives on a private LAN and
-          # the Akamai host firewalls :22 to known IPs, so the runner is routinely
-          # unable to reach it (`dial tcp ***:22: i/o timeout`). Treat "unreachable
-          # from the runner" as a SKIP — the real deploys are run manually from an
-          # allowed network via the deploy-vps-local / deploy-vps-akamai skills — so
-          # an unreachable host no longer red-fails every release/push pipeline.
-          # When the host IS reachable, the deploy step below still runs in full and
-          # its health gate surfaces any genuine deploy failure.
+          # A GitHub-hosted runner can deploy only when it can open the VPS SSH port.
+          # An unreachable host is a truthful workflow failure; operators may use the
+          # separately reviewed manual deployment path from an allowed network.
           # VPS_HOST is exported and expanded by the child bash.
           # shellcheck disable=SC2016
           if timeout 15 bash -c 'exec 3<>"/dev/tcp/${VPS_HOST}/22"' 2>/dev/null; then
@@ -41,12 +135,17 @@ jobs:
             echo "✅ VPS_HOST:22 reachable from the runner — proceeding with deploy."
           else
             echo "reachable=false" >> "$GITHUB_OUTPUT"
-            echo "::warning title=Auto-deploy skipped::VPS_HOST:22 is not reachable from this GitHub runner (private LAN / firewalled). Deploy manually with the deploy-vps-local or deploy-vps-akamai skill."
+            echo "::error title=Deployment failed::VPS_HOST:22 is not reachable from this GitHub runner."
+            exit 1
           fi
 
       - name: Deploy via SSH
         if: steps.reach.outputs.reachable == 'true'
-        uses: appleboy/ssh-action@v1
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1
+        env:
+          DEPLOY_VERSION: ${{ steps.provenance.outputs.version }}
+          DEPLOY_SHA: ${{ steps.provenance.outputs.sha }}
+          EXPECTED_INTEGRITY: ${{ steps.provenance.outputs.integrity }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
@@ -54,13 +153,91 @@ jobs:
           port: 22
           timeout: 60s
           command_timeout: 15m
+          envs: DEPLOY_VERSION,DEPLOY_SHA,EXPECTED_INTEGRITY
           script: |
             set -euo pipefail
 
+            if ! printf '%s' "$DEPLOY_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+              echo "Invalid deployment version" >&2
+              exit 1
+            fi
+            if ! printf '%s' "$DEPLOY_SHA" | grep -qE '^[0-9a-f]{40}$'; then
+              echo "Invalid deployment commit" >&2
+              exit 1
+            fi
+            if ! printf '%s' "$EXPECTED_INTEGRITY" | grep -qE '^sha(256|384|512)-[A-Za-z0-9+/=]+$'; then
+              echo "Invalid deployment integrity identity" >&2
+              exit 1
+            fi
+
+            remote_integrity=$(npm view "omniroute@${DEPLOY_VERSION}" dist.integrity)
+            if [[ "$remote_integrity" != "$EXPECTED_INTEGRITY" ]]; then
+              echo "npm artifact integrity changed after provenance validation" >&2
+              exit 1
+            fi
+
+            PREVIOUS_VERSION=$(npm list -g omniroute --depth=0 --json 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(JSON.parse(s).dependencies?.omniroute?.version||"")}catch{}})' || true)
+            PREVIOUS_INTEGRITY=""
+            if printf '%s' "$PREVIOUS_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+              PREVIOUS_INTEGRITY=$(npm view "omniroute@${PREVIOUS_VERSION}" dist.integrity)
+            fi
+            wait_for_health() {
+              label=$1
+              version=$2
+              for i in $(seq 1 36); do
+                body=$(curl -sf -m 5 http://localhost:20128/api/monitoring/health 2>/dev/null || true)
+                if printf '%s' "$body" | grep -q '"status":"healthy"'; then
+                  echo "✅ ${label} health gate passed (attempt $i) — version ${version}"
+                  return 0
+                fi
+                echo "… ${label} not healthy yet (attempt $i/36), retrying in 5s"
+                sleep 5
+              done
+              echo "❌ ${label} health gate failed after ~3min" >&2
+              echo "--- recent PM2 logs ---"
+              pm2 logs omniroute --lines 40 --nostream || true
+              return 1
+            }
+            rollback() {
+              echo "Deployment of omniroute@${DEPLOY_VERSION} (${DEPLOY_SHA}) failed."
+              if printf '%s' "$PREVIOUS_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+                echo "Rolling back to omniroute@${PREVIOUS_VERSION}."
+                rollback_integrity=$(npm view "omniroute@${PREVIOUS_VERSION}" dist.integrity)
+                if [[ -z "$PREVIOUS_INTEGRITY" || "$rollback_integrity" != "$PREVIOUS_INTEGRITY" ]]; then
+                  echo "Refusing rollback because the previous artifact identity changed." >&2
+                  return 1
+                fi
+                npm install -g "omniroute@${PREVIOUS_VERSION}"
+                pm2 delete omniroute 2>/dev/null || true
+                pm2 start omniroute --name omniroute -- --port 20128
+                pm2 save
+                if ! wait_for_health "Rollback" "$PREVIOUS_VERSION"; then
+                  echo "Rollback did not restore a healthy service." >&2
+                  return 1
+                fi
+                echo "Rollback restored a healthy omniroute@${PREVIOUS_VERSION}."
+              else
+                echo "No trustworthy previous package identity was available for rollback."
+              fi
+            }
+            deploy_succeeded=false
+            rollback_on_exit() {
+              status=$?
+              if [[ "$deploy_succeeded" != "true" ]]; then
+                rollback || true
+              fi
+              exit "$status"
+            }
+            trap rollback_on_exit EXIT
+
             echo "=== Updating OmniRoute ==="
-            npm install -g omniroute@latest
+            npm install -g "omniroute@${DEPLOY_VERSION}"
             INSTALLED_VERSION=$(omniroute --version 2>/dev/null | tr -d '[:space:]' || echo "unknown")
             echo "Installed CLI version: $INSTALLED_VERSION"
+            if [[ "$INSTALLED_VERSION" != "$DEPLOY_VERSION" ]]; then
+              echo "Installed version does not match the trusted run" >&2
+              exit 1
+            fi
 
             # Recreate the PM2 process instead of `pm2 restart`. A bare restart
             # re-runs whatever script path was saved earlier; after the build-output
@@ -80,21 +257,9 @@ jobs:
             # bound). Boot can take a while after a native-module/build-layout change,
             # so poll up to ~3min before giving up.
             echo "=== Health Check (gates the deploy) ==="
-            ok=0
-            for i in $(seq 1 36); do
-              BODY=$(curl -sf -m 5 http://localhost:20128/api/monitoring/health 2>/dev/null || true)
-              if printf '%s' "$BODY" | grep -q '"status":"healthy"'; then
-                ok=1
-                echo "✅ /api/monitoring/health -> healthy (attempt $i) — version $INSTALLED_VERSION"
-                break
-              fi
-              echo "… not healthy yet (attempt $i/36), retrying in 5s"
-              sleep 5
-            done
-            if [ "$ok" != "1" ]; then
-              echo "❌ Health check failed — /api/monitoring/health never reported healthy after ~3min"
-              echo "--- recent PM2 logs ---"
-              pm2 logs omniroute --lines 40 --nostream || true
+            if ! wait_for_health "Deployment" "$INSTALLED_VERSION"; then
               exit 1
             fi
+            deploy_succeeded=true
+            trap - EXIT
             echo "=== Deploy complete ==="
