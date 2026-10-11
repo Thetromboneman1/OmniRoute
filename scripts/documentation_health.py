@@ -226,7 +226,24 @@ def render_svg(svg_path: Path, png_path: Path) -> None:
 
 
 def mermaid_command(source: Path, output: Path) -> list[str]:
-    command = ["npx", "-y", "@mermaid-js/mermaid-cli@11.10.1", "-i", str(source), "-o", str(output), "-b", "transparent"]
+    # The repository uses legacy-peer-deps=true, so npm does not automatically
+    # install mermaid-cli's Puppeteer peer. Declare both packages explicitly so
+    # npx builds a complete isolated renderer on local machines and CI runners.
+    command = [
+        "npx",
+        "-y",
+        "--package",
+        "@mermaid-js/mermaid-cli@11.10.1",
+        "--package",
+        "puppeteer@23",
+        "mmdc",
+        "-i",
+        str(source),
+        "-o",
+        str(output),
+        "-b",
+        "transparent",
+    ]
     if output.suffix.lower() == ".png":
         command.extend(["--scale", "2"])
     return command
