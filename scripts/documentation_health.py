@@ -283,8 +283,15 @@ def render_mermaid(root: Path, source: str, digest: str) -> tuple[Path, Path, Pa
     stamp_path.unlink(missing_ok=True)
     env = os.environ.copy()
     env.setdefault("PUPPETEER_SKIP_DOWNLOAD", "1")
-    chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-    if chrome.exists():
+    chrome_candidates = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+    ]
+    chrome = next((candidate for candidate in chrome_candidates if candidate and Path(candidate).exists()), None)
+    if chrome:
         env.setdefault("PUPPETEER_EXECUTABLE_PATH", str(chrome))
     if not svg_path.exists():
         result = subprocess.run(
