@@ -22,14 +22,8 @@ contributor-facing summary.
 | `main` | **Published line** — receives the cycle via squash-merge when the release ships |
 | `vX.Y.Z` (tag) | **Ship marker** — immutable “what shipped” pointer cut at release time |
 
-```mermaid
-flowchart LR
-  A["feat/fix branch"] --> B["PR → release/vX.Y.Z"]
-  B --> C["release/vX.Y.Z tip"]
-  C --> D["Release PR squash-merges → main"]
-  D --> E["Tag vX.Y.Z"]
-  C --> F["Next cycle: release/vX+1 cut from frozen tip"]
-```
+![Rendered system diagram](../architecture/generated/mermaid-6b385a587aba.png)
+
 
 ## Where should my PR target?
 

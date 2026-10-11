@@ -1,0 +1,10 @@
+flowchart TD
+    subgraph App["App Replica"]
+        RL[rateLimiter.ts]
+        AK[apiKeys.ts]
+        QS[redisQuotaStore.ts]
+    end
+    RL -- "REDIS_URL" --> R1[(Redis\nshared)]
+    AK -- "reuses RL's client" --> R1
+    QS -- "QUOTA_STORE_REDIS_URL" --> R2[(Redis\nquota store)]
+    R1 --> R2 -- "can be same instance" --> R1

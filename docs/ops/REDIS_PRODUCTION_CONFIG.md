@@ -179,18 +179,8 @@ Key metrics to watch:
 
 ## Architecture Diagram
 
-```mermaid
-flowchart LR
-    subgraph App["App Replica"]
-        RL[rateLimiter.ts]
-        AK[apiKeys.ts]
-        QS[redisQuotaStore.ts]
-    end
-    RL -- "REDIS_URL" --> R1[(Redis\nshared)]
-    AK -- "reuses RL's client" --> R1
-    QS -- "QUOTA_STORE_REDIS_URL" --> R2[(Redis\nquota store)]
-    R1 --> R2 -- "can be same instance" --> R1
-```
+![Rendered system diagram](../architecture/generated/mermaid-da2a6f2b5c7b.png)
+
 
 ---
 

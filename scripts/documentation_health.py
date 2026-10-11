@@ -64,7 +64,8 @@ def maintained_documents(root: Path) -> list[Path]:
 def is_external_or_generated_document(root: Path, document: Path) -> bool:
     relative = document.relative_to(root).as_posix()
     return (
-        relative.startswith("docs/reference/")
+        relative.startswith("docs/i18n/")
+        or relative.startswith("docs/reference/")
         or relative.startswith(".agents/")
         or relative.startswith(".github/prompts/")
         or relative.startswith(".github/chatmodes/")

@@ -1743,3 +1743,20 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 </div>
 <!-- GitHub Discussions enabled for community Q&A -->
+
+<!-- documentation-health:start -->
+
+## Current repository state
+
+![OmniRoute system architecture](docs/architecture/omniroute-system-architecture.png)
+
+- **Default branch:** `main`
+- **Implementation fingerprint:** `075dab06259689c9`
+- **Detected structure:** Source modules, Automation modules, Workspace packages, GitHub Actions, Tests and validation, Maintained documentation.
+- **Documentation contract:** editable diagram sources, committed PNG renderings,
+  resolved local image links, and generated state are checked on every commit.
+- **Refresh command:** `python3 scripts/documentation_health.py --write`
+
+See [repository state](docs/REPOSITORY_STATE.md) and the
+[architecture asset guide](docs/architecture/README.md).
+<!-- documentation-health:end -->
