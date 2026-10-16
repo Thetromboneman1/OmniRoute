@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: fork-sync-main
@@ -18,6 +18,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: Require workflow-capable fork sync credential
+        env:
+          SYNC_TOKEN: ${{ secrets.OMNIROUTE_FORK_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error title=Missing fork sync credential::Configure OMNIROUTE_FORK_SYNC_TOKEN for this repository with Contents and Workflows read/write permissions."
+            exit 1
+          fi
+
       - name: Checkout fork main
         # v7.0.1
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -27,14 +36,11 @@ jobs:
           token: ${{ github.token }}
           persist-credentials: false
 
-      - name: Configure git identity and authenticated origin
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Configure git identity
         run: |
           set -Eeuo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
       - name: Fetch upstream
         run: |
@@ -92,6 +98,7 @@ jobs:
         env:
           STRATEGY: ${{ steps.strategy.outputs.strategy }}
           UPSTREAM_SHA: ${{ steps.strategy.outputs.upstream-sha }}
+          SYNC_TOKEN: ${{ secrets.OMNIROUTE_FORK_SYNC_TOKEN }}
         run: |
           set -Eeuo pipefail
 
@@ -114,7 +121,9 @@ jobs:
             exit 1
           fi
 
-          git push origin HEAD:main
+          authorization=$(printf 'x-access-token:%s' "$SYNC_TOKEN" | base64 | tr -d '\n')
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${authorization}" \
+            push origin HEAD:main
           {
             echo "SYNC_RESULT=synchronized"
             echo "SYNC_UPSTREAM_SHA=${UPSTREAM_SHA}"
