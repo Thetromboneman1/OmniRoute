@@ -51,6 +51,12 @@ const IGNORE_FROM_CODE = new Set([
   "CI",
   "GITHUB_ACTIONS",
   "RUNNER_OS",
+  // CI dashboard inputs injected by GitHub Actions for one workflow step. These
+  // describe the current run; they are not OmniRoute runtime configuration.
+  "EVENT_NAME",
+  "PR_DRAFT",
+  "IS_HOTFIX",
+  "NEEDS_JSON",
   // Quality-gate harness knobs (optional cache/report paths for CI scripts — not product config).
   "ESLINT_RESULTS_JSON",
   "COMPLEXITY_ESLINT_REPORT",

@@ -105,6 +105,13 @@ const ENV_VAR_ALLOWLIST = new Set([
   "OMNIROUTE_URL", // used by ad-hoc tooling, validated elsewhere
   "OMNIROUTE_KEY", // ditto
   "OPENCODE_API_KEY", // ditto
+  // Repository-maintenance inventory: these are GitHub Actions secrets / a
+  // repository variable, not application environment variables read by code.
+  "NPM_TOKEN",
+  "VPS_HOST",
+  "VPS_SSH_KEY",
+  "VPS_USER",
+  "DEPLOY_ENABLED",
   // ── External-tool / spawn-injected / ops env vars ────────────────────────
   // Real environment variables, but they belong to an UPSTREAM CLI/tool, a
   // docker-compose/electron-build pipeline, or are injected into a spawned
