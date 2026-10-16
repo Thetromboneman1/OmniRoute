@@ -463,10 +463,10 @@ jobs:
       # One FS inventory of src/app/api for both anti-hallucination directions.
       - name: API docs refs (openapi + prose → routes)
         run: npm run check:api-docs-refs
-      # Blocking since the 2026-09 docs re-sync: a core doc edited without `npm run i18n:run
-      # --files=<doc>` (or `--adopt` for a mechanical edit) leaves 65 stale mirrors behind;
-      # the run only retranslates the `## ` sections whose text changed, so it is cheap.
-      - name: i18n docs drift (sources changed since their translation)
+      # Policy-controlled by config/i18n.json. Upstream-style repositories can keep this
+      # blocking; this fork reports drift as advisory so contributors can translate with
+      # their own tools. `--strict` remains available for an explicit release-time audit.
+      - name: i18n docs drift (policy-controlled)
         run: node scripts/i18n/check-translation-drift.mjs
 
   docs-lint:

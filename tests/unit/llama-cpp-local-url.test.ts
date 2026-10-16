@@ -28,16 +28,12 @@ test("llama-cpp buildUrl routes to the configured local baseUrl, not OpenAI", ()
 // baseUrl was set; with an empty one, `this.config.baseUrl` (= PROVIDERS.openai,
 // since llama-cpp is not in the open-sse registry) leaked through, producing
 // OpenAI-worded "incorrect api key" errors. Now it must fall back to the
-// catalog's localDefault (http://127.0.0.1:8080/v1).
+// catalog's downstream localDefault (http://127.0.0.1:8002/v1).
 test("llama-cpp buildUrl falls back to the local default when no baseUrl is set", () => {
   const executor = new DefaultExecutor("llama-cpp");
   const url = executor.buildUrl("some-model", true, 0, {});
 
-  assert.equal(url, "http://127.0.0.1:8080/v1/chat/completions");
-  assert.equal(
-    new URL(url).hostname,
-    "127.0.0.1",
-    `expected local default host, got ${url}`
-  );
+  assert.equal(url, "http://127.0.0.1:8002/v1/chat/completions");
+  assert.equal(new URL(url).hostname, "127.0.0.1", `expected local default host, got ${url}`);
   assert.notEqual(new URL(url).hostname, "api.openai.com");
 });

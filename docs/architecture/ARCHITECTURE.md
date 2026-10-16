@@ -17,7 +17,7 @@ It provides a single OpenAI-compatible endpoint (`/v1/*`) and routes traffic acr
 
 Core capabilities:
 
-- OpenAI-compatible API surface for CLI/tools (355 providers, 108 executors)
+- OpenAI-compatible API surface for CLI/tools (361 providers, 108 executors)
 - Request/response translation across provider formats
 - Model combo fallback (multi-model sequence)
 - Structured combo steps (`provider + model + connection`) with runtime ordering by `compositeTiers`
@@ -157,7 +157,6 @@ Main pages under `src/app/(dashboard)/dashboard/`:
 ## High-Level System Context
 
 ![Rendered system diagram](generated/mermaid-c864441bb484.png)
-
 
 ## Core Runtime Components
 
@@ -514,11 +513,9 @@ Domain State DB (SQLite):
 
 ![Rendered system diagram](generated/mermaid-4e3326f123a0.png)
 
-
 ## Combo + Account Fallback Flow
 
 ![Rendered system diagram](generated/mermaid-827dbbaf142b.png)
-
 
 Fallback decisions are driven by `open-sse/services/accountFallback.ts` using status codes and error-message heuristics. Combo routing adds one extra guard: provider-scoped 400s such as upstream content-block and role-validation failures are treated as model-local failures so later combo targets can still run.
 
@@ -526,20 +523,17 @@ Fallback decisions are driven by `open-sse/services/accountFallback.ts` using st
 
 ![Rendered system diagram](generated/mermaid-30b702e2d5f6.png)
 
-
 Refresh during live traffic is executed inside `open-sse/handlers/chatCore.ts` via executor `refreshCredentials()`.
 
 ## Cloud Sync Lifecycle (Enable / Sync / Disable)
 
 ![Rendered system diagram](generated/mermaid-dcdb656d952c.png)
 
-
 Periodic sync is triggered by `CloudSyncScheduler` when cloud is enabled.
 
 ## Data Model and Storage Map
 
 ![Rendered system diagram](generated/mermaid-f75cafbced5b.png)
-
 
 Physical storage files:
 
@@ -551,7 +545,6 @@ Physical storage files:
 ## Deployment Topology
 
 ![Rendered system diagram](generated/mermaid-794d65ede9f6.png)
-
 
 ## Module Mapping (Decision-Critical)
 

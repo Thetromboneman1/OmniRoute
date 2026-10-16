@@ -8,9 +8,11 @@
  * deterministic state-vs-disk comparison.
  *
  * Modes:
- *   --strict (default)  exit 1 on any drift, print the offending paths
+ *   --strict            exit 1 on any drift, print the offending paths
  *   --warn              exit 0, print warnings only
  *   --json              emit a JSON report to stdout (no human log lines)
+ * Without an explicit mode, config/i18n.json may make source freshness advisory;
+ * missing or modified mirror targets remain blocking.
  *
  * Recommended usage in CI:
  *   npm run i18n:check
@@ -45,11 +47,15 @@ export function findStaleTargets(sources) {
 }
 
 function parseArgs(argv) {
-  const opts = { mode: "strict", json: false };
+  const opts = { mode: "strict", modeExplicit: false, json: false };
   for (const arg of argv.slice(2)) {
-    if (arg === "--warn") opts.mode = "warn";
-    else if (arg === "--strict") opts.mode = "strict";
-    else if (arg === "--json") opts.json = true;
+    if (arg === "--warn") {
+      opts.mode = "warn";
+      opts.modeExplicit = true;
+    } else if (arg === "--strict") {
+      opts.mode = "strict";
+      opts.modeExplicit = true;
+    } else if (arg === "--json") opts.json = true;
     else if (arg === "--help" || arg === "-h") {
       console.log(
         [
@@ -64,6 +70,15 @@ function parseArgs(argv) {
     }
   }
   return opts;
+}
+
+export function effectiveMode({ requestedMode = "strict", explicit = false, policy }) {
+  return policy === "advisory" && !explicit ? "advisory" : requestedMode;
+}
+
+export function translationCheckOk({ mode, driftedSources, missingTargets, driftedTargets }) {
+  if (missingTargets.length > 0 || driftedTargets.length > 0) return false;
+  return mode === "advisory" || driftedSources.length === 0;
 }
 
 function sha256(buf) {
@@ -89,6 +104,11 @@ async function main() {
   // `--all` restores the full-state behaviour for local inspection.
   const { computeDocsCoreSet } = await import("./lib/docs-core-set.mjs");
   const config = JSON.parse(await fs.readFile(path.join(ROOT, "config", "i18n.json"), "utf8"));
+  opts.mode = effectiveMode({
+    requestedMode: opts.mode,
+    explicit: opts.modeExplicit,
+    policy: config.docsTranslationFreshness,
+  });
   const coreSet = computeDocsCoreSet({ root: ROOT, config });
   const coreList = Array.isArray(coreSet)
     ? coreSet
@@ -145,14 +165,27 @@ async function main() {
   // backend outage nobody can fix in-branch helps no one. The list is the
   // work order for `npm run i18n:run -- --locale=<code> --files=<sources>`.
   const staleTargets = findStaleTargets(sources);
-  const ok =
-    driftedSources.length === 0 && missingTargets.length === 0 && driftedTargets.length === 0;
+  const strictOk = translationCheckOk({
+    mode: "strict",
+    driftedSources,
+    missingTargets,
+    driftedTargets,
+  });
+  const ok = translationCheckOk({
+    mode: opts.mode,
+    driftedSources,
+    missingTargets,
+    driftedTargets,
+  });
 
   if (opts.json) {
     process.stdout.write(
       JSON.stringify(
         {
           ok,
+          strictOk,
+          mode: opts.mode,
+          policy: config.docsTranslationFreshness ?? "blocking",
           checkedSources,
           checkedTargets,
           driftedSources,
@@ -184,10 +217,14 @@ async function main() {
       );
       for (const t of staleTargets) console.log(`  - ${t.rel} [${t.locale}] (stale)`);
     }
-    if (ok) {
+    if (ok && strictOk) {
       console.log("[i18n-check] PASS — all sources and targets match recorded hashes.");
+    } else if (ok && opts.mode === "advisory") {
+      console.log(
+        "[i18n-check] WARN — source drift is advisory for this fork; missing or modified mirror targets remain blocking. Pass --strict to enforce source freshness."
+      );
     } else if (opts.mode === "warn") {
-      console.log("[i18n-check] WARN — drift detected (warn mode, exiting 0).");
+      console.log("[i18n-check] WARN — drift detected (explicit warn mode, exiting 0).");
     } else {
       console.log("[i18n-check] FAIL — drift detected. Run `npm run i18n:run` to refresh.");
     }
