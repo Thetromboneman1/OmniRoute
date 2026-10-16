@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { findStaleTargets } from "../../scripts/i18n/check-translation-drift.mjs";
+import {
+  effectiveMode,
+  findStaleTargets,
+  translationCheckOk,
+} from "../../scripts/i18n/check-translation-drift.mjs";
 
 // A partial refresh run (17 of 65 locales retranslated before an upstream 429)
 // bumps the top-level source_hash while the interrupted locales keep the old
@@ -32,4 +36,21 @@ test("records without a per-locale source_hash (legacy) are not reported", () =>
   const sources = { "docs/y.md": { source_hash: "h", locales: { de: { target_hash: "t" } } } };
   assert.deepEqual(findStaleTargets(sources), []);
   assert.deepEqual(findStaleTargets({}), []);
+});
+
+test("advisory fork policy warns by default but explicit strict still enforces", () => {
+  assert.equal(effectiveMode({ policy: "advisory" }), "advisory");
+  assert.equal(
+    effectiveMode({ requestedMode: "strict", explicit: true, policy: "advisory" }),
+    "strict"
+  );
+  assert.equal(effectiveMode({ policy: "blocking" }), "strict");
+});
+
+test("advisory source freshness never exempts missing or modified mirror targets", () => {
+  const base = { mode: "advisory", driftedSources: [{}], missingTargets: [], driftedTargets: [] };
+  assert.equal(translationCheckOk(base), true);
+  assert.equal(translationCheckOk({ ...base, missingTargets: [{}] }), false);
+  assert.equal(translationCheckOk({ ...base, driftedTargets: [{}] }), false);
+  assert.equal(translationCheckOk({ ...base, mode: "strict" }), false);
 });

@@ -26,6 +26,11 @@
       "description": "Locale codes that should NOT receive docs translations (e.g. the source language).",
       "items": { "type": "string" }
     },
+    "docsTranslationFreshness": {
+      "type": "string",
+      "enum": ["blocking", "advisory"],
+      "description": "Whether English source drift fails the default docs check. Advisory forks still report every stale mirror while missing or modified targets remain blocking; pass --strict to enforce source freshness on demand. Omitted defaults to blocking."
+    },
     "locales": {
       "type": "array",
       "minItems": 1,

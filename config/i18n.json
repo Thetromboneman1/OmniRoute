@@ -4,6 +4,7 @@
   "rtl": ["ar", "fa", "he", "ur"],
   "uiOnly": ["en"],
   "docsExcluded": ["en"],
+  "docsTranslationFreshness": "advisory",
   "locales": [
     {
       "code": "am",
