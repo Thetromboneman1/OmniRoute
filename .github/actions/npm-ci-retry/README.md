@@ -1,6 +1,6 @@
 # npm ci with retry
 
-This action installs the checkout dependencies with up to three attempts and restores a node_modules tree only when its complete cache key matches. Node, the lockfile, project npm configuration, postinstall helpers and the action itself participate in the key.
+This action installs the checkout dependencies with up to three attempts and restores a node_modules tree only when its complete cache key matches. Node, npm, lockfile, project npm configuration, postinstall helpers and the action itself participate in the key. Cached and freshly installed trees still pass the existing native-runtime verification.
 
 The installation step sets `ONNXRUNTIME_NODE_INSTALL=skip` before invoking npm. ONNX Runtime reads this environment variable directly, so skipping its additional CUDA installation does not depend on npm forwarding the custom `.npmrc` key. The repository retains that key temporarily; its npm warning can therefore remain.
 

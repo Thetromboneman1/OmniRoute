@@ -1,5 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { runGateProcess } from "../../../scripts/quality/gate-process.mjs";
 import {
   computeVerdict,
   evaluateComplexityRun,
@@ -102,4 +106,34 @@ test("partial regression output cannot disguise a crashed check as advisory drif
     100
   );
   assert.equal(computeVerdict(results).releaseGreen, false);
+});
+
+test("real subprocess cancellation preserves the receipt and cannot emit a metric PASS", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "release-green-complexity-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const controller = new AbortController();
+  const result = await runGateProcess(
+    process.execPath,
+    ["-e", "console.log('complexity=20'); setInterval(()=>{},1000)"],
+    {
+      cwd: directory,
+      logPath: join(directory, "complexity.log"),
+      timeout: 15000,
+      killGraceMs: 100,
+      signal: controller.signal,
+      heartbeatMs: 100,
+      onHeartbeat: ({ bytes }: { bytes: number }) => {
+        if (bytes > 0) controller.abort();
+      },
+    }
+  );
+  assert.equal(result.receipt.outcome, "CANCELLED");
+  assert.equal(JSON.parse(readFileSync(result.receiptPath, "utf8")).outcome, "CANCELLED");
+  const checks = evaluateComplexityRun(result, 100);
+  assert.equal(
+    checks.some((check) => check.ok),
+    false
+  );
+  const report = JSON.parse(JSON.stringify({ checks, ...computeVerdict(checks) }));
+  assert.equal(report.releaseGreen, false);
 });

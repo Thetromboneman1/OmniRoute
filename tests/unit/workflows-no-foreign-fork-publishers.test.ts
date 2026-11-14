@@ -34,8 +34,23 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const workflowDir = path.join(repoRoot, ".github/workflows");
 
-/** The only owner whose namespaces this repository may publish to or gate on. */
+/**
+ * The only owner whose namespaces this fork may publish to or gate on. Upstream moved to the
+ * cheaper-inference organization on 2026-10-21 and still publishes Docker Hub images as
+ * diegosouzapw; this fork publishes neither, so every registry namespace must be ours.
+ */
 const OWNER = "thetromboneman1";
+/**
+ * Upstream gates its scheduled jobs with `github.repository == 'cheaper-inference/OmniRoute'`,
+ * which makes them a no-op in this fork. That positive gate is allowed (it can only skip work
+ * here); a `!=` guard or any other foreign owner is not.
+ */
+const UPSTREAM_REPOSITORY = "cheaper-inference/omniroute";
+const REGISTRY_OWNER: Record<string, string> = {
+  "ghcr.io": OWNER,
+  "docker.io": OWNER,
+  "index.docker.io": OWNER,
+};
 
 function workflowFiles(): string[] {
   return fs
@@ -51,9 +66,9 @@ test("no workflow publishes to another owner's container registry", () => {
     const text = fs.readFileSync(file, "utf-8");
     // ghcr.io/<owner>/... and index.docker.io/<owner>/... — the owner is the segment
     // right after the registry host.
-    for (const m of text.matchAll(/\b(?:ghcr\.io|(?:index\.)?docker\.io)\/([A-Za-z0-9_.-]+)/g)) {
-      const owner = m[1];
-      if (owner.toLowerCase() !== OWNER) {
+    for (const m of text.matchAll(/\b(ghcr\.io|(?:index\.)?docker\.io)\/([A-Za-z0-9_.-]+)/g)) {
+      const [, host, owner] = m;
+      if (owner.toLowerCase() !== REGISTRY_OWNER[host]) {
         offenders.push(`${path.basename(file)} → ${m[0]}`);
       }
     }
@@ -62,7 +77,7 @@ test("no workflow publishes to another owner's container registry", () => {
   assert.deepEqual(
     offenders,
     [],
-    `workflow(s) target a registry namespace that is not ${OWNER}'s:\n  ${offenders.join("\n  ")}\n` +
+    `workflow(s) target a registry namespace that is not ours (${JSON.stringify(REGISTRY_OWNER)}):\n  ${offenders.join("\n  ")}\n` +
       `A fork's publish workflow does not belong in the canonical repository — it cannot ` +
       `authenticate anyway, and it pollutes every release check board.`
   );
@@ -75,9 +90,10 @@ test("no workflow job is gated on a different repository", () => {
     const text = fs.readFileSync(file, "utf-8");
     // `if: github.repository == 'owner/name'` — a guard naming someone else's repo means
     // the workflow was written for a fork.
-    for (const m of text.matchAll(/github\.repository\s*[=!]=\s*['"]([^'"]+)['"]/g)) {
-      const [owner] = m[1].split("/");
-      if (owner.toLowerCase() !== OWNER) {
+    for (const m of text.matchAll(/github\.repository\s*([=!])=\s*['"]([^'"]+)['"]/g)) {
+      const [owner] = m[2].split("/");
+      const upstreamOnlyGate = m[1] === "=" && m[2].toLowerCase() === UPSTREAM_REPOSITORY;
+      if (owner.toLowerCase() !== OWNER && !upstreamOnlyGate) {
         offenders.push(`${path.basename(file)} → ${m[0]}`);
       }
     }

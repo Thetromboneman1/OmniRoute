@@ -21,7 +21,7 @@ for (const stale of [
   "**352-provider catalog**",
   "327 AI Providers",
   "329 registered providers",
-  "**349** LLM providers",
+  "**358** LLM providers",
 ]) {
   test(`rejects mixed current and stale aggregate claims: ${stale}`, () => {
     assert.equal(evaluate(`${expected} providers. Also: ${stale}.`).strict, 1);

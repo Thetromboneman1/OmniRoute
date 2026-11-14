@@ -1,3 +1,4 @@
+import { mergeCodexQuotaObservation } from "@/lib/providers/codexQuotaDisplay";
 import { backupDbFile } from "../backup";
 import { getDbInstance, rowToCamel } from "../core";
 import { invalidateDbCache } from "../readCache";
@@ -41,7 +42,9 @@ function mutate(id: string, apply: (data: RecordValue) => void): RecordValue | n
     ).run(JSON.stringify(data), new Date().toISOString(), id);
     return data;
   })();
-  if (result) invalidateDbCache("connections");
+  // #13389: codex quota/cooldown observations are routing/health-only writes;
+  // the model catalog never reads them, so don't bust the /v1/models cache.
+  if (result) invalidateDbCache("connections", undefined, { skipModelCatalog: true });
   return result;
 }
 
@@ -81,7 +84,7 @@ export async function syncCodexQuotaObservation(id: string, usage: RecordValue, 
       )
         continue;
       const byScope = { ...toRecord(data.codexQuotaStateByScope) };
-      const snapshot = { ...toRecord(byScope[scope]), observedAt: new Date().toISOString() };
+      const snapshot: RecordValue = { observedAt: new Date().toISOString() };
       for (const [window, suffix] of [
         [session, "5h"],
         [weekly, "7d"],
@@ -93,7 +96,9 @@ export async function syncCodexQuotaObservation(id: string, usage: RecordValue, 
           [`resetAt${suffix}`]: window.resetAt ?? null,
         });
       }
-      byScope[scope] = snapshot;
+      const merged = mergeCodexQuotaObservation(toRecord(byScope[scope]), snapshot);
+      if (!merged) continue;
+      byScope[scope] = merged;
       data.codexQuotaStateByScope = byScope;
       if (
         valid(session) &&

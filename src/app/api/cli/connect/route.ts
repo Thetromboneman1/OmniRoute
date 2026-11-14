@@ -9,7 +9,12 @@ import {
   verifyManagementPassword,
 } from "@/lib/auth/managementPassword";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
-import { checkLoginGuard, clearLoginAttempts, recordLoginFailure } from "@/server/auth/loginGuard";
+import {
+  beginLoginAttempt,
+  clearLoginAttempts,
+  endLoginAttempt,
+  recordLoginFailure,
+} from "@/server/auth/loginGuard";
 import {
   getLoginLockoutKey,
   getLoginSourceScope,
@@ -17,6 +22,7 @@ import {
 } from "@/server/auth/loginPeer";
 import { getRequestPeerLocality } from "@/shared/utils/apiAuth";
 import { createAccessToken } from "@/lib/db/accessTokens";
+import { isMfaRequiredForRequest, verifyDashboardSecondFactor } from "@/server/auth/dashboardMfa";
 import { ACCESS_SCOPES } from "@/lib/accessTokens/scopes";
 
 /**
@@ -37,10 +43,16 @@ const connectSchema = z.object({
   name: z.string().min(1).max(100).optional(),
   scope: z.enum(ACCESS_SCOPES).optional(),
   expiresInDays: z.number().int().positive().max(3650).optional(),
+  // Required while dashboard two-factor login is on: a 6-digit TOTP or a recovery code.
+  totp: z.string().trim().min(1).max(64).optional(),
 });
 
 export async function POST(request: Request) {
   const auditContext = getAuditRequestContext(request);
+  // The guard reserves a failure slot while the password is being verified; release it on
+  // every exit so an aborted request cannot leak budget.
+  let heldSlotKey: string | null | undefined;
+  let holdsSlot = false;
 
   try {
     let rawBody: unknown;
@@ -54,7 +66,7 @@ export async function POST(request: Request) {
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
-    const { password, name, scope, expiresInDays } = validation.data;
+    const { password, name, scope, expiresInDays, totp } = validation.data;
 
     const settings = await getCachedSettings();
     const bruteForceEnabled = settings.bruteForceProtection !== false;
@@ -64,7 +76,7 @@ export async function POST(request: Request) {
     // would hand out a fresh attempt budget on every request.
     const lockoutKey = getLoginLockoutKey(request, clientIp);
 
-    const guardCheck = checkLoginGuard(lockoutKey, { enabled: bruteForceEnabled });
+    const guardCheck = beginLoginAttempt(lockoutKey, { enabled: bruteForceEnabled });
     if (!guardCheck.allowed) {
       logAuditEvent({
         action: "cli.connect.locked",
@@ -86,6 +98,9 @@ export async function POST(request: Request) {
         }
       );
     }
+
+    holdsSlot = true;
+    heldSlotKey = lockoutKey;
 
     const passwordState = await ensurePersistentManagementPasswordHash({
       settings,
@@ -158,6 +173,62 @@ export async function POST(request: Request) {
       );
     }
 
+    // Opt-in TOTP: with two-factor login on, the password alone must not mint an admin
+    // token either — otherwise this route is a way around the dashboard's second factor.
+    if (isMfaRequiredForRequest(request)) {
+      if (!totp) {
+        logAuditEvent({
+          action: "cli.connect.mfa_required",
+          actor: "anonymous",
+          target: "cli-access-token",
+          resourceType: "auth_session",
+          status: "failed",
+          ipAddress: clientIp || undefined,
+          requestId: auditContext.requestId,
+          metadata: { reason: "missing_second_factor" },
+        });
+        return NextResponse.json(
+          {
+            error: "Two-factor authentication is enabled. Provide a verification code (totp).",
+            mfaRequired: true,
+          },
+          { status: 401 }
+        );
+      }
+      const secondFactor = await verifyDashboardSecondFactor(totp);
+      if (!secondFactor.ok) {
+        const failureDecision = recordLoginFailure(lockoutKey, { enabled: bruteForceEnabled });
+        logAuditEvent({
+          action: "cli.connect.failed",
+          actor: "anonymous",
+          target: "cli-access-token",
+          resourceType: "auth_session",
+          status: "failed",
+          ipAddress: clientIp || undefined,
+          requestId: auditContext.requestId,
+          metadata: {
+            reason: "invalid_second_factor",
+            lockedOut: failureDecision.allowed === false,
+          },
+        });
+        if (!failureDecision.allowed) {
+          return NextResponse.json(
+            { error: "Too many failed attempts. Try again later." },
+            {
+              status: 429,
+              headers: failureDecision.retryAfterSeconds
+                ? { "Retry-After": String(failureDecision.retryAfterSeconds) }
+                : {},
+            }
+          );
+        }
+        return NextResponse.json(
+          { error: "Invalid verification code", mfaRequired: true },
+          { status: 401 }
+        );
+      }
+    }
+
     clearLoginAttempts(lockoutKey);
 
     const tokenScope = scope ?? "admin";
@@ -195,5 +266,7 @@ export async function POST(request: Request) {
   } catch (error) {
     console.error("[CLI] connect failed:", error);
     return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+  } finally {
+    if (holdsSlot) endLoginAttempt(heldSlotKey);
   }
 }

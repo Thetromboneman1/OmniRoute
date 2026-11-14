@@ -10,9 +10,12 @@ import {
 } from "../../../utils/reasoningPlaceholder.ts";
 import { getReadableReasoningValue } from "../../../utils/reasoningFields.ts";
 import { generateToolCallId } from "../../helpers/toolCallHelper.ts";
+import { coerceToolCallArguments } from "../../helpers/toolArguments.ts";
+import { chatStrictForResponses } from "../../helpers/toolStrict.ts";
 import {
   JsonRecord,
   RESPONSES_STORE_MARKER,
+  REASONING_SUMMARY_OPT_OUT_MARKER,
   toRecord,
   toArray,
   toString,
@@ -31,6 +34,18 @@ import {
 // explicit `reasoning` object from a Responses-shaped client is preserved as-is.
 const DEFAULT_RESPONSES_REASONING_SUMMARY = "auto";
 const RESPONSES_REASONING_ENCRYPTED_CONTENT_INCLUDE = "reasoning.encrypted_content";
+
+// Preserve the client's effort-only request shape for the listed model families
+// during Chat-to-Responses translation (optional `codex/` or `cx/` routing prefix,
+// optional effort suffix). Do not add a default summary or encrypted-content
+// include on this path. This compatibility policy makes no claim about the cause
+// or resolution of upstream safety rejections.
+const CODEX_MODEL_PATTERN =
+  /^(?:(?:codex|cx)\/)?(?:gpt-6(?:\.1)?-(?:astra|sol|luna)|gpt-5\.6-(?:sol|terra|luna))(?:-(?:none|low|medium|high|xhigh|max|ultra))?$/;
+function isCodexModel(model: unknown): boolean {
+  if (typeof model !== "string") return false;
+  return CODEX_MODEL_PATTERN.test(model.trim().toLowerCase());
+}
 
 // Chat Completions JSON `response_format` → Responses API `text.format`.
 // Merges into any existing `result.text` (e.g. verbosity) so structured-output schemas from
@@ -56,6 +71,32 @@ function mapChatResponseFormatToResponsesText(body: JsonRecord, result: JsonReco
   if (jsonSchema.strict !== undefined) format.strict = jsonSchema.strict;
 
   result.text = { ...existingText, format };
+}
+
+// The Responses API rejects text.format json_object with 400 "Response input
+// messages must contain the word 'json'" unless an `input` message says "json";
+// `instructions` does not count. Chat Completions counts the system prompt, and
+// this translator hoists that prompt into `instructions`, so a request that was
+// valid as Chat (JSON asked for only in the system prompt) failed upstream.
+// Prepend a constant developer hint in that case: a fixed prefix keeps
+// the prompt-cache prefix stable across turns.
+const JSON_OBJECT_INPUT_HINT = "Respond with a valid JSON object.";
+
+function ensureJsonObjectInputHint(result: JsonRecord): void {
+  if (toRecord(toRecord(result.text).format).type !== "json_object") return;
+  if (!Array.isArray(result.input)) return;
+  const input = result.input as JsonRecord[];
+  const mentionsJson = input.some((item) => {
+    if (item.type !== "message") return false;
+    if (typeof item.content === "string") return /json/i.test(item.content);
+    return toArray(item.content).some((part) => /json/i.test(toString(toRecord(part).text)));
+  });
+  if (mentionsJson) return;
+  input.unshift({
+    type: "message",
+    role: "developer",
+    content: [{ type: "input_text", text: JSON_OBJECT_INPUT_HINT }],
+  });
 }
 
 // Flatten a Chat-Completions content block into the single string the Responses
@@ -304,7 +345,7 @@ export function openaiToOpenAIResponsesRequest(
             type: "function_call",
             call_id: clampCallId(toString(toolCall.id).trim() || generateToolCallId()),
             name: fnName,
-            arguments: toString(fn.arguments, "{}"),
+            arguments: coerceToolCallArguments(fn.arguments),
             status: "completed",
           });
         }
@@ -319,7 +360,7 @@ export function openaiToOpenAIResponsesRequest(
             type: "function_call",
             call_id: clampCallId(`call_${fnName}`),
             name: fnName,
-            arguments: toString(fc.arguments, "{}"),
+            arguments: coerceToolCallArguments(fc.arguments),
             status: "completed",
           });
         }
@@ -366,12 +407,42 @@ export function openaiToOpenAIResponsesRequest(
       )
       .map((item: { type?: string; call_id?: string }) => item.call_id)
   );
-  result.input = input.filter((item: { type?: string; call_id?: string }) => {
+  const orphanFilteredInput = input.filter((item: { type?: string; call_id?: string }) => {
     if (item.type === "function_call_output" && item.call_id) {
       return knownCallIds.has(item.call_id);
     }
     return true;
   });
+  result.input = orphanFilteredInput;
+
+  // Mirror of the filter above: a `function_call` whose output never arrived
+  // (truncated history, client crash mid-tool-loop) makes strict Responses
+  // upstreams reject the whole request with 400 "No tool output found for
+  // function call <id>". Pair every unpaired call with a synthesized empty
+  // output in place rather than dropping the call, so the model still sees
+  // that the call happened and the caller's history stays intact (#15216).
+  const pairedOutputCallIds = new Set(
+    orphanFilteredInput
+      .filter(
+        (item: { type?: string; call_id?: string }) =>
+          item.type === "function_call_output" && item.call_id
+      )
+      .map((item: { type?: string; call_id?: string }) => item.call_id)
+  );
+  const pairedInput: JsonRecord[] = [];
+  for (const item of orphanFilteredInput as Array<{ type?: string; call_id?: string }>) {
+    pairedInput.push(item);
+    if (item.type === "function_call" && item.call_id && !pairedOutputCallIds.has(item.call_id)) {
+      pairedInput.push({
+        type: "function_call_output",
+        call_id: item.call_id,
+        output: "",
+        status: "completed",
+      });
+      pairedOutputCallIds.add(item.call_id);
+    }
+  }
+  result.input = pairedInput;
 
   // If no system message, keep empty instructions
   if (!hasSystemMessage) {
@@ -390,7 +461,8 @@ export function openaiToOpenAIResponsesRequest(
           name,
           description: toString(fn.description),
           parameters: fn.parameters,
-          strict: fn.strict,
+          // Omitted strict is non-strict on Chat but strict-normalized on Responses.
+          strict: chatStrictForResponses(fn),
         };
       }
       return toolValue;
@@ -464,7 +536,12 @@ export function openaiToOpenAIResponsesRequest(
     result.max_output_tokens = root.max_tokens;
   }
   if (root.top_p !== undefined) result.top_p = root.top_p;
+  // A client's explicit tool-parallelism choice is a request control, not a Chat-only field.
+  if (typeof root.parallel_tool_calls === "boolean") {
+    result.parallel_tool_calls = root.parallel_tool_calls;
+  }
   mapChatResponseFormatToResponsesText(root, result);
+  ensureJsonObjectInputHint(result);
   // GPT-5 verbosity: Chat Completions `verbosity` → Responses `text.verbosity`.
   const chatVerbosity = normalizeVerbosity(root.verbosity);
   if (chatVerbosity) {
@@ -477,9 +554,20 @@ export function openaiToOpenAIResponsesRequest(
     const effort = normalizeResponsesReasoningEffort(root.reasoning_effort, model ?? root.model);
     if (effort && effort !== "none") {
       // Effort-only chat request: default a reasoning summary so the upstream
-      // streams thinking back (see the constant's note above).
-      result.reasoning = { effort, summary: DEFAULT_RESPONSES_REASONING_SUMMARY };
-      defaultedReasoningSummary = true;
+      // streams thinking back (see the constant's note above). For Codex-family
+      // models, preserve the effort-only request shape rather
+      // than adding an inferred summary and encrypted-content include. This
+      // compatibility path applies only to Chat-to-Responses translation.
+      if (isCodexModel(model ?? root.model)) {
+        result.reasoning = { effort };
+        // Tell the Codex executor not to re-add the defaults on the wire. Native
+        // Responses clients never carry this marker, so they keep their
+        // encrypted-reasoning continuity.
+        result[REASONING_SUMMARY_OPT_OUT_MARKER] = true;
+      } else {
+        result.reasoning = { effort, summary: DEFAULT_RESPONSES_REASONING_SUMMARY };
+        defaultedReasoningSummary = true;
+      }
     } else if (effort) {
       result.reasoning = { effort };
     }
