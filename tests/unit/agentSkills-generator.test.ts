@@ -62,6 +62,25 @@ function bodyLineCount(result: { body: string }): number {
 
 // ── Dry-run: no writes ────────────────────────────────────────────────────────
 
+test("Test & Add documentation example is an executable no-inference preview", () => {
+  const sources = emptySources();
+  sources.cliRegistry.families.set("cli-models", [
+    {
+      name: "models test-add <model>",
+      description: "Validate then add",
+      flags: [],
+      isSubcommand: true,
+    },
+  ]);
+  const { body: markdown } = buildSkillMarkdown("cli-models", sources);
+  assert.ok(
+    markdown.includes(
+      "omniroute models test-add example-model --provider example-provider --connection example-connection --dry-run"
+    )
+  );
+  assert.ok(!markdown.includes("```bash\nomniroute models test-add <model>"));
+});
+
 test("dry-run (default) returns report without writing any files", async () => {
   const tmpDir = mkTmpDir();
   try {
@@ -716,4 +735,22 @@ test("serializeFrontmatter escapes backslashes before quotes → valid round-tri
     fm.description,
     "description with backslashes + quotes + newline must round-trip exactly"
   );
+});
+
+test("generated skills keep a formatter-stable blank line after frontmatter", async () => {
+  const directory = mkTmpDir();
+  try {
+    await generateAgentSkills({
+      dryRun: false,
+      prune: false,
+      outputDir: directory,
+      onlyIds: ["cli-health"],
+    });
+    assert.match(
+      fs.readFileSync(path.join(directory, "cli-health", "SKILL.md"), "utf8"),
+      /\n---\n\n<!-- generated/
+    );
+  } finally {
+    rmTmpDir(directory);
+  }
 });

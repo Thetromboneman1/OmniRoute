@@ -30,6 +30,9 @@ jobs:
       && vars.DEPLOY_ENABLED == 'true'
     name: Deploy OmniRoute to VPS
     runs-on: ubuntu-latest
+    # Bound a hung SSH session to an hour instead of GitHub's 6-hour default; the deploy
+    # itself fails fast when the VPS is unreachable (run 39101148517: 0 min of work).
+    timeout-minutes: 60
     steps:
       - name: Bind deployment to a trusted immutable version
         id: provenance
@@ -124,10 +127,13 @@ jobs:
           # script body) so /dev/tcp gets a shell variable, not inlined text.
           VPS_HOST: ${{ secrets.VPS_HOST }}
         run: |
-          set -uo pipefail
-          # A GitHub-hosted runner can deploy only when it can open the VPS SSH port.
-          # An unreachable host is a truthful workflow failure; operators may use the
-          # separately reviewed manual deployment path from an allowed network.
+          set -euo pipefail
+          # A GitHub-hosted runner can only deploy when it can actually open a TCP
+          # connection to the VPS SSH port. The Local VPS lives on a private LAN and
+          # the Akamai host firewalls :22 to known IPs, so the runner is routinely
+          # unable to reach it. An enabled deployment that cannot start is a failed
+          # deployment, not success. Keep DEPLOY_ENABLED=false when this runner has
+          # no authorized route; do not convert a requested deployment into green.
           # VPS_HOST is exported and expanded by the child bash.
           # shellcheck disable=SC2016
           if timeout 15 bash -c 'exec 3<>"/dev/tcp/${VPS_HOST}/22"' 2>/dev/null; then
@@ -135,7 +141,7 @@ jobs:
             echo "✅ VPS_HOST:22 reachable from the runner — proceeding with deploy."
           else
             echo "reachable=false" >> "$GITHUB_OUTPUT"
-            echo "::error title=Deployment failed::VPS_HOST:22 is not reachable from this GitHub runner."
+            echo "::error title=Deployment did not start::VPS_HOST:22 is not reachable from this runner. An operator must provide an authorized route or perform a separately authorized deployment."
             exit 1
           fi
 

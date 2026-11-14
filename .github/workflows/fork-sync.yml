@@ -45,8 +45,8 @@ jobs:
       - name: Fetch upstream
         run: |
           set -Eeuo pipefail
-          git remote add upstream https://github.com/diegosouzapw/OmniRoute.git 2>/dev/null || \
-            git remote set-url upstream https://github.com/diegosouzapw/OmniRoute.git
+          git remote add upstream https://github.com/cheaper-inference/OmniRoute.git 2>/dev/null || \
+            git remote set-url upstream https://github.com/cheaper-inference/OmniRoute.git
 
           for attempt in 1 2 3; do
             echo "Attempt ${attempt}: fetching upstream/main"
